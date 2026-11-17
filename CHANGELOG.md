@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **放弃流程后 Agent 不再继续追问**：此前只有 `flowgate_gate` 检查过 `flow.finished`，`flowgate_ask`、`flowgate_doc`、
+  `flowgate_review`、`flowgate_test` 只校验阶段，于是用户点了「放弃这次流程」之后，Agent 仍能弹出新的追问卡片、
+  继续提交文档，看起来像流程没结束。现在四个工具统一走 `requireRunning(flow)`，结束或放弃后直接报错，
+  错误信息里带上放弃原因并提示「请让用户在工作台重新启动一条流程」。
+  同时 `cancelFlow` 清空未答完的 `grill.pending`，`view` 在流程结束时不再渲染追问卡片与文档门禁。
 - **界面启动会真正唤醒 Agent**：此前点「开始需求分析」只创建流程状态，Agent 毫不知情，S1 会一直停在「进行中」，
   用户必须自己在对话里再说一句才动。现在启动后宿主用 `ctx.get('agents')` 取到该会话的 live agent，
   通过 `followup` 投递一条 user 消息（档位 + 需求原文 + 「先 `flowgate_status`，再 `flowgate_ask` 一次一问，
@@ -32,7 +37,7 @@
 - **空态换成需求描述输入框**：不再是「只能填一个标题」。填写的原文作为 `brief` 随启动提交，
   宿主用它派生标题（第一行、去 markdown 前缀与句末标点、超 40 字截断），`flowgate_status` 摘要里带上原文，
   Agent 在 S1 直接读需求提问而不用用户复述；`flowgate_start` 增加可选 `brief` 参数。
-- 169 项测试：宿主状态机（71）、假宿主集成（23）、客户端真渲染点击（62）、安装就绪度（13）。
+- 172 项测试：宿主状态机（74）、假宿主集成（23）、客户端真渲染点击（62）、安装就绪度（13）。
 - 实机验证 D4 的另一半：评审发现落在冻结 scope 外时点升档，实测回退到 S1（`upgrade-scope-overflow`）、
   scope 解冻（`scope.data: null`），重新批准时把越界文件补进 scope 后才继续开发。
 

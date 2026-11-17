@@ -813,6 +813,44 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
     assert.match(again.body.error, /已经结束/)
   })
 
+  // 用户点了「结束」，Agent 却不知道：修复前它还能继续追问、继续提交文档，
+  // 用户就会看到「明明结束了，对话框里还在问我问题」。
+  let askError = null
+  try {
+    await cx.tool('flowgate_ask', { question: '还要继续吗？', options: [{ label: '要', tradeoff: '继续做' }, { label: '不要', tradeoff: '收工' }] })
+  } catch (err) {
+    askError = err
+  }
+  check('放弃后追问工具直接报错，不再挂起等用户回答', () => {
+    assert.ok(askError, '应抛错')
+    assert.match(String(askError.message), /放弃/)
+    assert.match(String(askError.message), /重新启动/)
+  })
+  let docError = null
+  try {
+    await cx.tool('flowgate_doc', {
+      html: '<html><body><p>作废</p></body></html>',
+      scope: {
+        files_expected_to_change: ['src/a.ts'],
+        capabilities: ['改 a.ts'],
+        out_of_scope_explicitly: [],
+        acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
+      },
+    })
+  } catch (err) {
+    docError = err
+  }
+  check('放弃后文档提交也被拒绝，流程不会自己复活', () => {
+    assert.ok(docError, '应抛错')
+    assert.match(String(docError.message), /放弃/)
+  })
+  const deadView = await cx.request('/api/flowgate/state?sessionId=sess-cancel')
+  check('放弃后视图不再残留作废的追问卡片', () => {
+    assert.equal(deadView.body.finished, true)
+    assert.equal(deadView.body.grill.pending, null)
+    assert.equal(deadView.body.doc.pending, false)
+  })
+
   // 放弃后必须能重开，并且新流程不带着上一轮的 scope 白名单。
   const restarted = await cx.request('/api/flowgate/action', {
     sessionId: 'sess-cancel',
