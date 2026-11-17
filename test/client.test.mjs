@@ -328,6 +328,12 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
     assert.equal(found.length, 1, '必须有一个多行的需求描述输入框')
     assert.equal(found[0].props.rows, 4)
   })
+  await check('需求描述为空时按钮不可点，点也不发请求', async () => {
+    const button = buttonByText(renderer.toJSON(), '开始需求分析')
+    assert.equal(button.props.disabled, true, '空需求时启动按钮应当禁用')
+    await click(button)
+    assert.equal(posted.length, 0, '空需求不该发出 start')
+  })
   await check('点「开始需求分析」发出 start 动作（标题可以留空）', async () => {
     // 先把需求写进去：这段文字会随 start 一起提交，宿主用它派生标题。
     const area = areas()[0]
@@ -995,15 +1001,28 @@ await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
   posted = []
   currentView = { active: false }
   const renderer = await render(FlowgateDock, {})
-  await check('流程未启动时 dock 也能一键启动', () => {
+  await check('流程未启动时 dock 也能启动', () => {
     const text = flat(renderer.toJSON())
     assert.ok(text.includes('这个会话还没有流程'))
     assert.ok(text.includes('开始需求分析'))
   })
-  await check('dock 的启动按钮发出 start 动作', async () => {
+  await check('点开始时先就地展开需求输入，不直接建流程', async () => {
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    assert.equal(posted.length, 0, '没填需求之前不该发出 start')
+    assert.ok(flat(renderer.toJSON()).includes('先写一句这次要做什么'), '应当展开填写区')
+    assert.equal(findTags(renderer.toJSON(), 'textarea').length, 1, '展开后要有一个需求输入框')
+  })
+  await check('展开后需求为空时按钮禁用，填了才发出带 brief 的 start', async () => {
+    assert.equal(buttonByText(renderer.toJSON(), '开始需求分析').props.disabled, true, '空需求时按钮应当禁用')
+    const area = findTags(renderer.toJSON(), 'textarea')[0]
+    await act(async () => {
+      area.props.onChange({ target: { value: '会话过期返回 401，并给出重新认证入口' } })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    })
     await click(buttonByText(renderer.toJSON(), '开始需求分析'))
     assert.equal(posted.at(-1).action, 'start')
     assert.equal(posted.at(-1).payload.preset, 'fast')
+    assert.equal(posted.at(-1).payload.brief, '会话过期返回 401，并给出重新认证入口')
   })
 }
 
