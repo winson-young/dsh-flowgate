@@ -145,7 +145,7 @@ bundle 的 `__ModuleLoader__.load` id 是否等于包名、宿主半有没有跨
 ### 不开 DSH 就能验的
 
 ```bash
-npm test          # 134 项：状态机 / 假宿主集成 / 客户端真渲染点击 / 安装就绪度
+npm test          # 136 项：状态机 / 假宿主集成 / 客户端真渲染点击 / 安装就绪度
 npm run test:install  # 装进 profile 后的清单、软链、bundle 契约
 ```
 

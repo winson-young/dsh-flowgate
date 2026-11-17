@@ -78,8 +78,17 @@ function makeHost(cwd, sessionId) {
     return { status: response.status, body: await response.json() }
   }
 
+  const guard = (name, args) => {
+    const handler = handlers.get('tools/pre-execute')
+    assert.ok(handler, 'scope 守卫未注册')
+    return handler(
+      { name, arguments: args, agent: { session: { header: { id: sessionId, cwd } } }, signal: undefined },
+      async () => ({ kind: 'allow' }),
+    )
+  }
+
   apply({ inject: (_names, cb) => cb(scoped) })
-  return { tools, routes, handlers, shell, tool, request }
+  return { tools, routes, handlers, shell, tool, request, guard }
 }
 
 const cwd = mkdtempSync(join(tmpdir(), 'flowgate-'))
@@ -235,6 +244,8 @@ check('scope.json 已落盘', () => {
   assert.ok(existsSync(file), 'scope.json 未生成')
   const frozen = JSON.parse(readFileSync(file, 'utf8'))
   assert.deepEqual(frozen.in_scope.files_expected_to_change, ['src/auth/session.ts'])
+  // PRD 4.1.2：走「批准」路径时这个标记是 false，只有跳过需求文档评审才为 true。
+  assert.equal(frozen.scope_frozen_without_doc_approval, false)
 })
 
 // AC-3：scope 外文件被阻断，并带路径与回退指引。
@@ -444,6 +455,10 @@ check('AC-2 S1 记录为 skipped_by_user 且台账计数为 1', () => {
 })
 const writeAfterSkip = await guard('write', { file_path: join(cwd, 'src/auth/session.ts'), content: 'x' })
 check('AC-2 跳过后 S2 写操作放行', () => assert.equal(writeAfterSkip.kind, 'allow'))
+check('AC-2 跳过后 scope.json 带上 without_doc_approval 标记', () => {
+  const frozen = JSON.parse(readFileSync(join(cwd, '.dsh-flowgate', 'scope.json'), 'utf8'))
+  assert.equal(frozen.scope_frozen_without_doc_approval, true)
+})
 
 // PRD 4.5：开发规则是结构化检查清单，用户可勾选，也可追加自定义规则。
 const rulesState = await getState()
@@ -533,8 +548,15 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
     assert.equal(review4Result.decision, 'interrupted')
     assert.equal(review4Result.next, 'S1')
   })
-  check('D4 回退 S1 后 scope 没有被自动扩充', () => {
-    assert.deepEqual(up4.body.scope.data.in_scope.files_expected_to_change, ['src/auth/session.ts'])
+  check('D4 回退 S1 后 scope 解冻，必须重新批准（不自动扩充）', () => {
+    assert.equal(up4.body.scope.frozen, false)
+    assert.equal(up4.body.scope.data, null)
+  })
+  // 解冻的意义：用户改文档重新批准前，S2 的写操作不能被旧白名单放行。
+  const afterRollback = await ctx4.guard('write', { file_path: join(cwd, 'src/auth/session.ts'), content: 'x' })
+  check('D4 回退 S1 后写操作被拒（旧 scope 不再放行）', () => {
+    assert.equal(afterRollback.kind, 'deny')
+    assert.match(afterRollback.reason, /不能修改业务代码|scope 尚未冻结/)
   })
 }
 
