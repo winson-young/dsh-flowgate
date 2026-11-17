@@ -404,5 +404,38 @@ check('AC-2 S1 记录为 skipped_by_user 且台账计数为 1', () => {
 const writeAfterSkip = await guard('write', { file_path: join(cwd, 'src/auth/session.ts'), content: 'x' })
 check('AC-2 跳过后 S2 写操作放行', () => assert.equal(writeAfterSkip.kind, 'allow'))
 
+// PRD 4.5：开发规则是结构化检查清单，用户可勾选，也可追加自定义规则。
+const rulesState = await getState()
+check('PRD 4.5 开发规则默认启用全部内置规则', () => {
+  assert.equal(rulesState.body.rules.length, 5)
+  assert.equal(rulesState.body.ruleCatalog.length, 5)
+  assert.ok(rulesState.body.ruleIds.includes('scope-only'))
+})
+
+const statusS2 = await runTool('flowgate_status', {})
+check('PRD 4.5 S2 的 status 给出逐条检查清单', () => {
+  assert.match(statusS2.summary, /开发规则检查清单/)
+  assert.match(statusS2.summary, /只改 scope 内的文件/)
+})
+
+const ruleOff = await postAction('toggleRule', { id: 'no-debug-leftovers', enabled: false })
+check('PRD 4.5 取消勾选后规则从清单里移除', () => {
+  assert.equal(ruleOff.status, 200)
+  assert.equal(ruleOff.body.rules.length, 4)
+  assert.ok(!ruleOff.body.ruleIds.includes('no-debug-leftovers'))
+})
+
+const ruleAdded = await postAction('addRule', { name: '日志用结构化字段', points: ['不拼字符串', '不带敏感值'] })
+check('PRD 4.5 追加自定义规则后默认启用', () => {
+  assert.equal(ruleAdded.status, 200)
+  const rule = ruleAdded.body.ruleCatalog.find((item) => item.name === '日志用结构化字段')
+  assert.ok(rule, '自定义规则没有进 catalog')
+  assert.ok(ruleAdded.body.ruleIds.includes(rule.id))
+  assert.deepEqual(rule.points, ['不拼字符串', '不带敏感值'])
+})
+
+const unknownRule = await postAction('toggleRule', { id: 'nope', enabled: true })
+check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status, 409))
+
 rmSync(cwd, { recursive: true, force: true })
 console.log('\n全部通过：' + passed.length + ' 项')

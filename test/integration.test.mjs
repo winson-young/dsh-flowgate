@@ -15,12 +15,40 @@ function makeHost() {
   const tools = new Map()
   const routes = new Map()
   const listeners = new Map()
-  const host = { tools, routes, listeners }
+  // 只读过滤用的工具可见性：与 flowgate 自己注册的工具分开，避免污染 host.tools 的断言。
+  const visible = new Set([
+    'write', 'edit', 'str_replace_editor', 'subagent', 'subagent_fork', 'workflow', 'send_message', 'web_search',
+  ])
+  // 假子代理：捕获 spawn 请求，立即返回一份结构化报告。
+  const spawns = []
+  const subagents = {
+    list: () => ['spawn'],
+    async start(provider, request) {
+      spawns.push({ provider, request })
+      return {
+        id: 'child-' + spawns.length,
+        result: Promise.resolve({
+          stopReason: 'completed',
+          output: [{
+            type: 'text',
+            text: JSON.stringify({
+              verdict: 'advisory',
+              suggestUpgrade: false,
+              findings: [{ file: 'src/auth/session.ts', line: 42, severity: 'MINOR', summary: '缺少失败路径的注释' }],
+            }),
+          }],
+        }),
+        dispose: async () => {},
+      }
+    },
+  }
+  const host = { tools, routes, listeners, spawns }
   const ctx = {
     inject(_deps, cb) { cb(ctx) },
     effect(fn) { const d = fn(); return typeof d === 'function' ? d : () => {} },
     on(event, handler) { listeners.set(event, handler); return () => {} },
     get(name) {
+      if (name === 'subagents') return subagents
       if (name === 'shell') {
       return {
         resolve: (request) => ({ ...request, resolved: true }),
@@ -37,7 +65,11 @@ function makeHost() {
     }
       return undefined
     },
-    tools: { register(def) { tools.set(def.name, def); return () => {} } },
+    tools: {
+      register(def) { tools.set(def.name, def); return () => {} },
+      // spawnReadonlyChild 用 tools.get 与 READONLY_DENY 取交集。
+      get(name) { return tools.get(name) ?? (visible.has(name) ? { name } : undefined) },
+    },
     connection: { fetch: { register(spec) { routes.set(spec.path, spec); return () => {} } } },
     workingDirectory: { ensure: async () => CWD },
   }
@@ -322,6 +354,56 @@ await check('scope.json 冻结后落盘', async () => {
   assert.ok(existsSync(file))
   const scope = JSON.parse(readFileSync(file, 'utf8'))
   assert.equal(scope.in_scope.files_expected_to_change[0], 'src/auth/session.ts')
+})
+
+await check('flowgate_review_run 为每个角度 spawn 只读子代理并带上开发规则', async () => {
+  const S = 'sess-rev'
+  await call('flowgate_start', { title: '子代理评审', preset: 'fast' }, S)
+  const docPending = within(call('flowgate_doc', {
+    html: '<!doctype html><html><body>子代理评审</body></html>',
+    scope: {
+      files_expected_to_change: ['src/auth/session.ts'],
+      capabilities: ['会话过期检测'],
+      out_of_scope_explicitly: [],
+      acceptance_criteria: [{ id: 'AC-1', when: '会话过期', then: '返回 401' }],
+    },
+  }, S), 'flowgate_doc 子代理流程')
+  await tick()
+  await post({ sessionId: S, action: 'doc', payload: { decision: 'approve' } })
+  await docPending
+
+  const gatePending = within(call('flowgate_gate', {}, S), 'flowgate_gate 子代理流程')
+  await tick()
+  await post({ sessionId: S, action: 'gate', payload: { decision: 'pass' } })
+  await gatePending
+
+  host.spawns.length = 0
+  const reviewPending = within(call('flowgate_review_run', {}, S), 'flowgate_review_run')
+  await tick()
+
+  const view = await getState(S)
+  assert.equal(view.review.angles.length, 2, 'fast 档应有两个评审角度')
+  assert.equal(view.review.blocking, 0)
+  assert.equal(host.spawns.length, 2, '每个角度各 spawn 一个子代理')
+
+  const reviewSpawn = host.spawns.find((item) => String(item.request.label).includes('正确性'))
+  assert.ok(reviewSpawn, '应有正确性角度的子代理')
+  assert.equal(reviewSpawn.provider, 'spawn')
+  // PRD 4.3.1：只读靠 toolFilter.deny 在工具层封死，不是提示词建议。
+  assert.deepEqual(
+    reviewSpawn.request.toolFilter.deny.slice().sort(),
+    ['edit', 'send_message', 'str_replace_editor', 'subagent', 'subagent_fork', 'web_search', 'workflow', 'write'],
+  )
+  // PRD 4.5：正确性角度会逐条核对用户定义的开发规则。
+  const prompt = reviewSpawn.request.prompt[0].text
+  assert.match(prompt, /用户定义的开发规则/)
+  assert.match(prompt, /只改 scope 内的文件/)
+
+  const res = await post({ sessionId: S, action: 'gate', payload: { decision: 'skip' } })
+  assert.equal(res.status, 200)
+  const value = await reviewPending
+  assert.equal(value.decision, 'skip')
+  assert.equal(value.next, 'S4')
 })
 
 rmSync(CWD, { recursive: true, force: true })

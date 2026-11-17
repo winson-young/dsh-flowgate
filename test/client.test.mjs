@@ -134,6 +134,16 @@ function baseView(stage, patch = {}) {
       { id: 'smoke', name: '冒烟验证', points: ['主路径可用'] },
       { id: 'regression', name: '回归影响', points: ['旧用例不退化'] },
     ],
+    rules: [
+      { id: 'scope-only', name: '只改 scope 内的文件', points: ['不新增 scope 之外的文件'] },
+      { id: 'no-debug-leftovers', name: '不留调试残留', points: ['不留 console.log / debugger'] },
+    ],
+    ruleIds: ['scope-only', 'no-debug-leftovers'],
+    ruleCatalog: [
+      { id: 'scope-only', name: '只改 scope 内的文件', points: ['不新增 scope 之外的文件'] },
+      { id: 'no-debug-leftovers', name: '不留调试残留', points: ['不留 console.log / debugger'] },
+      { id: 'match-style', name: '与既有代码风格一致', points: ['命名习惯一致'] },
+    ],
     review: null,
     test: null,
     devChanges: null,
@@ -372,6 +382,12 @@ const FlowgateDock = registrations[1].Component
     assert.ok(text.includes('会话过期检测'))
   })
 
+  await check('S2 显示开发规则检查清单', () => {
+    assert.ok(text.includes('开发规则检查清单'))
+    assert.ok(text.includes('只改 scope 内的文件'))
+    assert.ok(text.includes('逐条核对'))
+  })
+
   await check('S2 门禁按钮可点并提交 gate/pass', async () => {
     await click(buttonByText(tree, '完成开发'))
     const last = posted[posted.length - 1]
@@ -552,6 +568,34 @@ const FlowgateDock = registrations[1].Component
     assert.ok(text.includes('测试方向'))
     assert.ok(text.includes('追加自定义角度'))
     assert.ok(text.includes('追加自定义方向'))
+  })
+
+  await check('设置面板列出开发规则并可追加自定义规则', () => {
+    assert.ok(text.includes('开发规则'))
+    assert.ok(text.includes('与既有代码风格一致'))
+    assert.ok(text.includes('追加自定义开发规则'))
+  })
+
+  await check('勾选开发规则会提交 toggleRule', async () => {
+    const boxes = []
+    const walk = (node) => {
+      if (!node) return
+      if (Array.isArray(node)) { node.forEach(walk); return }
+      if (node.type === 'input' && node.props.type === 'checkbox') boxes.push(node)
+      if (node.children) walk(node.children)
+    }
+    walk(renderer.toJSON())
+    const target = boxes.find((node) => node.props['aria-label'] === '与既有代码风格一致')
+    assert.ok(target, '找不到开发规则的勾选框')
+    assert.equal(target.props.checked, false)
+    await act(async () => {
+      target.props.onChange({ target: { checked: true } })
+      await new Promise((resolve) => setTimeout(resolve, 40))
+    })
+    const last = posted[posted.length - 1]
+    assert.equal(last.action, 'toggleRule')
+    assert.equal(last.payload.id, 'match-style')
+    assert.equal(last.payload.enabled, true)
   })
 }
 

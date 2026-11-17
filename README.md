@@ -69,6 +69,14 @@ cd "$USERPROFILE/.dsh/profiles/desktop" && pnpm install --prefer-offline
 
 用户可以在右侧「阶段设置」里勾选或追加角度/方向——追加只在内置集合上加条目，不替换内置项。中途升档只作用于尚未进行的阶段；S3 升档且评审已发现 scope 内问题时，流程回到 S2 按升档参数重做，但 **scope 不会自动扩充**。
 
+## 开发规则
+
+开发规则是**结构化检查清单**，不是提示词里的一句「请遵守项目规范」。内置五条：只改 scope 内的文件、不引入未声明的依赖、错误路径显式处理、不留调试残留、与既有代码风格一致。
+
+- S2 里规则清单以卡片形式出现在主区，Agent 通过 `flowgate_status` 拿到的也是同一份逐条清单；
+- S3 的**正确性**与**风格**角度会把规则逐条写进子代理 prompt，未遵守的作为 finding 报出来；
+- 用户可以在右侧「阶段设置 → 开发规则」里勾选或追加自定义规则——追加只在内置集合上加条目，内置规则不可删除。
+
 ## S4 的写权限例外（D2）
 
 评审与测试默认都是只读的。v1 里唯一的例外是**测试方向声明需要写权限**：某些方向必须跑变更性命令
@@ -105,8 +113,8 @@ cd "$USERPROFILE/.dsh/profiles/desktop" && pnpm install --prefer-offline
 ## 测试
 
 ```bash
-npm test              # 三套全跑
-npm run test:host     # 状态机 / scope 守卫 / 门禁流转（纯 node，无需 DSH）
+npm test              # 四套全跑
+npm run test:host     # 状态机 / scope 守卫 / 规则清单 / 门禁流转（纯 node，无需 DSH）
 npm run test:integration  # 假宿主跑真实 apply()：工具注册、pre-execute 守卫、HTTP 路由、挂起-唤醒
 npm run test:client   # 用 react-test-renderer 真渲染客户端并点击按钮
 npm run test:install  # 静态核对 profile 清单、软链、bundle 契约（需先装进 profile）
@@ -130,7 +138,7 @@ bundle 的 `__ModuleLoader__.load` id 是否等于包名、宿主半有没有跨
 ## 界面
 
 - **左侧**阶段导航条：不可点击跳转，只能通过门禁推进或回退。
-- **中间**当前阶段内容：追问卡片 / 需求文档预览 / 开发变更 / 评审报告 / 测试报告。
+- **中间**当前阶段内容：追问卡片 / 需求文档预览 / 开发变更与规则清单 / 评审报告 / 测试报告。
 - **右侧**可收起面板：阶段设置与出口门禁。
 
 对话视图在「流程工作台」标签下；输入框上方另有一条常驻状态条，显示当前阶段与门禁是否在等你。
