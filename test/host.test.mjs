@@ -321,6 +321,25 @@ const reviewPending3 = gateRound(
 )
 await reviewPending3
 
+// D2：v1 唯一的写权限例外——只在 S4、只对声明 needsWrite 的方向、只由用户显式授权。
+const addDir = await postAction('addDirection', {
+  name: '迁移回滚',
+  points: ['迁移后回滚可恢复'],
+  needsWrite: true,
+})
+check('D2 追加带写权限声明的测试方向', () => assert.equal(addDir.status, 200))
+const customDirId = addDir.body.directions.find((d) => d.name === '迁移回滚').id
+const grantBuiltin = await postAction('toggleWriteGrant', { id: 'smoke', enabled: true })
+check('D2 未声明需要写权限的方向不能被授权', () => assert.equal(grantBuiltin.status, 409))
+const granted = await postAction('toggleWriteGrant', { id: customDirId, enabled: true })
+check('D2 用户显式勾选后授权生效', () => {
+  assert.equal(granted.status, 200)
+  assert.deepEqual(granted.body.writeGrants, [customDirId])
+  assert.equal(granted.body.directions.find((d) => d.id === customDirId).writeGranted, true)
+})
+const revoked = await postAction('toggleWriteGrant', { id: customDirId, enabled: false })
+check('D2 取消勾选后授权撤销', () => assert.deepEqual(revoked.body.writeGrants, []))
+
 const testPending = gateRound(
   'flowgate_test',
   {

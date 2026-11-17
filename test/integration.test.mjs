@@ -156,6 +156,20 @@ await check('AC-4 子代理会话的写工具被工具层拒绝', async () => {
   }
 })
 
+// D2：用户显式授权的测试方向可以跑变更性 shell，但代码写工具仍然拒绝。
+await check('D2 已授权的测试子代理可跑变更性 shell，写工具仍拒绝', async () => {
+  const service = mod.currentService()
+  service.registerChild(SESSION, 'sess-test', { allowShellWrite: true })
+  try {
+    const shell = await guard('bash', { command: 'pnpm migrate && pnpm migrate:rollback' }, 'sess-test')
+    assert.equal(shell.kind, 'allow', '授权后的变更性 shell 应放行')
+    const write = await guard('write', { path: 'src/auth/session.ts' }, 'sess-test')
+    assert.equal(write.kind, 'deny', '写权限例外不覆盖代码写工具')
+  } finally {
+    service.unregisterChild('sess-test')
+  }
+})
+
 await check('AC-4 子会话解绑后回到父流程的 scope 判定', async () => {
   const d = await guard('write', { path: 'src/auth/session.ts' }, 'sess-review')
   assert.equal(d.kind, 'allow', '没有流程归属的会话不应被只读守卫拦住')

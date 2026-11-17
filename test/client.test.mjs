@@ -580,6 +580,53 @@ const FlowgateDock = registrations[1].Component
   })
 }
 
+{
+  // D2：v1 唯一的写权限例外——只对声明 needsWrite 的方向、只在 S4、只由用户显式勾选。
+  posted = []
+  currentView = baseView('S4', {
+    directions: [{ id: 'mig', name: '迁移回滚', points: ['回滚可恢复'], needsWrite: true, writeGranted: false }],
+    directionCatalog: [{ id: 'mig', name: '迁移回滚', points: ['回滚可恢复'], needsWrite: true }],
+  })
+  const renderer = await render(WorkbenchView, {})
+  const boxes = []
+  const walk = (node) => {
+    if (!node) return
+    if (Array.isArray(node)) { node.forEach(walk); return }
+    if (node.type === 'input' && node.props.type === 'checkbox') boxes.push(node)
+    if (node.children) walk(node.children)
+  }
+  walk(renderer.toJSON())
+  const text = flat(renderer.toJSON())
+  await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
+    assert.ok(text.includes('授权执行变更性命令'))
+    const grant = boxes.find((node) => node.props.disabled === false && node.props.checked === false)
+    assert.ok(grant, 'S4 下必须有一个可用的授权勾选框')
+  })
+  await check('D2 勾选授权提交 toggleWriteGrant', async () => {
+    const grant = boxes.find((node) => node.props.disabled === false && node.props.checked === false)
+    await act(async () => {
+      grant.props.onChange({ target: { checked: true } })
+      await new Promise((resolve) => setTimeout(resolve, 40))
+    })
+    const call = posted.find((item) => item.action === 'toggleWriteGrant')
+    assert.ok(call, '必须提交 toggleWriteGrant')
+    assert.equal(call.payload.id, 'mig')
+    assert.equal(call.payload.enabled, true)
+  })
+}
+
+{
+  currentView = baseView('S2', {
+    directions: [{ id: 'mig', name: '迁移回滚', points: ['回滚可恢复'], needsWrite: true, writeGranted: false }],
+    directionCatalog: [{ id: 'mig', name: '迁移回滚', points: ['回滚可恢复'], needsWrite: true }],
+  })
+  const renderer = await render(WorkbenchView, {})
+  const text = flat(renderer.toJSON())
+  await check('D2 非 S4 阶段授权勾选被禁用并说明原因', () => {
+    assert.ok(text.includes('写权限例外只在 S4 测试阶段开放'))
+  })
+}
+
 // ---------------------------------------------------------------------------
 // 9. 输入区上方的常驻条
 // ---------------------------------------------------------------------------
