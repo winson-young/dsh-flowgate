@@ -10,6 +10,12 @@
 - 改善连接提示、未启动状态、键盘焦点与减少动态效果适配，配色继续跟随 DSH 明暗主题。
 - 输入框上方的状态条改成与输入框等宽：照 DSH 输入卡片的几何（列宽减去两侧 clearance，上限 `--dsh-composer-card-max-width`）计算，不再独占整行。
 - 保持宿主状态机、接口请求、按钮操作与权限规则不变。
+- **D1 变更摘要兜底采集**：`dsh-ops` 这类 profile 会退掉官方 `shell` 行（`retiredLegacyRow(ctx, 'shell')`），
+  宿主内 `ctx.get('shell')` 为空，S2 的 `dev.summary` 只剩一条 error。改为优先 shell 服务、缺失时用
+  `node:child_process` 直接跑 git（摘要带 `via` 字段），两条路都失败才写 `error`。
+- 145 项测试：宿主状态机（56）、假宿主集成（23）、客户端真渲染点击（53）、安装就绪度（13）。
+- 实机验证 D4 的另一半：评审发现落在冻结 scope 外时点升档，实测回退到 S1（`upgrade-scope-overflow`）、
+  scope 解冻（`scope.data: null`），重新批准时把越界文件补进 scope 后才继续开发。
 
 ## 0.1.0
 

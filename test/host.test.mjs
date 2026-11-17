@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, existsSync, readFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply, scopeDenial } from '../lib/index.js'
@@ -8,7 +9,7 @@ import { apply, scopeDenial } from '../lib/index.js'
 // 宿主端 mock：只实现插件实际用到的 ctx 成员。
 // ---------------------------------------------------------------------------
 
-function makeHost(cwd, sessionId) {
+function makeHost(cwd, sessionId, options = {}) {
   const tools = new Map()
   const routes = []
   const handlers = new Map()
@@ -41,7 +42,8 @@ function makeHost(cwd, sessionId) {
       return () => {}
     },
     get(name) {
-      if (name === 'shell') return shell
+      // noShell 用来模拟 dsh-ops 这类退掉官方 shell 行的 profile。
+      if (name === 'shell') return options.noShell ? undefined : shell
       // 界面一键启动靠它把 sessionId 换成工作目录；sess-no-cwd 用来验失败分支。
       if (name === 'sessions') {
         return { get: (id) => (id === 'sess-no-cwd' ? undefined : { header: { id, cwd } }) }
@@ -616,6 +618,59 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
     assert.equal(viaTool.stage, 'S1')
     assert.equal(viaTool.preset, 'fast')
   })
+}
+
+// ---------------------------------------------------------------------------
+// D1 兜底采集：有些 profile 没有宿主 shell 服务（例如 dsh-ops 退掉了 shell 行），
+// 这时必须改用 child_process 直接跑 git，不能把变更摘要丢成空。
+// ---------------------------------------------------------------------------
+{
+  const repo = mkdtempSync(join(tmpdir(), 'flowgate-repo-'))
+  const git = (args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8', windowsHide: true })
+  git(['init', '-q'])
+  git(['config', 'user.email', 'test@example.com'])
+  git(['config', 'user.name', 'test'])
+  git(['config', 'commit.gpgsign', 'false'])
+  writeFileSync(join(repo, 'a.txt'), 'one\n')
+  git(['add', '.'])
+  git(['commit', '-q', '-m', 'init'])
+  writeFileSync(join(repo, 'a.txt'), 'one\ntwo\nthree\n')
+  writeFileSync(join(repo, 'b.txt'), 'new\n')
+
+  const noShellCtx = makeHost(repo, 'sess-noshell', { noShell: true })
+  await noShellCtx.tool('flowgate_start', { title: '兜底采集', preset: 'fast' })
+  const docNoShell = noShellCtx.tool('flowgate_doc', {
+    html: '<!doctype html><html><body><h1>兜底采集</h1></body></html>',
+    scope: {
+      files_expected_to_change: ['a.txt'],
+      capabilities: ['改 a.txt'],
+      out_of_scope_explicitly: [],
+      acceptance_criteria: [{ id: 'AC-1', when: '改完', then: '能采到变更' }],
+    },
+  })
+  await tick()
+  await noShellCtx.request('/api/flowgate/action', { sessionId: 'sess-noshell', action: 'doc', payload: { decision: 'approve' } })
+  await docNoShell
+
+  const gateNoShell = noShellCtx.tool('flowgate_gate', { summary: '改完了 a.txt' })
+  // 门禁工具在 S2 会先跑 collectChanges（两次 git 进程），5ms 的 tick 不够，
+  // 门禁 waiter 还没注册就点按钮会被丢掉，execute 就一直挂着。
+  await new Promise((resolve) => setTimeout(resolve, 800))
+  const gateReply = await noShellCtx.request('/api/flowgate/action', { sessionId: 'sess-noshell', action: 'gate', payload: { decision: 'pass' } })
+  const gateResult = await gateNoShell
+  check('没有 shell 服务时改用 child_process 采集变更摘要', () => {
+    assert.equal(gateReply.status, 200, JSON.stringify(gateReply.body))
+    assert.equal(gateResult.decision, 'pass')
+    const changes = gateReply.body.devChanges
+    assert.ok(changes, '门禁后应留下变更摘要')
+    assert.equal(changes.via, 'child_process')
+    assert.equal(changes.error, undefined)
+    assert.ok(changes.files.includes('a.txt'), '应包含已跟踪的修改')
+    assert.ok(changes.files.includes('b.txt'), '应包含未跟踪的新文件')
+    assert.ok(changes.untracked.includes('b.txt'))
+    assert.equal(changes.added, 2)
+  })
+  rmSync(repo, { recursive: true, force: true })
 }
 rmSync(cwd, { recursive: true, force: true })
 console.log('\n全部通过：' + passed.length + ' 项')
