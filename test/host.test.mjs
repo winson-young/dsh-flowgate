@@ -15,6 +15,8 @@ function makeHost(cwd, sessionId, options = {}) {
   const handlers = new Map()
   // 界面启动后插件会通过宿主 agents 服务给会话补一条消息；这里记下来给用例断言。
   const delivered = []
+  // sess-late-agent 用它模拟「第一次拿不到、之后拿得到」：验证重复点开始会重试唤醒。
+  const agentLookups = new Map()
   const shell = {
     resolve(request) {
       return { ...request, resolved: true }
@@ -52,10 +54,17 @@ function makeHost(cwd, sessionId, options = {}) {
       }
       // sess-no-agent 模拟宿主没返回 live agent：唤醒失败时要降级成界面提示。
       if (name === 'agents') {
+        const live = (id) => ({ followup: (message) => { delivered.push({ sessionId: id, message }) } })
         return {
-          get: (id) => (id === 'sess-no-agent'
-            ? undefined
-            : { followup: (message) => { delivered.push({ sessionId: id, message }) } }),
+          get: (id) => {
+            if (id === 'sess-no-agent') return undefined
+            if (id === 'sess-late-agent') {
+              const seen = agentLookups.get(id) ?? 0
+              agentLookups.set(id, seen + 1)
+              return seen === 0 ? undefined : live(id)
+            }
+            return live(id)
+          },
         }
       }
       return undefined
@@ -643,6 +652,25 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
     assert.equal(noAgent.body.active, true)
     assert.equal(noAgent.body.nudge.ok, false)
     assert.ok(noAgent.body.nudge.reason.length > 0)
+  })
+  // 上一次没唤醒成功时，用户再点一次「开始需求分析」应当重试，而不是静默返回旧视图。
+  const lateCtx = makeHost(cwd, 'sess-late-agent')
+  const lateFirst = await lateCtx.request('/api/flowgate/action', {
+    sessionId: 'sess-late-agent',
+    action: 'start',
+    payload: { brief: '第一次拿不到 Agent' },
+  })
+  const lateSecond = await lateCtx.request('/api/flowgate/action', {
+    sessionId: 'sess-late-agent',
+    action: 'start',
+    payload: { brief: '第一次拿不到 Agent' },
+  })
+  check('唤醒失败后再点一次开始会重试，且不新建流程', () => {
+    assert.equal(lateFirst.body.nudge.ok, false)
+    assert.equal(lateSecond.body.nudge.ok, true)
+    assert.equal(lateSecond.body.id, lateFirst.body.id)
+    assert.equal(lateCtx.delivered.length, 1)
+    assert.equal(lateCtx.delivered[0].sessionId, 'sess-late-agent')
   })
   const briefStatus = await briefCtx.tool('flowgate_status', {})
   check('流程摘要里带上需求原文，Agent 不必再问用户要一遍', () => {
