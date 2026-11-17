@@ -254,6 +254,24 @@ const WorkbenchView = registrations[0].Component
 const FlowgateDock = registrations[1].Component
 
 // ---------------------------------------------------------------------------
+// 1b. 滚动归属：视图必须声明自己拥有滚动条
+// ---------------------------------------------------------------------------
+
+await check('三种状态下的根节点都声明 data-conversation-composer-overlay', async () => {
+  // 没有这个属性时 ConversationRoot 仍把 .scrollBody 当滚动容器，.viewArea 是
+  // flex:1 0 auto + min-height:auto，.fg-root 的 height:100% 解析成 auto、内容整个摊开；
+  // 切到本 tab 就会继承聊天视图留下的 scrollTop 并被 clamp 到最底部。
+  const seen = []
+  for (const view of [null, { active: false, presets: {} }, baseView('S2')]) {
+    currentView = view
+    const renderer = await render(WorkbenchView, {})
+    const root = renderer.toJSON()
+    seen.push(root?.props?.['data-conversation-composer-overlay'])
+  }
+  assert.deepEqual(seen, ['', '', ''], '根节点必须带 data-conversation-composer-overlay（值为空串）')
+})
+
+// ---------------------------------------------------------------------------
 // 2. 空态
 // ---------------------------------------------------------------------------
 

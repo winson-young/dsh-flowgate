@@ -155,7 +155,7 @@ cd "$USERPROFILE/.dsh/profiles/desktop" && pnpm install --prefer-offline
 npm test              # 四套全跑
 npm run test:host     # 状态机 / scope 守卫 / 规则清单 / 门禁流转（纯 node，无需 DSH）
 npm run test:integration  # 假宿主跑真实 apply()：工具注册、pre-execute 守卫、HTTP 路由、挂起-唤醒
-npm run test:client   # 用 react-test-renderer 真渲染客户端并点击按钮
+npm run test:client   # 用 react-test-renderer 真渲染客户端并点击按钮，含滚动归属与配色字面量断言
 npm run test:install  # 静态核对 profile 清单、软链、bundle 契约（需先装进 profile）
 ```
 
@@ -251,6 +251,12 @@ D4 的两半现在都有实机证据：发现全在 scope 内时回退 S2（「�
 - **右侧**可收起面板：阶段设置与出口门禁。
 
 对话视图在「流程工作台」标签下；输入框上方另有一条常驻状态条，显示当前阶段与门禁是否在等你。
+
+工作台自己滚动：根节点带 `data-conversation-composer-overlay`，DSH 的对话骨架据此把 `.viewArea` 收成
+`flex: 1 1 0` 并把输入框改成浮层（见 `ConversationRoot.module.css:272-292`，官方同形态用例是 ui-trajectory）。
+没有这个属性时 `.viewArea` 在 active 相位是 `flex: 1 0 auto`，工作台会整个摊开在对话滚动容器里，
+切到这个标签时浏览器把聊天留下的 scrollTop 夹到新内容底部——表现就是「一切过来就停在最下面」。
+底部留白用 `--dsh-composer-height` 让出浮层输入框的高度，所以最后一张卡片滚到底时不会被遮住。
 
 还没有流程时，工作台空态可以直接填标题（可留空）、选档位，点「开始需求分析」就进 S1；状态条上也有同一个按钮。界面启动只用 `sessionId` 请求宿主，工作目录由宿主从会话里解析，不需要客户端知道 cwd。
 

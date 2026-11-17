@@ -13,7 +13,10 @@
 - **D1 变更摘要兜底采集**：`dsh-ops` 这类 profile 会退掉官方 `shell` 行（`retiredLegacyRow(ctx, 'shell')`），
   宿主内 `ctx.get('shell')` 为空，S2 的 `dev.summary` 只剩一条 error。改为优先 shell 服务、缺失时用
   `node:child_process` 直接跑 git（摘要带 `via` 字段），两条路都失败才写 `error`。
-- 145 项测试：宿主状态机（56）、假宿主集成（23）、客户端真渲染点击（53）、安装就绪度（13）。
+- **不再「切到工作台就被滚到最下面」**：根节点声明 `data-conversation-composer-overlay`，让 DSH 对话骨架
+  把 `.viewArea` 收成 `flex: 1 1 0` 并把输入框改成浮层，滚动交给工作台自己；底部留白改读
+  `--dsh-composer-height`，最后一张卡片滚到底不会被输入框遮住。窄屏下滚动容器是 `.fg-body`，留白同样按它算。
+- 146 项测试：宿主状态机（56）、假宿主集成（23）、客户端真渲染点击（54）、安装就绪度（13）。
 - 实机验证 D4 的另一半：评审发现落在冻结 scope 外时点升档，实测回退到 S1（`upgrade-scope-overflow`）、
   scope 解冻（`scope.data: null`），重新批准时把越界文件补进 scope 后才继续开发。
 
