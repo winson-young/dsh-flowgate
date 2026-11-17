@@ -23,7 +23,10 @@ function makeHost(cwd, sessionId) {
         timedOut: false,
         aborted: false,
         timeoutMs: spec.timeoutMs ?? 0,
-        stdout: { text: ' M src/auth/session.ts\n1\t2\tsrc/auth/session.ts\n', truncated: false },
+        stdout: {
+          text: ' M src/auth/session.ts\n?? src/auth/new-helper.ts\n---numstat---\n1\t2\tsrc/auth/session.ts\n',
+          truncated: false,
+        },
         stderr: { text: '', truncated: false },
       }
     },
@@ -224,10 +227,22 @@ check('AC-3 scope 外 write 被拒且给出路径与指引', () => {
 })
 const allowIn = await guard('edit', { file_path: join(cwd, 'src/auth/session.ts'), old_string: 'a', new_string: 'b' })
 check('scope 内 edit 放行', () => assert.equal(allowIn.kind, 'allow'))
+// 变更性 shell 无法逐条核对 scope，S2 也必须拒绝——放行等于给 scope 边界开后门。
 const denyShell = await guard('bash', { command: 'git checkout -- src/api/middleware.ts' })
-check('变更性 shell 在 S1/S2 按阶段判定', () => assert.equal(denyShell.kind, 'allow'))
+check('变更性 shell 在 S2 被拒并给出回退指引', () => {
+  assert.equal(denyShell.kind, 'deny')
+  assert.match(denyShell.reason, /变更性 shell 无法核对冻结 scope/)
+  assert.match(denyShell.reason, /回到需求分析阶段/)
+})
+const denyShellOps = await guard('ops_bash', { command: 'rm -rf src/api' })
+check('ops_bash 这类别名 shell 同样被拦（不同 profile 装的 shell 插件不同）', () => {
+  assert.equal(denyShellOps.kind, 'deny')
+  assert.match(denyShellOps.reason, /变更性 shell/)
+})
 const denyShell2 = await guard('bash', { command: 'echo hello' })
 check('只读 shell 放行', () => assert.equal(denyShell2.kind, 'allow'))
+const allowGitDiff = await guard('ops_bash', { command: 'git diff --stat' })
+check('ops_bash 的只读命令放行', () => assert.equal(allowGitDiff.kind, 'allow'))
 
 // scope 未冻结分支：直接构造 flow 验证守卫文案。
 check('scope 未冻结时 S2 写操作返回「scope 未冻结」', () => {
@@ -244,6 +259,10 @@ const afterDev = await getState()
 check('S2 记录变更摘要凭据', () => {
   assert.equal(afterDev.body.stages.find((s) => s.id === 'S2').status, 'passed')
   assert.ok(afterDev.body.devChanges.files.includes('src/auth/session.ts'))
+  // 新文件在开发阶段很常见：porcelain 的 ?? 行必须进摘要，否则评审看不到新增文件。
+  assert.ok(afterDev.body.devChanges.untracked.includes('src/auth/new-helper.ts'))
+  assert.equal(afterDev.body.devChanges.added, 1)
+  assert.equal(afterDev.body.devChanges.removed, 2)
 })
 
 // AC-6 / AC-7：评审阶段升档 + 评审发现问题 → 回退 S2。

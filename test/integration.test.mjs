@@ -9,7 +9,7 @@ rmSync(CWD, { recursive: true, force: true })
 mkdirSync(CWD, { recursive: true })
 
 const SESSION = 'sess-main'
-const SHELL_OUT = ' M src/auth/session.ts\n3\t1\tsrc/auth/session.ts\n'
+const SHELL_OUT = ' M src/auth/session.ts\n---numstat---\n3\t1\tsrc/auth/session.ts\n'
 
 function makeHost() {
   const tools = new Map()
