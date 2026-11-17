@@ -145,6 +145,7 @@ function baseView(stage, patch = {}) {
       { id: 'match-style', name: '与既有代码风格一致', points: ['命名习惯一致'] },
     ],
     review: null,
+    reviewOutsideScope: [],
     test: null,
     devChanges: null,
     waiting: false,
@@ -734,6 +735,94 @@ await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
   const text = flat(renderer.toJSON())
   await check('D2 非 S4 阶段授权勾选被禁用并说明原因', () => {
     assert.ok(text.includes('写权限例外只在 S4 测试阶段开放'))
+  })
+}
+
+// ---------------------------------------------------------------------------
+// 8.5 D4：scope 外的评审发现要给出「得回 S1」的指引
+// ---------------------------------------------------------------------------
+
+{
+  currentView = baseView('S3', {
+    review: {
+      angles: [{ id: 'security', name: '安全', verdict: 'blocking', findings: [
+        { file: 'src/config/secrets.ts', line: 7, severity: 'CRITICAL', summary: '密钥硬编码' },
+      ] }],
+      blocking: 1,
+      at: '2026-11-17T09:20:00Z',
+    },
+    reviewOutsideScope: [{ file: 'src/config/secrets.ts', severity: 'CRITICAL', angle: '安全' }],
+  })
+  const renderer = await render(WorkbenchView, {})
+  const text = flat(renderer.toJSON())
+  await check('D4 评审卡片提示 scope 外发现需要回 S1 调 scope', () => {
+    assert.ok(text.includes('1 条发现落在冻结 scope 之外'))
+    assert.ok(text.includes('src/config/secrets.ts'))
+    assert.ok(text.includes('要先回到需求分析阶段更新 scope.json 并重新批准'))
+  })
+}
+
+{
+  currentView = baseView('S3', {
+    review: {
+      angles: [{ id: 'correctness', name: '正确性', verdict: 'advisory', findings: [
+        { file: 'src/auth/session.ts', line: 12, severity: 'MINOR', summary: '缺少注释' },
+      ] }],
+      blocking: 0,
+      at: '2026-11-17T09:20:00Z',
+    },
+    reviewOutsideScope: [],
+  })
+  const renderer = await render(WorkbenchView, {})
+  const text = flat(renderer.toJSON())
+  await check('D4 没有 scope 外发现时不显示回 S1 提示', () => {
+    assert.ok(!text.includes('落在冻结 scope 之外'))
+  })
+}
+
+{
+  currentView = baseView('S3', {
+    waiting: true,
+    waitingKind: 'gate',
+    review: {
+      angles: [{ id: 'security', name: '安全', verdict: 'blocking', findings: [
+        { file: 'src/config/secrets.ts', line: 7, severity: 'CRITICAL', summary: '密钥硬编码' },
+      ] }],
+      blocking: 1,
+      at: '2026-11-17T09:20:00Z',
+    },
+    reviewOutsideScope: [{ file: 'src/config/secrets.ts', severity: 'CRITICAL', angle: '安全' }],
+  })
+  const renderer = await render(WorkbenchView, {})
+  const tree = renderer.toJSON()
+  const back = buttonByText(tree, '回到需求分析调整 scope')
+  await check('D4 有 scope 外发现时 S3 门禁出现回 S1 的按钮', () => {
+    assert.ok(back, '没找到「回到需求分析调整 scope」按钮')
+    assert.ok(flat(tree).includes('退回开发修复也改不到它们'))
+  })
+  await click(back)
+  await check('D4 点回 S1 发出 gate/back 且 to=S1', () => {
+    const last = posted[posted.length - 1]
+    assert.equal(last.action, 'gate')
+    assert.equal(last.payload.decision, 'back')
+    assert.equal(last.payload.to, 'S1')
+  })
+}
+
+{
+  currentView = baseView('S3', {
+    waiting: true,
+    waitingKind: 'gate',
+    review: {
+      angles: [{ id: 'correctness', name: '正确性', verdict: 'advisory', findings: [], }],
+      blocking: 0,
+      at: '2026-11-17T09:20:00Z',
+    },
+    reviewOutsideScope: [],
+  })
+  const renderer = await render(WorkbenchView, {})
+  await check('D4 没有 scope 外发现时 S3 门禁不显示回 S1 按钮', () => {
+    assert.ok(!flat(renderer.toJSON()).includes('回到需求分析调整 scope'))
   })
 }
 

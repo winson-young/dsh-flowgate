@@ -74,7 +74,16 @@ cd "$USERPROFILE/.dsh/profiles/desktop" && pnpm install --prefer-offline
 | 测试方向 | 1（冒烟验证） | 3（功能正确性、边界与异常、回归影响） |
 | 追问深度 | 较浅 | 较深 |
 
-用户可以在右侧「阶段设置」里勾选或追加角度/方向——追加只在内置集合上加条目，不替换内置项。中途升档只作用于尚未进行的阶段；S3 升档且评审已发现 scope 内问题时，流程回到 S2 按升档参数重做，但 **scope 不会自动扩充**。
+用户可以在右侧「阶段设置」里勾选或追加角度/方向——追加只在内置集合上加条目，不替换内置项。中途升档只作用于尚未进行的阶段。
+
+升档只改**执行深度**，不改**范围**（D4）。S3 点升档时按评审发现落在哪决定回退深度：
+
+| 评审发现 | 回退到 | 理由 |
+| :--- | :--- | :--- |
+| 全在冻结 scope 内 | S2 | 重做开发就能修 |
+| 有 CRITICAL / MAJOR 落在 scope 外 | S1 | 重做 S2 修不了，得先更新 scope.json 并重新批准 |
+
+两种情况 scope 都**不会自动扩充**；评审卡片会列出落在 scope 外的那几条。
 
 ## 开发规则
 
@@ -136,7 +145,7 @@ bundle 的 `__ModuleLoader__.load` id 是否等于包名、宿主半有没有跨
 ### 不开 DSH 就能验的
 
 ```bash
-npm test          # 126 项：状态机 / 假宿主集成 / 客户端真渲染点击 / 安装就绪度
+npm test          # 134 项：状态机 / 假宿主集成 / 客户端真渲染点击 / 安装就绪度
 npm run test:install  # 装进 profile 后的清单、软链、bundle 契约
 ```
 
@@ -159,6 +168,7 @@ npm run test:install  # 装进 profile 后的清单、软链、bundle 契约
 | 8 | S3 让评审子代理试 `write` | 工具层 deny，reason 含「只读」 | AC-4 |
 | 9 | S3 点「升档到大需求严格执行」 | 只切 S3/S4 参数，S2 记录不变 | AC-6 |
 | 10 | S3 有阻断项时点「升档」 | 回退到 S2 重做，评审发现作为输入 | AC-7 |
+| 10b | 阻断项落在 scope 外的文件上，再点「升档」 | 回退到 S1 调 scope，评审卡片列出 scope 外的发现 | D4 |
 | 11 | S4 点「验收通过，结束流程」 | 顶部台账显示完成；`.dsh-flowgate/flows.jsonl` 落盘 | AC-8 |
 | 12 | 在任一门禁点「跳过」 | 该阶段标「已跳过」，台账计数 +1，后续阶段仍可推进 | AC-2 / D3 |
 
@@ -170,7 +180,7 @@ npm run test:install  # 装进 profile 后的清单、软链、bundle 契约
 | :--- | :--- | :--- |
 | 会话过期返回 401 | AC-1 / AC-3 / AC-5 / AC-8 | S1 写操作被拒；两次追问卡片点选完成；越界写被拒并给出回退指引；16 条事件落盘 |
 | 跳过与升档 | AC-2 / D3 | 门禁点「跳过评审直接开发」后 scope 仍冻结、S1 记 `skipped_by_user`、台账计数 1，S2 可进入 |
-| 评审升档回退 | AC-6 / AC-7 / D4 | fast 起步 → S3 评审 2 角度发现 1 个 CRITICAL → 点升档 → 回退 S2 → 重做后评审 4 角度、测试 3 方向；scope 始终 1 个文件（未扩充） |
+| 评审升档回退 | AC-6 / AC-7 | fast 起步 → S3 评审 2 角度发现 1 个 CRITICAL（落在 scope 内）→ 点升档 → 回退 S2 → 重做后评审 4 角度、测试 3 方向；scope 始终 1 个文件（未扩充） |
 | 严格档全流程 | AC-6 | S1 门禁直接选严格档，评审 4 角度、测试 3 方向，含 `fail` / `uncovered` 结果正常聚合 |
 | 升档后重做 | D1 | `dev.summary` 在两次 S2 里都自动采集，用户没贴过 diff |
 
@@ -180,6 +190,9 @@ npm run test:install  # 装进 profile 后的清单、软链、bundle 契约
 - **shell 工具名硬编码 `bash`**：本 profile 装的是 dsh-ops，真名 `ops_bash`，守卫对真实 shell 完全失效。
   改为 `SHELL_TOOLS` 集合后 `ops_bash` / `powershell` 等别名同样受管。
 - **升档清空开发规则**：`flow.overrides` 整体重置会把用户勾选的规则一起丢掉，现在只重置角度与方向。
+
+D4 的另一半（发现落在 scope 外 → 回退 S1）在实机上没有跑到，由 `test/host.test.mjs` 的「D4 升档遇到 scope
+外发现时回退 S1 而不是 S2」用例覆盖：断言回退目标为 S1、`reviewOutsideScope` 列出该文件、scope 未被扩充。
 
 ### 出问题先看哪
 

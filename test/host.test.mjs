@@ -58,8 +58,28 @@ function makeHost(cwd, sessionId) {
       },
     },
   }
+  // 便捷入口：一个宿主实例自带 session 上下文，多流程用例不必各自拼 exec 与 Request。
+  const tool = (name, args) => {
+    const definition = tools.get(name)
+    assert.ok(definition, '工具未注册：' + name)
+    return definition.execute(args, {
+      name,
+      arguments: args,
+      agent: { session: { header: { id: sessionId, cwd } } },
+      signal: undefined,
+    })
+  }
+  const request = async (path, body) => {
+    const pathname = path.split('?')[0]
+    const spec = routes.find((r) => r.path === pathname)
+    assert.ok(spec, '路由未注册：' + pathname)
+    const init = body === undefined ? undefined : { method: 'POST', body: JSON.stringify(body) }
+    const response = await spec.fetch(new Request('http://host' + path, init))
+    return { status: response.status, body: await response.json() }
+  }
+
   apply({ inject: (_names, cb) => cb(scoped) })
-  return { tools, routes, handlers, shell }
+  return { tools, routes, handlers, shell, tool, request }
 }
 
 const cwd = mkdtempSync(join(tmpdir(), 'flowgate-'))
@@ -457,6 +477,66 @@ check('PRD 4.5 追加自定义规则后默认启用', () => {
 
 const unknownRule = await postAction('toggleRule', { id: 'nope', enabled: true })
 check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status, 409))
+
+// ---------------------------------------------------------------------------
+// D4：升档只改执行深度，不改范围——回退深度由「发现落在哪」决定。
+// ---------------------------------------------------------------------------
+
+{
+  // 用独立 session 起一条新流程，避免被上面的流程状态污染。
+  const d4Session = 'sess-d4'
+  const ctx4 = makeHost(cwd, d4Session)
+  const state4 = await ctx4.request('/api/flowgate/state?sessionId=' + d4Session)
+  assert.equal(state4.body.active, false)
+
+  await ctx4.tool('flowgate_start', { title: 'D4 回退深度', preset: 'fast' })
+  const doc4 = ctx4.tool('flowgate_doc', {
+    html: '<html><body><p>D4</p></body></html>',
+    recommendedPreset: 'fast',
+    reason: '只验回退深度',
+    scope: {
+      files_expected_to_change: ['src/auth/session.ts'],
+      capabilities: ['会话过期检测'],
+      out_of_scope_explicitly: ['OAuth'],
+      acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
+    },
+  })
+  await tick()
+  await ctx4.request('/api/flowgate/action', { sessionId: d4Session, action: 'doc', payload: { decision: 'approve' } })
+  await doc4
+
+  const dev4 = ctx4.tool('flowgate_gate', {})
+  await tick()
+  await ctx4.request('/api/flowgate/action', { sessionId: d4Session, action: 'gate', payload: { decision: 'pass' } })
+  await dev4
+
+  // 发现落在 scope 之外：重做 S2 也修不了，只能回 S1 调 scope。
+  const review4 = ctx4.tool('flowgate_review', {
+    angles: [{
+      id: 'security',
+      name: '安全',
+      verdict: 'blocking',
+      findings: [{ file: 'src/config/secrets.ts', line: 7, severity: 'CRITICAL', summary: '密钥硬编码' }],
+    }],
+  })
+  await tick()
+  const up4 = await ctx4.request('/api/flowgate/action', { sessionId: d4Session, action: 'upgrade', payload: { preset: 'strict' } })
+  check('D4 升档遇到 scope 外发现时回退 S1 而不是 S2', () => {
+    assert.equal(up4.status, 200)
+    assert.equal(up4.body.stage, 'S1')
+    assert.equal(up4.body.preset, 'strict')
+    assert.equal(up4.body.reviewOutsideScope.length, 1)
+    assert.equal(up4.body.reviewOutsideScope[0].file, 'src/config/secrets.ts')
+  })
+  const review4Result = await review4
+  check('D4 回退 S1 后评审工具被中断而不是继续等待', () => {
+    assert.equal(review4Result.decision, 'interrupted')
+    assert.equal(review4Result.next, 'S1')
+  })
+  check('D4 回退 S1 后 scope 没有被自动扩充', () => {
+    assert.deepEqual(up4.body.scope.data.in_scope.files_expected_to_change, ['src/auth/session.ts'])
+  })
+}
 
 rmSync(cwd, { recursive: true, force: true })
 console.log('\n全部通过：' + passed.length + ' 项')
