@@ -20,6 +20,24 @@ dsh plugin --profile <profile> add link:D:/Projects/dsh-flowgate
 
 装完**重启 DSH 进程**：客户端 bundle 元数据按包名缓存，不重启拿不到新的 `dsh.client` 声明。
 
+### 桌面端（desktop profile）
+
+桌面端由 Electron 独占管理 profile，CLI 的 `dsh plugin` 装不进去，直接改 profile 清单：
+
+```jsonc
+// %USERPROFILE%\.dsh\profiles\desktop\package.json
+{
+  "dsh": { "profile": { "bundles": [ /* …原有条目… */, "dsh-flowgate" ] } },
+  "dependencies": { "dsh-flowgate": "link:D:/Projects/dsh-flowgate" }
+}
+```
+
+```bash
+cd "$USERPROFILE/.dsh/profiles/desktop" && pnpm install --prefer-offline
+```
+
+然后完全退出并重启桌面端。装完用 `npm run test:install` 复核清单、软链、bundle 契约与宿主导出是否都对得上。
+
 ## 四阶段与门禁
 
 | 阶段 | 产出 | 出口门禁 |
@@ -77,7 +95,12 @@ npm test              # 三套全跑
 npm run test:host     # 状态机 / scope 守卫 / 门禁流转（纯 node，无需 DSH）
 npm run test:integration  # 假宿主跑真实 apply()：工具注册、pre-execute 守卫、HTTP 路由、挂起-唤醒
 npm run test:client   # 用 react-test-renderer 真渲染客户端并点击按钮
+npm run test:install  # 静态核对 profile 清单、软链、bundle 契约（需先装进 profile）
 ```
+
+`test:install` 按 DSH 的客户端模块扫描规则复核：`dsh.client` 字段形状、`exports["./client"]` 是否指向真实文件、
+bundle 的 `__ModuleLoader__.load` id 是否等于包名、宿主半有没有跨包值导入。这些错了宿主只会静默跳过该插件，
+提前用一条命令查出来比在界面里找不到入口好排查。
 
 ## 数据
 
