@@ -55,7 +55,14 @@ cd "$USERPROFILE/.dsh/profiles/desktop" && pnpm install --prefer-offline
 
 > 该文件不在冻结 scope 内。要修改它，必须先回到需求分析阶段更新 scope.json 并重新批准。
 
+**变更性 shell 在 S2 也被拦。** shell 命令没法逐条核对 scope，放行等于给 scope 边界开后门，所以
+`rm` / `mv` / `sed -i` / `git checkout` / 重定向写文件这类命令在 S2 同样被拒绝，指引改用 `write` / `edit`。
+只读命令（`git diff`、`git status`、`grep`…）不受影响。
+
 **评审只读。** 评审子代理 spawn 时带 `toolFilter.deny`，把 `write` / `edit` / `str_replace_editor` / `subagent` / `send_message` 等工具从它的工具集里彻底剥离，它只能读 diff、读文件、跑只读 shell。
+
+> shell 工具名按集合识别（`bash` / `shell` / `exec` / `ops_bash` / `powershell`…），不硬编码某一个名字——
+> 不同 profile 装的 shell 插件不一样，只认一个名字等于给自己留后门。
 
 ## 档位
 
