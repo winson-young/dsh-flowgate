@@ -100,6 +100,7 @@ let host = null
 await check('宿主半可被 import 且导出 name / inject / apply', async () => {
   host = await import(pathToFileURL(join(linkedDir, pkg.main ?? 'lib/index.js')).href)
   assert.equal(typeof host.apply, 'function', '缺少 apply')
+  assert.equal(host.name, pkg.name, '导出的 name 必须等于包名（Cordis 用它做诊断与依赖解析）')
 })
 
 await check('宿主半不引入任何 @deepseek-ai/* 运行时依赖', () => {
