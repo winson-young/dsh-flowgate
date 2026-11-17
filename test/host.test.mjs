@@ -320,6 +320,8 @@ check('AC-7 升档且评审有阻塞项 → 回退 S2 重做', () => assert.equa
 const reviewResult2 = await reviewPending2
 check('AC-7 回退后评审工具返回 wait/reject 语义', () => assert.ok(reviewResult2))
 check('升档后评审角度切换为 4 个', () => assert.equal(upgraded.body.angles.length, 4))
+// 角度/方向随档位重置是对的；开发规则的勾选与档位无关，升档不该静默丢掉。
+check('升档保留用户勾选的开发规则', () => assert.equal(upgraded.body.ruleIds.length, 5))
 
 // 重做 → 门禁 → 评审 → 测试 → 验收通过。
 const devPending3 = gateRound('flowgate_gate', {}, { decision: 'pass' })
