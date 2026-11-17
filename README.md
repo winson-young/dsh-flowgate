@@ -20,6 +20,15 @@ dsh plugin --profile <profile> add link:D:/Projects/dsh-flowgate
 
 装完**重启 DSH 进程**：客户端 bundle 元数据按包名缓存，不重启拿不到新的 `dsh.client` 声明。
 
+装好之后，改代码的生效范围不一样：
+
+| 改的是 | 要做什么 |
+| :--- | :--- |
+| `lib/client.js`（客户端半） | 存盘即可，浏览器收到 rebuild 帧自动 reload |
+| `lib/index.js`（宿主半） | **必须重启 DSH 进程**——宿主模块 import 一次就缓存了 |
+
+宿主半改了没重启，表现是「工具还是旧行为、界面还是旧字段」，而文件、测试、git 都是新的。`npm test` 跑的是文件，验不出这件事。
+
 ### 桌面端（desktop profile）
 
 桌面端由 Electron 独占管理 profile，CLI 的 `dsh plugin` 装不进去，直接改 profile 清单：
