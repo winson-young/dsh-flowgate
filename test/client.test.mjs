@@ -1027,12 +1027,52 @@ await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
 }
 
 {
+  // 流程结束（含放弃）后 view 仍然是 active，dock 不能因此把启动入口藏起来：
+  // 用户在对话里看到「流程已结束」，下一步往往就是想接着做下一件事。
+  posted = []
   currentView = baseView('S4', { finished: true, skippedCount: 2 })
   const renderer = await render(FlowgateDock, {})
   const text = flat(renderer.toJSON())
   await check('流程结束后 dock 显示已结束与跳过计数', () => {
     assert.ok(text.includes('流程已结束'))
     assert.ok(text.includes('已跳过 2 个阶段'))
+  })
+  await check('流程结束后 dock 仍然给得出开始入口', () => {
+    assert.ok(text.includes('开始需求分析'), '已结束的流程也要能直接开新的')
+  })
+  await check('已结束时点开始同样先展开填写区，填了才发 start', async () => {
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    assert.equal(posted.length, 0, '展开阶段不该发请求')
+    const area = findTags(renderer.toJSON(), 'textarea')[0]
+    assert.ok(area, '展开后要有需求输入框')
+    await act(async () => {
+      area.props.onChange({ target: { value: '接着做登录限流' } })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    })
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    assert.equal(posted.at(-1).action, 'start')
+    assert.equal(posted.at(-1).payload.brief, '接着做登录限流')
+  })
+}
+
+{
+  currentView = baseView('S4', { finished: true })
+  const renderer = await render(WorkbenchView, {})
+  const text = flat(renderer.toJSON())
+  await check('已结束时工作台仍然能开始新流程', () => {
+    assert.ok(text.includes('这次流程已结束'))
+    assert.ok(text.includes('开始一次新流程'))
+    assert.ok(text.includes('开始需求分析'))
+  })
+}
+
+{
+  currentView = baseView('S2', { finished: true, cancelled: true, cancelReason: '先不做了' })
+  const renderer = await render(WorkbenchView, {})
+  await check('已放弃时工作台也能开始新流程', () => {
+    const text = flat(renderer.toJSON())
+    assert.ok(text.includes('这次流程已放弃'))
+    assert.ok(text.includes('开始一次新流程'))
   })
 }
 
