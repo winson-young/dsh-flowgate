@@ -400,6 +400,52 @@ const FlowgateDock = registrations[1].Component
   })
 }
 
+// 未跟踪文件是开发阶段的常态：git diff --numstat 看不见它们，摘要必须单独标出来。
+{
+  currentView = baseView('S2', {
+    devChanges: {
+      files: ['src/auth/session.ts', 'src/auth/new-helper.ts'],
+      untracked: ['src/auth/new-helper.ts'],
+      added: 42,
+      removed: 7,
+      at: '2026-11-17T09:40:00Z',
+    },
+    waiting: true,
+    waitingKind: 'gate',
+  })
+  const renderer = await render(WorkbenchView, {})
+  const tree = renderer.toJSON()
+  const text = flat(tree)
+
+  await check('S2 摘要把未跟踪文件标为新增', () => {
+    assert.ok(text.includes('1 个新增'))
+    assert.ok(text.includes('新增'))
+    assert.ok(text.includes('src/auth/new-helper.ts'))
+  })
+}
+
+// 采集失败不等于没有变更：原因必须原样显示，否则空摘要会被误读成「什么都没改」。
+{
+  currentView = baseView('S2', {
+    devChanges: {
+      files: [],
+      untracked: [],
+      added: 0,
+      removed: 0,
+      at: '2026-11-17T09:40:00Z',
+      error: '宿主没有可用的 shell 服务，无法自动采集变更摘要。',
+    },
+    waiting: true,
+    waitingKind: 'gate',
+  })
+  const renderer = await render(WorkbenchView, {})
+  const text = flat(renderer.toJSON())
+
+  await check('S2 采集失败时显示宿主给的原因', () => {
+    assert.ok(text.includes('无法自动采集变更摘要'))
+  })
+}
+
 // ---------------------------------------------------------------------------
 // 6. S3：评审报告
 // ---------------------------------------------------------------------------
