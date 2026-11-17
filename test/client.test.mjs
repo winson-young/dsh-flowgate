@@ -597,7 +597,27 @@ const FlowgateDock = registrations[1].Component
   }
   walk(renderer.toJSON())
   const text = flat(renderer.toJSON())
-  await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
+  await check('S1 追问卡片的跳过按钮不放行追问', async () => {
+  currentView = baseView('S1', {
+    grill: { pending: { id: 'q-skip', question: '过期后是否强制重新登录？', options: [{ label: '强制重新登录', tradeoff: '更安全' }], recommended: 0 }, answeredCount: 0 },
+  })
+  posted = []
+  const tree = await render(WorkbenchView, {})
+  const skip = buttonByText(tree.toJSON(), '跳过')
+  await click(skip)
+  assert.equal(posted.length, 0, '跳过不能提交任何动作')
+  const text = flat(tree.toJSON())
+  assert.ok(text.includes('跳过不会放行追问'), '必须说明跳过不放行')
+})
+
+await check('点「修改需求」后回到追问流程并说明下一步', async () => {
+  currentView = baseView('S1', { doc: { html: null, revisedAt: '2026-11-17T10:00:00Z' } })
+  const tree = await render(WorkbenchView, {})
+  const text = flat(tree.toJSON())
+  assert.ok(text.includes('你点了「修改需求」'))
+})
+
+await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
     assert.ok(text.includes('授权执行变更性命令'))
     const grant = boxes.find((node) => node.props.disabled === false && node.props.checked === false)
     assert.ok(grant, 'S4 下必须有一个可用的授权勾选框')
