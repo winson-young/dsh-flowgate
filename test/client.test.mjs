@@ -226,6 +226,30 @@ await check('样式只注入一次', () => {
   assert.ok(styleNodes[0].textContent.includes('.fg-root'))
 })
 
+await check('样式不写死颜色，全部走 DSH 主题 token', () => {
+  const css = styleNodes[0].textContent
+  const literal = css.match(/#[0-9a-fA-F]{3,8}\b|\brgba?\(|\bhsla?\(/g) ?? []
+  assert.deepEqual(literal, [], '不得出现颜色字面量：' + literal.join(', '))
+  // 只允许 ui-theme 真正定义的 alias 名；写错名字会静默失效（var() 取不到值即继承/透明）。
+  const KNOWN = new Set([
+    'label-primary', 'label-secondary', 'label-tertiary', 'label-caption',
+    'label-primary-inverted', 'label-primary-foreground',
+    'bg-base', 'bg-layer-1', 'bg-layer-2', 'bg-layer-3', 'bg-overlay',
+    'border-l1', 'border-l2', 'border-l3', 'border-l4',
+    'brand-primary', 'brand-text',
+    'state-error-primary', 'state-error-secondary',
+    'state-success-primary', 'state-success-secondary', 'state-success-tertiary',
+    'state-warn-primary', 'state-warn-secondary', 'state-warn-tertiary', 'state-warn-label',
+    'state-business-primary', 'state-business-tertiary',
+    'interactive-bg-hover', 'interactive-bg-hover-accent', 'interactive-bg-hover-danger',
+  ])
+  const used = [...new Set((css.match(/var\(--dsw-alias-([a-z0-9-]+)/g) ?? [])
+    .map((s) => s.replace('var(--dsw-alias-', '')))]
+  const unknown = used.filter((name) => !KNOWN.has(name))
+  assert.deepEqual(unknown, [], '用到了 ui-theme 未定义的 token：' + unknown.join(', '))
+  assert.ok(used.length > 8, '样式应当大量复用主题 token')
+})
+
 const WorkbenchView = registrations[0].Component
 const FlowgateDock = registrations[1].Component
 

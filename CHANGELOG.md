@@ -24,6 +24,7 @@
 - S3 门禁在存在 scope 外发现时显示「回到需求分析调整 scope」按钮（D4 的回退入口）。
 - 升档回退的提示文案跟随实际回退目标（此前写死 S2，回退到 S1 时会误导 Agent 去改代码）。
 - README 补「改客户端半 / 宿主半的生效范围」：客户端存盘自动 reload，宿主半必须重启进程。
+- **界面颜色改为跟随 DSH 主题**：此前客户端用的 `--dsw-alias-text-primary` / `--dsw-alias-border-default` / `--dsw-alias-accent-primary` 等名字在 ui-theme 里并不存在，`var()` 取不到值就落到写死的 fallback，界面实际是固定色、完全不跟明暗主题。现全部换成 ui-theme 真实 token（`label-*` / `bg-layer-*` / `border-l*` / `brand-primary` / `state-*`），并删掉所有颜色字面量（状态徽标改用 `state-*` 语义色，主按钮前景改用 `label-primary-inverted`）。
 - 集成测试补齐 AC-4：评审 / 测试子代理会话的写工具在工具层被拒绝，解绑后回到父流程判定。
 - 安装就绪度检查：按 DSH 客户端模块扫描规则复核 profile 清单、软链、`dsh.client` 形状、bundle id 与宿主导出。
 - 修正 S2 变更摘要采集：改用 `shell.run(shell.resolve({ workdir }))`，与 `ShellExecRequest` 的实际字段和

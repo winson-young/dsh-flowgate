@@ -29,6 +29,20 @@ dsh plugin --profile <profile> add link:D:/Projects/dsh-flowgate
 
 宿主半改了没重启，表现是「工具还是旧行为、界面还是旧字段」，而文件、测试、git 都是新的。`npm test` 跑的是文件，验不出这件事。
 
+### 界面配色
+
+界面不定义自己的颜色，全部走 DSH 主题 token（`--dsw-alias-*`），所以会跟随用户的明暗主题和主题插件：
+
+| 用途 | token |
+| :--- | :--- |
+| 正文 / 次要 / 辅助文字 | `label-primary` / `label-secondary` / `label-tertiary` |
+| 页面底 / 卡片与面板 | `bg-base` / `bg-layer-1` |
+| 分隔线与描边 | `border-l2` |
+| 主按钮与选中态 | `brand-primary`（前景用 `label-primary-inverted`） |
+| 状态徽标 | `state-success-*` / `state-warn-*` / `state-error-*` / `state-business-*` |
+
+`test:client` 会断言样式里不含任何颜色字面量，且用到的 token 名都在 ui-theme 的定义清单内——写错名字的 `var()` 不会报错，只会静默失效，这条断言就是为了防它。
+
 ### 桌面端（desktop profile）
 
 桌面端由 Electron 独占管理 profile，CLI 的 `dsh plugin` 装不进去，直接改 profile 清单：
