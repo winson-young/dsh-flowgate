@@ -130,6 +130,23 @@ cd "$USERPROFILE/.dsh/profiles/desktop" && pnpm install --prefer-offline
 授权只覆盖**变更性 shell**。`write` / `edit` / `str_replace_editor` 对这些子代理仍然硬拒绝——
 允许跑迁移，不等于允许改代码。流程一旦回退（`rollbackTo`），`writeGrants` 立即清空，重做后要重新授权。
 
+## 放弃流程
+
+流程不是单向的：卡在 S1 想换需求、或者干脆不想做了，都可以随时放弃。
+门禁面板最底部有「放弃这次流程」，点一次变成「确认放弃 / 再想想」，**第二次点击才真的放弃**——
+放弃会作废掉这条流程的全部阶段记录，不该是一按就中的操作。没有挂起门禁时入口也在。
+
+放弃做四件事：
+
+1. 流程标记为已结束 + 已放弃（`cancelled` / `cancelledAt` / `cancelReason`）；
+2. **解冻 scope** 并清空 `writeGrants`，否则下一次启动会带着上一轮的越界白名单跑；
+3. 写一条 `flow.cancelled` 审计事件进 `flows.jsonl`；
+4. 唤醒所有挂起的门禁工具，让它们立刻返回 `cancelled` 而不是等到超时——
+   Agent 那边看到的是「用户放弃了这次流程」，而不是卡住的工具调用。
+
+放弃和跳过不是一回事：跳过是「这个阶段的评审不做了，继续往下走」，会留下 `skipped_by_user` 标记；
+放弃是「这条流程不要了」，不会推进任何阶段。Agent 也可以调 `flowgate_cancel`，语义与界面按钮完全一致。
+
 ## 工具
 
 | 工具 | 用途 |
@@ -142,6 +159,7 @@ cd "$USERPROFILE/.dsh/profiles/desktop" && pnpm install --prefer-offline
 | `flowgate_review_run` | 由宿主端为每个评审角度 spawn 只读子代理，聚合后挂起等门禁 |
 | `flowgate_test` | 提交 S4 测试报告（报告由当前 Agent 产出） |
 | `flowgate_test_run` | 由宿主端为每个测试方向 spawn 执行单元，聚合后挂起等门禁 |
+| `flowgate_cancel` | 放弃当前流程：解冻 scope、写审计事件、唤醒挂起的门禁 |
 | `flowgate_status` | 读取当前流程状态 |
 
 `flowgate_review_run` / `flowgate_test_run` 只在宿主提供 `subagents` 服务时可用（视图里的 `canSpawn` 会告诉客户端）；
@@ -195,6 +213,8 @@ npm run test:install  # 装进 profile 后的清单、软链、bundle 契约
 | 10b | 阻断项落在 scope 外的文件上，再点「升档」 | 回退到 S1 调 scope，评审卡片列出 scope 外的发现 | D4 |
 | 11 | S4 点「验收通过，结束流程」 | 顶部台账显示完成；`.dsh-flowgate/flows.jsonl` 落盘 | AC-8 |
 | 12 | 在任一门禁点「跳过」 | 该阶段标「已跳过」，台账计数 +1，后续阶段仍可推进 | AC-2 / D3 |
+| 13 | 门禁面板底部点「放弃这次流程」，再点「确认放弃」 | 只点一次不出结果（变成二次确认）；确认后流程标「已放弃」、scope 解冻、Agent 的工具立刻返回 `cancelled` | 放弃流程 |
+| 14 | 放弃后回空态重新启动 | 新流程从 S1 开始，不带着上一条的 scope 白名单 | 放弃流程 |
 
 ### 实机验证记录（2026-11-17，桌面端 0.2.2-rc.3）
 

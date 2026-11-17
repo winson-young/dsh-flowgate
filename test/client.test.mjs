@@ -893,6 +893,66 @@ await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
 }
 
 // ---------------------------------------------------------------------------
+// 8.6 放弃流程：门禁面板底部必须有出口，而且要点两次才真的放弃
+// ---------------------------------------------------------------------------
+
+{
+  posted = []
+  currentView = baseView('S2', { waiting: true, waitingKind: 'gate' })
+  const renderer = await render(WorkbenchView, {})
+  await check('门禁面板底部有「放弃这次流程」入口', () => {
+    assert.ok(flat(renderer.toJSON()).includes('放弃这次流程'))
+  })
+  await click(buttonByText(renderer.toJSON(), '放弃这次流程'))
+  await check('点一次只是二次确认，不会立刻放弃', () => {
+    assert.equal(posted.length, 0, '一按就发 cancel 请求等于没有防手滑')
+    const text = flat(renderer.toJSON())
+    assert.ok(text.includes('确认放弃'))
+    assert.ok(text.includes('都会作废'))
+  })
+  await click(buttonByText(renderer.toJSON(), '再想想'))
+  await check('「再想想」收起确认，同样不发请求', () => {
+    assert.equal(posted.length, 0)
+    assert.ok(flat(renderer.toJSON()).includes('放弃这次流程'))
+  })
+  await click(buttonByText(renderer.toJSON(), '放弃这次流程'))
+  await click(buttonByText(renderer.toJSON(), '确认放弃'))
+  await check('确认放弃发出 cancel 动作并带上原因', () => {
+    assert.equal(posted.length, 1, '只能提交一次')
+    assert.equal(posted[0].action, 'cancel')
+    assert.ok(posted[0].payload.reason.length > 0)
+  })
+}
+
+{
+  // 没有挂起门禁时也要能放弃：用户卡在 S1 想换个需求是常见情形。
+  currentView = baseView('S1', { waiting: false })
+  const renderer = await render(WorkbenchView, {})
+  await check('没有挂起门禁时也能放弃流程', () => {
+    assert.ok(flat(renderer.toJSON()).includes('放弃这次流程'))
+  })
+}
+
+{
+  currentView = baseView('S2', {
+    finished: true,
+    cancelled: true,
+    cancelledAt: '2026-11-17T10:30:00Z',
+    cancelReason: '这个需求先不做了',
+  })
+  const renderer = await render(WorkbenchView, {})
+  const text = flat(renderer.toJSON())
+  await check('已放弃的流程显示放弃标记与原因', () => {
+    assert.ok(text.includes('流程已放弃'))
+    assert.ok(text.includes('这个需求先不做了'))
+    assert.ok(text.includes('scope 已解冻'))
+  })
+  await check('已放弃后不再显示放弃入口', () => {
+    assert.ok(!text.includes('放弃这次流程'))
+  })
+}
+
+// ---------------------------------------------------------------------------
 // 9. 输入区上方的常驻条
 // ---------------------------------------------------------------------------
 

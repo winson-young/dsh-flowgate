@@ -123,9 +123,9 @@ const check = async (name, fn) => {
   console.log('ok   ' + name)
 }
 
-await check('apply 注册 9 个工具与 2 条路由', () => {
+await check('apply 注册 10 个工具与 2 条路由', () => {
   assert.deepEqual([...host.tools.keys()].sort(), [
-    'flowgate_ask', 'flowgate_doc', 'flowgate_gate', 'flowgate_review',
+    'flowgate_ask', 'flowgate_cancel', 'flowgate_doc', 'flowgate_gate', 'flowgate_review',
     'flowgate_review_run', 'flowgate_start', 'flowgate_status', 'flowgate_test', 'flowgate_test_run',
   ])
   assert.ok(host.routes.has('/api/flowgate/state'))

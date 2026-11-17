@@ -672,5 +672,115 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
   })
   rmSync(repo, { recursive: true, force: true })
 }
+// ---------------------------------------------------------------------------
+// 取消：用户放弃流程时必须把流程判死、解冻 scope，并唤醒挂起的门禁工具。
+// 否则 Agent 的工具会一直等到超时，用户看到的是「点了没反应」。
+// ---------------------------------------------------------------------------
+
+{
+  const cx = makeHost(cwd, 'sess-cancel')
+  await cx.tool('flowgate_start', { title: '取消演示', preset: 'fast' })
+
+  // 需求文档门禁挂起时放弃：工具要立刻返回 cancelled，而不是等到超时。
+  const pendingDoc = cx.tool('flowgate_doc', {
+    html: '<html><body><p>取消</p></body></html>',
+    scope: {
+      files_expected_to_change: ['src/a.ts'],
+      capabilities: ['改 a.ts'],
+      out_of_scope_explicitly: [],
+      acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
+    },
+  })
+  await tick()
+  const cancelReply = await cx.request('/api/flowgate/action', {
+    sessionId: 'sess-cancel',
+    action: 'cancel',
+    payload: { reason: '这个需求先不做了' },
+  })
+  const docResult = await pendingDoc
+  check('取消会唤醒挂起的文档门禁，工具返回 cancelled', () => {
+    assert.equal(cancelReply.status, 200, JSON.stringify(cancelReply.body))
+    assert.equal(docResult.decision, 'cancelled')
+    assert.equal(docResult.frozen, false)
+    assert.match(docResult.message, /放弃/)
+  })
+  check('取消后流程标记为已放弃，scope 解冻', () => {
+    const v = cancelReply.body
+    assert.equal(v.finished, true)
+    assert.equal(v.cancelled, true)
+    assert.equal(v.cancelReason, '这个需求先不做了')
+    assert.ok(v.cancelledAt, '应记录放弃时间')
+    assert.equal(v.scope.frozen, false)
+    assert.equal(v.scope.data, null)
+  })
+  const afterCancel = await cx.guard('write', { file_path: join(cwd, 'src/a.ts'), content: 'x' })
+  check('取消后写操作不再被 scope 拦截', () => assert.equal(afterCancel.kind, 'allow'))
+
+  const twice = await cx.tool('flowgate_cancel', {})
+  check('流程已结束后再放弃工具返回「不需要」而不是报错', () => {
+    assert.equal(twice.cancelled, false)
+    assert.match(twice.message, /已经结束/)
+  })
+  const again = await cx.request('/api/flowgate/action', { sessionId: 'sess-cancel', action: 'cancel', payload: {} })
+  check('已结束流程再发 cancel 动作返回 409', () => {
+    assert.equal(again.status, 409)
+    assert.match(again.body.error, /已经结束/)
+  })
+
+  // 放弃后必须能重开，并且新流程不带着上一轮的 scope 白名单。
+  const restarted = await cx.request('/api/flowgate/action', {
+    sessionId: 'sess-cancel',
+    action: 'start',
+    payload: { title: '再来一次' },
+  })
+  check('放弃后可以重新启动一条干净的新流程', () => {
+    assert.equal(restarted.status, 200)
+    assert.equal(restarted.body.active, true)
+    assert.equal(restarted.body.cancelled, false)
+    assert.equal(restarted.body.title, '再来一次')
+    assert.equal(restarted.body.scope.frozen, false)
+  })
+}
+
+// 开发阶段门禁挂起时放弃：gate 工具返回 cancelled，阶段不再推进。
+{
+  const gx = makeHost(cwd, 'sess-cancel-gate')
+  await gx.tool('flowgate_start', { title: '取消开发门禁', preset: 'fast' })
+  const docGate = gx.tool('flowgate_doc', {
+    html: '<html><body><p>取消</p></body></html>',
+    scope: {
+      files_expected_to_change: ['src/a.ts'],
+      capabilities: ['改 a.ts'],
+      out_of_scope_explicitly: [],
+      acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
+    },
+  })
+  await tick()
+  await gx.request('/api/flowgate/action', { sessionId: 'sess-cancel-gate', action: 'doc', payload: { decision: 'approve' } })
+  await docGate
+
+  const pendingGate = gx.tool('flowgate_gate', { summary: '改完了' })
+  await tick()
+  await gx.request('/api/flowgate/action', { sessionId: 'sess-cancel-gate', action: 'cancel', payload: { reason: '不想做了' } })
+  const gateResult = await pendingGate
+  check('取消会唤醒挂起的开发门禁，gate 返回 cancelled 且停在原地', () => {
+    assert.equal(gateResult.decision, 'cancelled')
+    assert.equal(gateResult.next, 'cancelled')
+    assert.equal(gateResult.stage, 'S2')
+    assert.match(gateResult.message, /放弃/)
+  })
+  const v = await gx.request('/api/flowgate/state?sessionId=sess-cancel-gate')
+  check('取消后阶段不再推进，S2 保持原状', () => {
+    assert.equal(v.body.stage, 'S2')
+    assert.equal(v.body.finished, true)
+    assert.equal(v.body.cancelled, true)
+  })
+  const log = readFileSync(join(cwd, '.dsh-flowgate', 'flows.jsonl'), 'utf8')
+  check('放弃写了一条 flow.cancelled 审计事件', () => {
+    assert.match(log, /"type":"flow\.cancelled"/)
+    assert.match(log, /不想做了/)
+  })
+}
+
 rmSync(cwd, { recursive: true, force: true })
 console.log('\n全部通过：' + passed.length + ' 项')
