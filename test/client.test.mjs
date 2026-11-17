@@ -1076,6 +1076,64 @@ await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
   })
 }
 
+
+// ---------------------------------------------------------------------------
+// 实时进度：用户提交需求后要能在工作台里看到「正在做什么」和推进到哪。
+// ---------------------------------------------------------------------------
+
+{
+  currentView = baseView('S1', {
+    progress: { percent: 43, stageIndex: 0, label: '需求分析' },
+    activity: { tool: 'read', text: '读取文件：src/auth/session.ts', elapsedMs: 2000 },
+    elapsedMs: 65000,
+  })
+  const renderer = await render(WorkbenchView, {})
+  const text = flat(renderer.toJSON())
+  await check('工作台顶部显示阶段进度、正在做什么与已用时间', () => {
+    assert.ok(text.includes('S1 需求分析 · 正在读取文件：src/auth/session.ts'), text)
+    assert.ok(text.includes('43%'))
+    assert.ok(text.includes('已用 1 分 5 秒'))
+  })
+}
+
+{
+  currentView = baseView('S2', {
+    waiting: true,
+    waitingKind: 'gate',
+    progress: { percent: 50, stageIndex: 1, label: '开发' },
+    elapsedMs: 125000,
+  })
+  const renderer = await render(WorkbenchView, {})
+  const text = flat(renderer.toJSON())
+  await check('门禁等待时进度条说明在等你，不假装 Agent 还在跑', () => {
+    assert.ok(text.includes('S2 开发 · 门禁等你确认'), text)
+    const dots = findTags(renderer.toJSON(), 'span').filter((node) => node.props?.className === 'fg-live-dot')
+    assert.equal(dots.length, 0)
+  })
+}
+
+{
+  currentView = baseView('S4', {
+    finished: true,
+    progress: { percent: 100, stageIndex: 3, label: '测试' },
+    elapsedMs: 600000,
+  })
+  const renderer = await render(WorkbenchView, {})
+  const text = flat(renderer.toJSON())
+  await check('流程结束后收起进度条，结果页不再被占一行', () => {
+    assert.ok(!text.includes('已用'))
+    assert.ok(!text.includes('等待 Agent 下一步'))
+  })
+}
+
+{
+  // 旧宿主不给 progress 时也不能崩：这条条是纯增量字段。
+  currentView = baseView('S1')
+  const renderer = await render(WorkbenchView, {})
+  await check('宿主没给进度字段时进度条不出现，布局也不塌', () => {
+    assert.ok(!flat(renderer.toJSON()).includes('等待 Agent 下一步'))
+  })
+}
 // ---------------------------------------------------------------------------
 // 收尾
 // ---------------------------------------------------------------------------

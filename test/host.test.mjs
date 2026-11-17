@@ -918,4 +918,75 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
 }
 
 rmSync(cwd, { recursive: true, force: true })
+
+// ---------------------------------------------------------------------------
+// 实时进度：提交需求后工作台要能显示「正在做什么」与推进到哪，
+// 否则用户只能对着一个静止页面等 Agent。
+// ---------------------------------------------------------------------------
+
+{
+  const cx = makeHost(cwd, 'sess-live')
+  const exec = (name, args) => ({ name, arguments: args, agent: { session: { header: { id: 'sess-live', cwd } } }, signal: undefined })
+  const pre = cx.handlers.get('tools/pre-execute')
+
+  await cx.tool('flowgate_start', { title: '实时进度', preset: 'fast', brief: '会话过期返回 401' })
+
+  const first = await cx.request('/api/flowgate/state?sessionId=sess-live')
+  check('启动后视图带阶段进度与已用时', () => {
+    const progress = first.body.progress
+    assert.ok(progress, '缺少 progress')
+    assert.equal(progress.steps.length, 4)
+    assert.equal(progress.steps[0].status, 'active')
+    assert.equal(progress.steps[1].status, 'pending')
+    assert.equal(progress.label, '需求分析')
+    assert.ok(progress.percent > 0 && progress.percent < 100, '进行中的流程不该是 0 或 100')
+    assert.equal(typeof first.body.elapsedMs, 'number')
+    assert.equal(first.body.activity, null)
+  })
+
+  await pre(exec('read', { path: join(cwd, 'src/auth/session.ts') }), async () => ({ kind: 'allow' }))
+  const second = await cx.request('/api/flowgate/state?sessionId=sess-live')
+  check('工具执行会留下「正在做什么」的摘要', () => {
+    const activity = second.body.activity
+    assert.ok(activity, '缺少 activity')
+    assert.match(activity.text, /读取文件/)
+    assert.match(activity.text, /session\.ts/)
+    assert.ok(activity.elapsedMs >= 0)
+  })
+
+  // Agent 停下来以后，上一条「正在读取文件」必须消失，否则像是卡住了。
+  const statusHandler = cx.handlers.get('agent/status')
+  assert.ok(statusHandler, 'agent/status 未被订阅')
+  statusHandler({ agent: { session: { header: { id: 'sess-live' } } }, status: 'idle' })
+  const idle = await cx.request('/api/flowgate/state?sessionId=sess-live')
+  check('Agent 空闲后不再显示上一次动作', () => assert.equal(idle.body.activity, null))
+
+  const docPending = cx.tool('flowgate_doc', {
+    html: '<html><body><h1>实时进度</h1></body></html>',
+    scope: {
+      files_expected_to_change: ['src/auth/session.ts'],
+      capabilities: ['会话过期检测'],
+      out_of_scope_explicitly: [],
+      acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
+    },
+  })
+  await tick()
+  await cx.request('/api/flowgate/action', { sessionId: 'sess-live', action: 'doc', payload: { decision: 'approve' } })
+  await docPending
+  const third = await cx.request('/api/flowgate/state?sessionId=sess-live')
+  check('进入下一阶段后不再显示上个阶段的旧动作', () => {
+    assert.equal(third.body.stage, 'S2')
+    assert.equal(third.body.activity, null)
+    assert.equal(third.body.progress.steps[0].status, 'done')
+    assert.equal(third.body.progress.steps[1].status, 'active')
+    assert.ok(third.body.progress.percent >= 25, 'S1 落地后总进度应有四分之一以上')
+  })
+
+  await cx.request('/api/flowgate/action', { sessionId: 'sess-live', action: 'cancel', payload: { reason: '测进度' } })
+  const ended = await cx.request('/api/flowgate/state?sessionId=sess-live')
+  check('放弃后的视图不再带活动摘要，进度保留实际值', () => {
+    assert.equal(ended.body.activity, null)
+    assert.ok(ended.body.progress.percent > 0)
+  })
+}
 console.log('\n全部通过：' + passed.length + ' 项')
