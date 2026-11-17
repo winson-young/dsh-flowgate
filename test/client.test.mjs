@@ -247,7 +247,7 @@ await check('样式不写死颜色，全部走 DSH 主题 token', () => {
     'label-primary-inverted', 'label-primary-foreground',
     'bg-base', 'bg-layer-1', 'bg-layer-2', 'bg-layer-3', 'bg-overlay',
     'border-l1', 'border-l2', 'border-l3', 'border-l4',
-    'brand-primary', 'brand-text',
+    'brand-primary', 'brand-text', 'button-primary-hover',
     'state-error-primary', 'state-error-secondary',
     'state-success-primary', 'state-success-secondary', 'state-success-tertiary',
     'state-warn-primary', 'state-warn-secondary', 'state-warn-tertiary', 'state-warn-label',
