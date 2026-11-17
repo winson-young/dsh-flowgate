@@ -547,6 +547,8 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
   check('D4 回退 S1 后评审工具被中断而不是继续等待', () => {
     assert.equal(review4Result.decision, 'interrupted')
     assert.equal(review4Result.next, 'S1')
+    // 文案必须跟着实际回退目标走：写死 S2 会让 Agent 误以为要去改代码。
+    assert.match(review4Result.message, /回退到 S1 重做/)
   })
   check('D4 回退 S1 后 scope 解冻，必须重新批准（不自动扩充）', () => {
     assert.equal(up4.body.scope.frozen, false)
