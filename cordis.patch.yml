@@ -1,0 +1,4 @@
+# dsh bundle patch: 把流程约束工作台插入 profile 的层栈。
+- insert:
+    - id: flowgate
+      name: 'dsh-flowgate'

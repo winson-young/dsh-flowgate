@@ -1,0 +1,63 @@
+{
+  "name": "dsh-flowgate",
+  "version": "0.1.0",
+  "description": "四阶段流程约束开发工作台：需求分析 → 开发 → 评审 → 测试，以代码级门禁控制阶段流转",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "workflow",
+    "gate",
+    "scope",
+    "review"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.1-rc.5 <0.3.0-0"
+  },
+  "scripts": {
+    "test": "node test/host.test.mjs && node test/integration.test.mjs && node test/client.test.mjs && node test/install.test.mjs",
+    "test:host": "node test/host.test.mjs",
+    "test:client": "node test/client.test.mjs",
+    "test:integration": "node test/integration.test.mjs",
+    "test:install": "node test/install.test.mjs",
+    "check": "node --check lib/index.js && node --check lib/client.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    },
+    "compatibility": {
+      "dsh": ">=0.2.1-rc.5 <0.3.0-0",
+      "dshReleases": {
+        "0.2.1-rc.5": "compatible",
+        "0.2.2-rc.1": "compatible"
+      }
+    }
+  },
+  "devDependencies": {
+    "react": "^18.0.0",
+    "react-dom": "^18.0.0",
+    "react-test-renderer": "^18.0.0",
+    "scheduler": "0.21.0"
+  }
+}
