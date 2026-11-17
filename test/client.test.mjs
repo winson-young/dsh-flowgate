@@ -59,6 +59,17 @@ function texts(node, out = []) {
   return out
 }
 
+function findTags(node, tag, out = []) {
+  if (node == null) return out
+  if (Array.isArray(node)) {
+    for (const child of node) findTags(child, tag, out)
+    return out
+  }
+  if (node.type === tag) out.push(node)
+  if (node.children) for (const child of node.children) findTags(child, tag, out)
+  return out
+}
+
 function flat(node) {
   return texts(node).join(' ')
 }
@@ -310,12 +321,26 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
     assert.ok(text.includes('开始一次新流程'))
     assert.ok(text.includes('小功能快速开发'))
   })
+  const areas = () => findTags(renderer.toJSON(), 'textarea')
+  await check('空态给的是需求描述输入框，不是只能填标题', () => {
+    assert.ok(flat(renderer.toJSON()).includes('需求描述'))
+    const found = areas()
+    assert.equal(found.length, 1, '必须有一个多行的需求描述输入框')
+    assert.equal(found[0].props.rows, 4)
+  })
   await check('点「开始需求分析」发出 start 动作（标题可以留空）', async () => {
+    // 先把需求写进去：这段文字会随 start 一起提交，宿主用它派生标题。
+    const area = areas()[0]
+    await act(async () => {
+      area.props.onChange({ target: { value: '会话过期返回 401，并给出重新认证入口\n第二行补充说明' } })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    })
     await click(buttonByText(renderer.toJSON(), '开始需求分析'))
     const last = posted.at(-1)
     assert.equal(last.action, 'start')
     assert.equal(last.payload.preset, 'fast')
     assert.equal(last.payload.title, '')
+    assert.equal(last.payload.brief, '会话过期返回 401，并给出重新认证入口\n第二行补充说明')
   })
   await check('先切档位再启动，请求里带上选择的档位', async () => {
     await click(buttonByText(renderer.toJSON(), '大需求严格执行'))

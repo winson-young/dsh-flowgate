@@ -598,6 +598,30 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
     assert.equal(again.body.id, started.body.id)
     assert.equal(again.body.preset, 'fast')
   })
+  // 需求描述：标题由第一行派生，原文进 brief，Agent 在 S1 直接读它提问。
+  const briefCtx = makeHost(cwd, 'sess-brief')
+  const withBrief = await briefCtx.request('/api/flowgate/action', {
+    sessionId: 'sess-brief',
+    action: 'start',
+    payload: { preset: 'fast', brief: '# 会话过期返回 401，并给出重新认证入口。\n\n第二段补充说明。' },
+  })
+  check('界面启动带需求描述时标题从第一行派生', () => {
+    assert.equal(withBrief.status, 200)
+    assert.equal(withBrief.body.title, '会话过期返回 401，并给出重新认证入口')
+    assert.equal(withBrief.body.brief, '# 会话过期返回 401，并给出重新认证入口。\n\n第二段补充说明。')
+  })
+  const briefStatus = await briefCtx.tool('flowgate_status', {})
+  check('流程摘要里带上需求原文，Agent 不必再问用户要一遍', () => {
+    assert.match(briefStatus.summary, /需求描述：# 会话过期返回 401/)
+  })
+  const longTitle = await makeHost(cwd, 'sess-brief-long').request('/api/flowgate/action', {
+    sessionId: 'sess-brief-long',
+    action: 'start',
+    payload: { brief: '一'.repeat(60) },
+  })
+  check('过长的需求第一行会被截断成标题', () => {
+    assert.equal(longTitle.body.title, '一'.repeat(40) + '…')
+  })
   const noCwd = await uiCtx.request('/api/flowgate/action', {
     sessionId: 'sess-no-cwd',
     action: 'start',
