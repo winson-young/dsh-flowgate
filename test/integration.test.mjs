@@ -48,6 +48,7 @@ function makeHost() {
     effect(fn) { const d = fn(); return typeof d === 'function' ? d : () => {} },
     on(event, handler) { listeners.set(event, handler); return () => {} },
     get(name) {
+      if (name === 'sessions') return { get: (id) => ({ header: { id, cwd: CWD } }) }
       if (name === 'subagents') return subagents
       if (name === 'shell') {
       return {

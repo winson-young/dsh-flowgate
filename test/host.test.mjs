@@ -41,7 +41,12 @@ function makeHost(cwd, sessionId) {
       return () => {}
     },
     get(name) {
-      return name === 'shell' ? shell : undefined
+      if (name === 'shell') return shell
+      // 界面一键启动靠它把 sessionId 换成工作目录；sess-no-cwd 用来验失败分支。
+      if (name === 'sessions') {
+        return { get: (id) => (id === 'sess-no-cwd' ? undefined : { header: { id, cwd } }) }
+      }
+      return undefined
     },
     tools: {
       register(definition) {
@@ -562,5 +567,55 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
   })
 }
 
+// ---------------------------------------------------------------------------
+// 界面一键启动：客户端只带 sessionId，工作目录由宿主自己解析。
+// ---------------------------------------------------------------------------
+
+{
+  // 上面的用例已经跑过，这里用独立 session 起一条新流程。
+  const uiCtx = makeHost(cwd, 'sess-ui')
+  const started = await uiCtx.request('/api/flowgate/action', {
+    sessionId: 'sess-ui',
+    action: 'start',
+    payload: { preset: 'fast' },
+  })
+  check('界面启动：不带标题也能开流程，标题回落默认值', () => {
+    assert.equal(started.status, 200)
+    assert.equal(started.body.active, true)
+    assert.equal(started.body.stage, 'S1')
+    assert.equal(started.body.title, '未命名任务')
+    assert.equal(started.body.preset, 'fast')
+  })
+  const again = await uiCtx.request('/api/flowgate/action', {
+    sessionId: 'sess-ui',
+    action: 'start',
+    payload: { title: '第二次点击', preset: 'strict' },
+  })
+  check('界面启动是幂等的：重复点击不新建流程、不改档位', () => {
+    assert.equal(again.status, 200)
+    assert.equal(again.body.id, started.body.id)
+    assert.equal(again.body.preset, 'fast')
+  })
+  const noCwd = await uiCtx.request('/api/flowgate/action', {
+    sessionId: 'sess-no-cwd',
+    action: 'start',
+    payload: {},
+  })
+  check('界面启动：拿不到工作目录时给出可执行的提示', () => {
+    assert.equal(noCwd.status, 409)
+    assert.match(noCwd.body.error, /无法确定当前会话的工作目录/)
+    assert.match(noCwd.body.error, /flowgate_start/)
+  })
+}
+
+// 工具的 title 不再必填，Agent 省略它也能启动。
+{
+  const toolCtx = makeHost(cwd, 'sess-ui-tool')
+  const viaTool = await toolCtx.tool('flowgate_start', {})
+  check('工具启动：title 可以省略', () => {
+    assert.equal(viaTool.stage, 'S1')
+    assert.equal(viaTool.preset, 'fast')
+  })
+}
 rmSync(cwd, { recursive: true, force: true })
 console.log('\n全部通过：' + passed.length + ' 项')

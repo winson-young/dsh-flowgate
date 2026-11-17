@@ -273,12 +273,36 @@ const FlowgateDock = registrations[1].Component
 }
 
 {
-  currentView = { active: false, presets: {}, builtinAngles: [], builtinDirections: [] }
+  posted = []
+  currentView = {
+    active: false,
+    presets: {
+      fast: { label: '小功能快速开发', summary: '两个评审角度 + 一个测试方向' },
+      strict: { label: '大需求严格执行', summary: '四个评审角度 + 三个测试方向' },
+    },
+    builtinAngles: [],
+    builtinDirections: [],
+  }
   const renderer = await render(WorkbenchView, {})
-  await check('流程未启动时给出如何开始的说明', () => {
+  await check('流程未启动时可以直接在界面启动', () => {
     const text = flat(renderer.toJSON())
     assert.ok(text.includes('当前会话还没有流程'))
+    // Agent 仍然是可用路径，只是不再是唯一路径。
     assert.ok(text.includes('flowgate_start'))
+    assert.ok(text.includes('开始一次新流程'))
+    assert.ok(text.includes('小功能快速开发'))
+  })
+  await check('点「开始需求分析」发出 start 动作（标题可以留空）', async () => {
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    const last = posted.at(-1)
+    assert.equal(last.action, 'start')
+    assert.equal(last.payload.preset, 'fast')
+    assert.equal(last.payload.title, '')
+  })
+  await check('先切档位再启动，请求里带上选择的档位', async () => {
+    await click(buttonByText(renderer.toJSON(), '大需求严格执行'))
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    assert.equal(posted.at(-1).payload.preset, 'strict')
   })
 }
 
@@ -865,10 +889,18 @@ await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
 }
 
 {
+  posted = []
   currentView = { active: false }
   const renderer = await render(FlowgateDock, {})
-  await check('流程未启动时 dock 不渲染', () => {
-    assert.equal(renderer.toJSON(), null)
+  await check('流程未启动时 dock 也能一键启动', () => {
+    const text = flat(renderer.toJSON())
+    assert.ok(text.includes('这个会话还没有流程'))
+    assert.ok(text.includes('开始需求分析'))
+  })
+  await check('dock 的启动按钮发出 start 动作', async () => {
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    assert.equal(posted.at(-1).action, 'start')
+    assert.equal(posted.at(-1).payload.preset, 'fast')
   })
 }
 
