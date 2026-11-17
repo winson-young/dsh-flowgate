@@ -13,6 +13,8 @@ function makeHost(cwd, sessionId, options = {}) {
   const tools = new Map()
   const routes = []
   const handlers = new Map()
+  // 界面启动后插件会通过宿主 agents 服务给会话补一条消息；这里记下来给用例断言。
+  const delivered = []
   const shell = {
     resolve(request) {
       return { ...request, resolved: true }
@@ -47,6 +49,14 @@ function makeHost(cwd, sessionId, options = {}) {
       // 界面一键启动靠它把 sessionId 换成工作目录；sess-no-cwd 用来验失败分支。
       if (name === 'sessions') {
         return { get: (id) => (id === 'sess-no-cwd' ? undefined : { header: { id, cwd } }) }
+      }
+      // sess-no-agent 模拟宿主没返回 live agent：唤醒失败时要降级成界面提示。
+      if (name === 'agents') {
+        return {
+          get: (id) => (id === 'sess-no-agent'
+            ? undefined
+            : { followup: (message) => { delivered.push({ sessionId: id, message }) } }),
+        }
       }
       return undefined
     },
@@ -95,7 +105,7 @@ function makeHost(cwd, sessionId, options = {}) {
   }
 
   apply({ inject: (_names, cb) => cb(scoped) })
-  return { tools, routes, handlers, shell, tool, request, guard }
+  return { tools, routes, handlers, shell, tool, request, guard, delivered }
 }
 
 const cwd = mkdtempSync(join(tmpdir(), 'flowgate-'))
@@ -609,6 +619,30 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
     assert.equal(withBrief.status, 200)
     assert.equal(withBrief.body.title, '会话过期返回 401，并给出重新认证入口')
     assert.equal(withBrief.body.brief, '# 会话过期返回 401，并给出重新认证入口。\n\n第二段补充说明。')
+  })
+  check('界面启动会把需求投递给 Agent，S1 不会停在原地等用户开口', () => {
+    assert.equal(withBrief.body.nudge.ok, true)
+    assert.equal(briefCtx.delivered.length, 1)
+    const { sessionId: target, message } = briefCtx.delivered[0]
+    assert.equal(target, 'sess-brief')
+    assert.equal(message.role, 'user')
+    assert.equal(message.source.kind, 'user')
+    const text = message.content.map((block) => block.text).join('\n')
+    assert.match(text, /S1 需求分析/)
+    assert.match(text, /会话过期返回 401/)
+    assert.match(text, /flowgate_doc/)
+  })
+  // 宿主没返回 live agent 时不能吞掉启动：流程照建，只是界面提示用户去对话里说一句。
+  const noAgent = await makeHost(cwd, 'sess-no-agent').request('/api/flowgate/action', {
+    sessionId: 'sess-no-agent',
+    action: 'start',
+    payload: { brief: '宿主拿不到 Agent 时也要能开流程' },
+  })
+  check('拿不到 Agent 时启动照常成功，视图里标记唤醒失败', () => {
+    assert.equal(noAgent.status, 200)
+    assert.equal(noAgent.body.active, true)
+    assert.equal(noAgent.body.nudge.ok, false)
+    assert.ok(noAgent.body.nudge.reason.length > 0)
   })
   const briefStatus = await briefCtx.tool('flowgate_status', {})
   check('流程摘要里带上需求原文，Agent 不必再问用户要一遍', () => {

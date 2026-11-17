@@ -36,11 +36,9 @@ dsh plugin --profile web add link:D:/Projects/dsh-flowgate
 
 > 会话超过 30 分钟未活动时，接口返回 401，并提供重新认证的入口。
 
-启动后，在对话中让 Agent 继续处理，例如：
+点开始后，这段需求会作为一条消息投递给对话里的 Agent，它会自己进入 S1：先读状态，再逐个问你关键决策，然后提交需求文档。你不用再去对话里补一句。
 
-> 请读取 flowgate_status，按当前流程开始需求分析，提交需求文档，等我在工作台确认。
-
-也可以直接在对话中说「用 flowgate 启动四阶段流程，需求是……」，由 Agent 调用工具启动。
+如果界面提示「没能自动唤醒 Agent」（宿主没有返回该会话的 Agent），在对话里发一句「继续」即可，Agent 会读取 `flowgate_status` 接着做。也可以一开始就在对话里说「用 flowgate 启动四阶段流程，需求是……」，由 Agent 调用 `flowgate_start` 启动。
 
 ### 2. 确认需求与修改范围
 
