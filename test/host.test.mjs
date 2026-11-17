@@ -617,6 +617,17 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
     assert.equal(again.body.id, started.body.id)
     assert.equal(again.body.preset, 'fast')
   })
+  // 用户什么都没写就点了输入框上方那个按钮：Agent 不能照着「需求分析」四个字
+  // 自己编一个需求去分析，S1 第一步必须是问清目标。
+  check('没填需求时唤醒消息要求 Agent 先问要做什么，不许自己开始分析', () => {
+    assert.equal(uiCtx.delivered.length, 1)
+    const text = uiCtx.delivered[0].message.content.map((block) => block.text).join('\n')
+    assert.match(text, /没有填写需求描述/)
+    assert.match(text, /只问一个问题/)
+    assert.match(text, /这次要做什么/)
+    assert.match(text, /不要自己假设目标/)
+    assert.doesNotMatch(text, /需求原文：/)
+  })
   // 需求描述：标题由第一行派生，原文进 brief，Agent 在 S1 直接读它提问。
   const briefCtx = makeHost(cwd, 'sess-brief')
   const withBrief = await briefCtx.request('/api/flowgate/action', {

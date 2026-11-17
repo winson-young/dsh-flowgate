@@ -40,6 +40,8 @@ dsh plugin --profile web add link:D:/Projects/dsh-flowgate
 
 如果界面提示「没能自动唤醒 Agent」（宿主没有返回该会话的 Agent），在对话里发一句「继续」即可，Agent 会读取 `flowgate_status` 接着做。也可以一开始就在对话里说「用 flowgate 启动四阶段流程，需求是……」，由 Agent 调用 `flowgate_start` 启动。
 
+需求描述留空、直接点输入框上方的 **「开始需求分析」** 也能开流程：这时 Agent 不会凭空假设目标，它会先问你一句这次要做什么，再继续 S1。
+
 ### 2. 确认需求与修改范围
 
 Agent 有需要你决定的问题时，会在工作台显示选择卡片。选一个方案或填写自定义答案，再查看需求文档、修改文件清单和验收标准。
