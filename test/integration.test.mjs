@@ -134,6 +134,33 @@ await check('S1 的变更性 shell 被拒绝，只读 shell 放行', async () =>
   assert.equal(ok.kind, 'allow')
 })
 
+// AC-4：评审 / 测试子代理的会话归到父流程，写工具在工具层被拒绝（不是靠提示词）。
+await check('AC-4 子代理会话的写工具被工具层拒绝', async () => {
+  const service = mod.currentService()
+  assert.ok(service, 'apply() 之后必须能拿到当前服务')
+  service.registerChild(SESSION, 'sess-review')
+  try {
+    for (const name of ['write', 'edit', 'str_replace_editor']) {
+      const d = await guard(name, { path: 'src/auth/session.ts' }, 'sess-review')
+      assert.equal(d.kind, 'deny', name + ' 必须被拒绝')
+      assert.match(d.reason, /只读/)
+    }
+    const shell = await guard('bash', { command: 'rm -rf src' }, 'sess-review')
+    assert.equal(shell.kind, 'deny')
+    const readShell = await guard('bash', { command: 'git diff' }, 'sess-review')
+    assert.equal(readShell.kind, 'allow')
+    const read = await guard('read', { file_path: 'src/auth/session.ts' }, 'sess-review')
+    assert.equal(read.kind, 'allow')
+  } finally {
+    service.unregisterChild('sess-review')
+  }
+})
+
+await check('AC-4 子会话解绑后回到父流程的 scope 判定', async () => {
+  const d = await guard('write', { path: 'src/auth/session.ts' }, 'sess-review')
+  assert.equal(d.kind, 'allow', '没有流程归属的会话不应被只读守卫拦住')
+})
+
 await check('追问卡片挂起，用户点选项后工具返回答案', async () => {
   const pending = within(call('flowgate_ask', {
     question: '过期后是返回 401 还是静默续期？',
