@@ -22,7 +22,7 @@
 dsh plugin --profile web add link:D:/Projects/dsh-flowgate
 ```
 
-**安装后完全退出并重启 DSH 进程**，再打开会话。对话视图顶部应出现「流程工作台」标签，输入框上方会有流程状态条。
+**安装后完全退出并重启 DSH 进程**，再打开会话。对话视图顶部应出现「流程工作台」标签，输入框正上方会有流程状态条（排在【任务】【目标】条之下，不会夹在两者中间）。
 
 **桌面端（desktop profile）**：使用[桌面端安装步骤](docs/development.md#桌面端安装)，安装方式与 CLI profile 不同。
 

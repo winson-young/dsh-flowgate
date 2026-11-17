@@ -230,6 +230,8 @@ await check('apply 注册 conversation.view 与 conversation.input.dock', () => 
   assert.equal(registrations[0].options.label(), '流程工作台')
   assert.equal(registrations[1].options.name, 'conversation.input.dock')
   assert.equal(registrations[1].options.id, 'flowgate-dock')
+  // 宿主同槽条目 order 升序：任务 0、目标 10、排队 20；取 15 才贴在输入框上方。
+  assert.equal(registrations[1].options.order, 15)
 })
 
 await check('样式只注入一次', () => {
