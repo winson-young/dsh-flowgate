@@ -196,6 +196,12 @@ check('无流程时 status 返回 active=false', () => assert.equal(status0.acti
 
 const started = await runTool('flowgate_start', { title: '会话过期检测', preset: 'fast' })
 check('start 进入 S1', () => assert.equal(started.stage, 'S1'))
+// AC-3：S1 只是起点，文案必须说清文档获批后继续 S2，否则模型会把 S1 当终点。
+check('start 返回说明 S1 之后继续推进', () => {
+  assert.match(started.message, /S1 只是这条流程的起点/)
+  assert.match(started.message, /直接继续 S2 开发/)
+  assert.match(started.message, /不要在阶段交界处停下来/)
+})
 
 // AC-1：未通过 S1 门禁前，写操作被拒。
 const denyS1 = await guard('write', { file_path: join(cwd, 'src/auth/session.ts'), content: 'x' })
@@ -265,6 +271,10 @@ check('批准后 scope 冻结并进入 S2', () => {
   assert.equal(docResult.decision, 'approve')
   assert.equal(approved.body.stage, 'S2')
   assert.equal(approved.body.scope.frozen, true)
+  // AC-4：批准之后必须立刻进入 S2，而不是停在 S1 等用户再发一句。
+  assert.match(docResult.message, /现在直接开始 S2/)
+  assert.match(docResult.message, /flowgate_gate/)
+  assert.match(docResult.message, /不要停下来等用户再确认一次/)
 })
 check('scope.json 已落盘', () => {
   const file = join(cwd, '.dsh-flowgate', 'scope.json')
@@ -312,7 +322,12 @@ check('scope 未冻结时 S2 写操作返回「scope 未冻结」', () => {
 // S2 出口门禁：完成开发 → 变更摘要作为凭据。
 const devPending = gateRound('flowgate_gate', { summary: '实现了过期检测' }, { decision: 'pass' })
 const devResult = await devPending
-check('S2 完成开发后进入 S3', () => assert.equal(devResult.next, 'S3'))
+// AC-5：门禁通过后直接给出下一阶段动作，措辞里不能只有「进入 S3」。
+check('S2 完成开发后进入 S3', () => {
+  assert.equal(devResult.next, 'S3')
+  assert.match(devResult.message, /现在直接开始 S3/)
+  assert.match(devResult.message, /不要在阶段交界处停下/)
+})
 const afterDev = await getState()
 check('S2 记录变更摘要凭据', () => {
   assert.equal(afterDev.body.stages.find((s) => s.id === 'S2').status, 'passed')
@@ -341,7 +356,12 @@ const reviewPending = gateRound(
   { decision: 'pass' },
 )
 const reviewResult = await reviewPending
-check('评审通过后进入 S4', () => assert.equal(reviewResult.next, 'S4'))
+// AC-6：评审通过后要求立即开始 S4，不停在阶段交界处。
+check('评审通过后进入 S4', () => {
+  assert.equal(reviewResult.next, 'S4')
+  assert.match(reviewResult.message, /现在直接开始 S4 测试/)
+  assert.match(reviewResult.message, /不要在阶段交界处停下/)
+})
 check('评审报告结构化聚合', () => {
   assert.equal(reviewResult.blocking, 1)
 })
@@ -627,6 +647,9 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
     assert.match(text, /只问一个问题/)
     assert.match(text, /这次要做什么/)
     assert.match(text, /不要自己假设目标/)
+    // AC-2：问清目标之后仍是一路走完四阶段，不能停在 S1。
+    assert.match(text, /问清楚目标后同样一路走完四阶段/)
+    assert.match(text, /不要在阶段交界处/)
     assert.doesNotMatch(text, /需求原文：/)
   })
   // 需求描述：标题由第一行派生，原文进 brief，Agent 在 S1 直接读它提问。
@@ -652,6 +675,10 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
     assert.match(text, /S1 需求分析/)
     assert.match(text, /会话过期返回 401/)
     assert.match(text, /flowgate_doc/)
+    // AC-1：有需求原文时说明 S1 不是一次单独的需求分析，批准后继续 S2。
+    assert.match(text, /这是同一条流程的 S1/)
+    assert.match(text, /立刻继续 S2 开发/)
+    assert.match(text, /不要在阶段交界处/)
   })
   // 宿主没返回 live agent 时不能吞掉启动：流程照建，只是界面提示用户去对话里说一句。
   const noAgent = await makeHost(cwd, 'sess-no-agent').request('/api/flowgate/action', {
@@ -1188,6 +1215,18 @@ rmSync(cwd, { recursive: true, force: true })
     assert.equal(passed.status, 200)
     assert.equal(passed.body.stage, 'S3')
   })
+  // 阶段推进了但没有人叫醒 Agent，流程就停在交界处；这里锁住补发的唤醒消息。
+  check('门禁决策落地后补一条唤醒消息，Agent 不会被留在阶段交界处', () => {
+    const texts = cx.delivered.map((item) => item.message.content.map((block) => block.text).join('\n'))
+    assert.ok(
+      texts.some((text) => /进入 S3/.test(text)),
+      '没有补发「进入 S3」的唤醒消息',
+    )
+    assert.ok(
+      texts.some((text) => /用户通过了 S2 门禁/.test(text)),
+      '唤醒消息没有说明是哪一次门禁',
+    )
+  })
   const again = await cx.request('/api/flowgate/action', {
     sessionId: 'sess-gate',
     action: 'gate',
@@ -1196,6 +1235,190 @@ rmSync(cwd, { recursive: true, force: true })
   check('S3 还没有评审报告时重复点击会被拒绝并说明原因', () => {
     assert.equal(again.status, 409)
     assert.match(again.body.error, /可确认的产物/)
+  })
+}
+
+// AC-5 / AC-7：跳过门禁同样要给出下一阶段动作，且返回字段集合不变（schema 不动）。
+{
+  const cx = makeHost(cwd, 'sess-skip')
+  await cx.tool('flowgate_start', { title: '跳过门禁文案', preset: 'fast' })
+  const scope = {
+    files_expected_to_change: ['src/auth/session.ts'],
+    capabilities: ['会话过期检测'],
+    out_of_scope_explicitly: [],
+    acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
+  }
+  const docCall = cx.tool('flowgate_doc', { html: '<html><body><p>跳过门禁</p></body></html>', scope })
+  await tick()
+  await cx.request('/api/flowgate/action', {
+    sessionId: 'sess-skip',
+    action: 'doc',
+    payload: { decision: 'approve' },
+  })
+  const docSkipped = await docCall
+  check('AC-7 文档批准返回字段集合不变', () => {
+    assert.deepEqual(Object.keys(docSkipped).sort(), ['decision', 'frozen', 'message', 'preset'])
+  })
+  const gateCall = cx.tool('flowgate_gate', {})
+  await tick()
+  await cx.request('/api/flowgate/action', {
+    sessionId: 'sess-skip',
+    action: 'gate',
+    payload: { decision: 'skip' },
+  })
+  const skippedGate = await gateCall
+  check('AC-5 跳过门禁后同样给出下一阶段动作', () => {
+    assert.equal(skippedGate.decision, 'skip')
+    assert.equal(skippedGate.next, 'S3')
+    assert.match(skippedGate.message, /用户跳过了本阶段门禁/)
+    assert.match(skippedGate.message, /现在直接开始 S3 的工作/)
+    assert.match(skippedGate.message, /不要在阶段交界处停下/)
+  })
+  check('AC-7 门禁返回字段集合不变', () => {
+    assert.deepEqual(Object.keys(skippedGate).sort(), ['decision', 'message', 'next', 'stage'])
+  })
+  // 工具还挂在门禁上时它自己会接着跑，不需要再补一条消息（否则会重复推进）。
+  check('等待器还在时不重复补发唤醒消息', () => {
+    const texts = cx.delivered.map((item) => item.message.content.map((block) => block.text).join('\n'))
+    assert.equal(texts.filter((text) => /进入 S3/.test(text)).length, 0)
+  })
+}
+
+// 评审回归：Agent 的工具已经中断时点「修改需求」，补发的消息不能宣称 scope 已冻结，
+// 否则 Agent 会跳过改文档、直接开始改代码——而 revise 分支里 scope 根本没有冻结。
+{
+  const cx = makeHost(cwd, 'sess-revise')
+  await cx.tool('flowgate_start', { title: '修改需求', preset: 'fast' })
+  const scope = {
+    files_expected_to_change: ['src/auth/session.ts'],
+    capabilities: ['会话过期检测'],
+    out_of_scope_explicitly: [],
+    acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
+  }
+  const docSignal = new AbortController()
+  const docCall = cx.tool(
+    'flowgate_doc',
+    { html: '<html><body><p>修改</p></body></html>', scope },
+    { signal: docSignal.signal },
+  )
+  await tick()
+  docSignal.abort()
+  const waited = await docCall
+  check('修改需求前文档工具已中断，停在等待状态', () => {
+    assert.ok(
+      ['wait', 'pending'].includes(waited.decision),
+      '文档工具中断后应返回等待状态，实际：' + waited.decision,
+    )
+  })
+  const revised = await cx.request('/api/flowgate/action', {
+    sessionId: 'sess-revise',
+    action: 'doc',
+    payload: { decision: 'revise' },
+  })
+  check('修改需求后仍停在 S1', () => {
+    assert.equal(revised.status, 200)
+    assert.equal(revised.body.stage, 'S1')
+  })
+  check('修改需求的补发文案要求改完文档重新提交，且不宣称 scope 已冻结', () => {
+    const last = cx.delivered[cx.delivered.length - 1]
+    const text = last.message.content.map((block) => block.text).join('\n')
+    assert.match(text, /用户要求修改需求文档/)
+    assert.match(text, /scope 尚未冻结/)
+    assert.match(text, /重新提交 flowgate_doc/)
+    assert.doesNotMatch(text, /scope 已冻结/)
+  })
+}
+
+// 门禁被中断后点「退回开发修复」：Agent 必须被告知回到 S2 重做，否则它会停在 S3。
+{
+  const sid = 'sess-back'
+  const cx = makeHost(cwd, sid)
+  await cx.tool('flowgate_start', { title: '退回唤醒', preset: 'fast' })
+  const scope = {
+    files_expected_to_change: ['src/auth/session.ts'],
+    capabilities: ['会话过期检测'],
+    out_of_scope_explicitly: [],
+    acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
+  }
+  const docCall = cx.tool('flowgate_doc', { html: '<html><body><p>退回</p></body></html>', scope })
+  await tick()
+  await cx.request('/api/flowgate/action', { sessionId: sid, action: 'doc', payload: { decision: 'approve' } })
+  await docCall
+  const devCall = cx.tool('flowgate_gate', { summary: '代码已改完' })
+  await tick()
+  await cx.request('/api/flowgate/action', { sessionId: sid, action: 'gate', payload: { decision: 'pass' } })
+  await devCall
+  const reviewSignal = new AbortController()
+  const reviewCall = cx.tool(
+    'flowgate_review',
+    { angles: [{ id: 'correctness', name: '正确性', verdict: 'pass', findings: [] }] },
+    { signal: reviewSignal.signal },
+  )
+  await tick()
+  reviewSignal.abort()
+  await reviewCall
+  const back = await cx.request('/api/flowgate/action', {
+    sessionId: sid,
+    action: 'gate',
+    payload: { decision: 'back', to: 'S2' },
+  })
+  check('无等待器时退回开发修复会补发回到 S2 的指令', () => {
+    assert.equal(back.status, 200)
+    assert.equal(back.body.stage, 'S2')
+    const last = cx.delivered[cx.delivered.length - 1]
+    const text = last.message.content.map((block) => block.text).join('\n')
+    assert.match(text, /用户退回到 S2 重做/)
+    assert.match(text, /进入 S2（/)
+  })
+}
+
+// 最后一个门禁通过后流程结束：补发的消息要说「结束了」，不能让 Agent 再找下一阶段。
+{
+  const sid = 'sess-finish'
+  const cx = makeHost(cwd, sid)
+  await cx.tool('flowgate_start', { title: '结束唤醒', preset: 'fast' })
+  const scope = {
+    files_expected_to_change: ['src/auth/session.ts'],
+    capabilities: ['会话过期检测'],
+    out_of_scope_explicitly: [],
+    acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
+  }
+  const docCall = cx.tool('flowgate_doc', { html: '<html><body><p>结束</p></body></html>', scope })
+  await tick()
+  await cx.request('/api/flowgate/action', { sessionId: sid, action: 'doc', payload: { decision: 'approve' } })
+  await docCall
+  const devCall = cx.tool('flowgate_gate', { summary: '代码已改完' })
+  await tick()
+  await cx.request('/api/flowgate/action', { sessionId: sid, action: 'gate', payload: { decision: 'pass' } })
+  await devCall
+  const reviewCall = cx.tool('flowgate_review', {
+    angles: [{ id: 'correctness', name: '正确性', verdict: 'pass', findings: [] }],
+  })
+  await tick()
+  await cx.request('/api/flowgate/action', { sessionId: sid, action: 'gate', payload: { decision: 'pass' } })
+  await reviewCall
+  const testSignal = new AbortController()
+  const testCall = cx.tool(
+    'flowgate_test',
+    { directions: [{ id: 'functional', name: '功能正确性', points: [{ point: '过期返回 401', result: 'pass' }] }] },
+    { signal: testSignal.signal },
+  )
+  await tick()
+  testSignal.abort()
+  await testCall
+  const done = await cx.request('/api/flowgate/action', {
+    sessionId: sid,
+    action: 'gate',
+    payload: { decision: 'pass' },
+  })
+  check('无等待器时最后一个门禁通过后说明流程已结束', () => {
+    assert.equal(done.status, 200)
+    assert.equal(done.body.stage, 'S4')
+    assert.equal(done.body.finished, true)
+    const last = cx.delivered[cx.delivered.length - 1]
+    const text = last.message.content.map((block) => block.text).join('\n')
+    assert.match(text, /用户通过了 S4 门禁/)
+    assert.match(text, /四个阶段已经全部结束/)
   })
 }
 console.log('\n全部通过：' + passed.length + ' 项')
