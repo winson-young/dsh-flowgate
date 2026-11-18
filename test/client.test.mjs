@@ -456,6 +456,52 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
   })
 }
 
+// 提交文档的那次工具调用可能被中断：文档还在就必须还能确认。
+{
+  posted = []
+  currentView = baseView('S1', {
+    doc: {
+      html: '<html><body>需求文档</body></html>',
+      recommendedPreset: 'fast',
+      reason: '只改两个文件',
+      at: '2026-11-17T09:20:00Z',
+      pending: true,
+      interrupted: true,
+    },
+    waiting: false,
+    waitingKind: null,
+  })
+  const renderer = await render(WorkbenchView, {})
+  const tree = renderer.toJSON()
+  await check('确认入口中断后按钮仍然在，并说明文档已保存', () => {
+    assert.ok(buttonByText(tree, '批准并冻结 scope'))
+    assert.ok(flat(tree).includes('被中断'))
+  })
+  await check('中断后点批准仍然提交 doc/approve', async () => {
+    await click(buttonByText(renderer.toJSON(), '批准并冻结 scope'))
+    const last = posted[posted.length - 1]
+    assert.equal(last.action, 'doc')
+    assert.equal(last.payload.decision, 'approve')
+  })
+}
+
+{
+  currentView = baseView('S1', {
+    doc: {
+      html: '<html><body>需求文档</body></html>',
+      pending: false,
+      decision: { kind: 'approve', at: '2026-11-17T09:25:00Z' },
+    },
+    waiting: false,
+  })
+  const tree = (await render(WorkbenchView, {})).toJSON()
+  await check('已决策的文档不再显示批准按钮', () => {
+    let approveButton = null
+    try { approveButton = buttonByText(tree, '批准并冻结 scope') } catch { approveButton = null }
+    assert.ok(!approveButton, '已决策的文档不应再给批准按钮')
+    assert.ok(flat(tree).includes('已经确认过'))
+  })
+}
 // ---------------------------------------------------------------------------
 // 5. S2：开发
 // ---------------------------------------------------------------------------
@@ -497,6 +543,82 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
 
   await check('S2 提供回到需求分析调整 scope 的入口', () => {
     assert.ok(buttonByText(renderer.toJSON(), '回到需求分析调整 scope'))
+  })
+}
+
+// 门禁请求被中断后等待器就没了：变更摘要已经采集完，按钮仍然该能点。
+{
+  posted = []
+  currentView = baseView('S2', {
+    devChanges: { files: ['src/auth/session.ts'], added: 42, removed: 7, at: '2026-11-17T09:40:00Z' },
+    gate: { pending: true, interrupted: true },
+    waiting: false,
+    waitingKind: null,
+  })
+  const renderer = await render(WorkbenchView, {})
+  const tree = renderer.toJSON()
+  await check('门禁中断后按钮仍然可点并说明原因', async () => {
+    assert.ok(flat(tree).includes('上次的门禁请求被中断'))
+    await click(buttonByText(tree, '完成开发'))
+    const last = posted[posted.length - 1]
+    assert.equal(last.action, 'gate')
+    assert.equal(last.payload.decision, 'pass')
+  })
+}
+
+// S3 / S4 同理：报告已经交上来，按钮就不该再等内存里的等待器。
+{
+  posted = []
+  currentView = baseView('S3', {
+    review: {
+      blocking: 1,
+      by: 'subagents',
+      at: '2026-11-17T10:10:00Z',
+      angles: [
+        {
+          id: 'correctness',
+          name: '正确性',
+          verdict: 'blocking',
+          suggestUpgrade: false,
+          findings: [{ file: 'src/auth/session.ts', line: 88, severity: 'CRITICAL', summary: '过期判断用了客户端时间' }],
+        },
+      ],
+    },
+    gate: { pending: true, interrupted: true },
+    waiting: false,
+    waitingKind: null,
+  })
+  const renderer = await render(WorkbenchView, {})
+  const tree = renderer.toJSON()
+  await check('S3 评审交上来后门禁按钮可点', async () => {
+    assert.ok(flat(tree).includes('上次的门禁请求被中断'))
+    await click(buttonByText(tree, '通过评审，进入测试'))
+    const last = posted[posted.length - 1]
+    assert.equal(last.action, 'gate')
+    assert.equal(last.payload.decision, 'pass')
+  })
+}
+
+{
+  posted = []
+  currentView = baseView('S4', {
+    test: {
+      directions: [{ id: 'unit', name: '单元测试', points: [{ point: '过期判断', result: 'pass' }] }],
+      failed: 0,
+      at: '2026-11-17T10:20:00Z',
+    },
+    gate: { pending: true, interrupted: true },
+    waiting: false,
+    waitingKind: null,
+  })
+  const renderer = await render(WorkbenchView, {})
+  const tree = renderer.toJSON()
+  await check('S4 测试结果交上来后门禁按钮可点', async () => {
+    assert.ok(flat(tree).includes('上次的门禁请求被中断'))
+    await click(buttonByText(tree, '验收通过，结束流程'))
+    const last = posted[posted.length - 1]
+    assert.equal(last.action, 'gate')
+    assert.equal(last.payload.decision, 'pass')
   })
 }
 

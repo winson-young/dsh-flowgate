@@ -85,14 +85,15 @@ function makeHost(cwd, sessionId, options = {}) {
     },
   }
   // 便捷入口：一个宿主实例自带 session 上下文，多流程用例不必各自拼 exec 与 Request。
-  const tool = (name, args) => {
+  // opts.signal 用来模拟工具调用被中断：真实宿主在执行超时时会中止这个 signal。
+  const tool = (name, args, opts = {}) => {
     const definition = tools.get(name)
     assert.ok(definition, '工具未注册：' + name)
     return definition.execute(args, {
       name,
       arguments: args,
       agent: { session: { header: { id: sessionId, cwd } } },
-      signal: undefined,
+      signal: opts.signal,
     })
   }
   const request = async (path, body) => {
@@ -722,6 +723,16 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
 // 这时必须改用 child_process 直接跑 git，不能把变更摘要丢成空。
 // ---------------------------------------------------------------------------
 {
+  // 受限沙箱会禁止 spawn git（EPERM）：这时构造不出真实仓库，跳过这段而不是中断整套测试。
+  let gitUsable = true
+  try {
+    execFileSync('git', ['--version'], { windowsHide: true })
+  } catch {
+    gitUsable = false
+  }
+  if (!gitUsable) {
+    console.log('  skip 没有 shell 服务时改用 child_process 采集变更摘要（当前环境禁止 spawn git）')
+  } else {
   const repo = mkdtempSync(join(tmpdir(), 'flowgate-repo-'))
   const git = (args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8', windowsHide: true })
   git(['init', '-q'])
@@ -768,6 +779,7 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
     assert.equal(changes.added, 2)
   })
   rmSync(repo, { recursive: true, force: true })
+  }
 }
 // ---------------------------------------------------------------------------
 // 取消：用户放弃流程时必须把流程判死、解冻 scope，并唤醒挂起的门禁工具。
@@ -860,6 +872,20 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
     assert.equal(deadView.body.finished, true)
     assert.equal(deadView.body.grill.pending, null)
     assert.equal(deadView.body.doc.pending, false)
+  })
+  // 文档要留着给人看，但不能再被批准：放弃是终态，不能靠点按钮复活。
+  check('放弃后文档仍可查看，只是不再待批准', () => {
+    assert.ok(deadView.body.doc.html, '已提交的文档应保留给用户查看')
+    assert.equal(deadView.body.doc.decision, null)
+  })
+  const approveAfterCancel = await cx.request('/api/flowgate/action', {
+    sessionId: 'sess-cancel',
+    action: 'doc',
+    payload: { decision: 'approve' },
+  })
+  check('放弃后批准需求文档被拒', () => {
+    assert.equal(approveAfterCancel.status, 409)
+    assert.match(approveAfterCancel.body.error, /放弃/)
   })
 
   // 放弃后必须能重开，并且新流程不带着上一轮的 scope 白名单。
@@ -987,6 +1013,189 @@ rmSync(cwd, { recursive: true, force: true })
   check('放弃后的视图不再带活动摘要，进度保留实际值', () => {
     assert.equal(ended.body.activity, null)
     assert.ok(ended.body.progress.percent > 0)
+  })
+}
+
+// ---------------------------------------------------------------------------
+// 文档等待的韧性：提交文档的那次工具调用可能被中断（执行超时、宿主重启、
+// 新门禁取代旧门禁）。文档已经落盘，批准入口不能跟着调用一起消失。
+// ---------------------------------------------------------------------------
+
+{
+  const cx = makeHost(cwd, 'sess-resume')
+  await cx.tool('flowgate_start', { title: '中断恢复', preset: 'fast' })
+  const controller = new AbortController()
+  const pending = cx.tool('flowgate_doc', {
+    html: '<html><body><h1>中断</h1></body></html>',
+    scope: {
+      files_expected_to_change: ['src/auth/session.ts'],
+      capabilities: ['会话过期检测'],
+      out_of_scope_explicitly: [],
+      acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
+    },
+  }, { signal: controller.signal })
+  await tick()
+  const before = await cx.request('/api/flowgate/state?sessionId=sess-resume')
+  check('中断前文档处于待批准且未标记中断', () => {
+    assert.equal(before.body.doc.pending, true)
+    assert.equal(before.body.doc.interrupted, false)
+  })
+  controller.abort()
+  const interrupted = await pending
+  check('调用中断后工具返回 pending 而不是 timeout，文档保留', () => {
+    assert.equal(interrupted.decision, 'pending')
+    assert.equal(interrupted.frozen, false)
+    assert.match(interrupted.message, /已保留/)
+  })
+  const after = await cx.request('/api/flowgate/state?sessionId=sess-resume')
+  check('中断后仍停在 S1 待批准，并标记确认入口曾中断', () => {
+    assert.equal(after.body.stage, 'S1')
+    assert.equal(after.body.finished, false)
+    assert.equal(after.body.doc.pending, true)
+    assert.equal(after.body.doc.interrupted, true)
+  })
+  const approved = await cx.request('/api/flowgate/action', {
+    sessionId: 'sess-resume',
+    action: 'doc',
+    payload: { decision: 'approve' },
+  })
+  check('没有等待器时批准按钮仍然生效', () => {
+    assert.equal(approved.status, 200)
+    assert.equal(approved.body.stage, 'S2')
+    assert.equal(approved.body.scope.frozen, true)
+  })
+}
+
+{
+  const first = makeHost(cwd, 'sess-reboot')
+  await first.tool('flowgate_start', { title: '重启恢复', preset: 'fast' })
+  const scope = {
+    files_expected_to_change: ['src/auth/session.ts'],
+    capabilities: ['会话过期检测'],
+    out_of_scope_explicitly: [],
+    acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
+  }
+  // 故意不 await：重启会丢掉内存里的等待器，这次调用永远不会结算。
+  void first.tool('flowgate_doc', { html: '<html><body><h1>重启</h1></body></html>', scope }).catch(() => {})
+  await tick()
+  // 新实例 = 宿主重启：内存等待器全没了，只剩磁盘上的流程快照。
+  const second = makeHost(cwd, 'sess-reboot')
+  await second.tool('flowgate_status', {})
+  const restored = await second.request('/api/flowgate/state?sessionId=sess-reboot')
+  check('宿主重启后仍能看到待批准的需求文档', () => {
+    assert.equal(restored.body.active, true)
+    assert.equal(restored.body.stage, 'S1')
+    assert.equal(restored.body.finished, false)
+    assert.equal(restored.body.doc.pending, true)
+    assert.equal(restored.body.doc.interrupted, true)
+  })
+  const approved = await second.request('/api/flowgate/action', {
+    sessionId: 'sess-reboot',
+    action: 'doc',
+    payload: { decision: 'approve' },
+  })
+  check('重启后仍能批准，scope 与验收标准完整保留', () => {
+    assert.equal(approved.status, 200)
+    assert.equal(approved.body.stage, 'S2')
+    assert.deepEqual(approved.body.scope.data.in_scope.files_expected_to_change, ['src/auth/session.ts'])
+    assert.deepEqual(approved.body.scope.data.acceptance_criteria.map((item) => item.id), ['AC-1'])
+  })
+  const repeat = await second.request('/api/flowgate/action', {
+    sessionId: 'sess-reboot',
+    action: 'doc',
+    payload: { decision: 'approve' },
+  })
+  check('重启后重复批准不会重复推进', () => {
+    assert.equal(repeat.status, 200)
+    assert.equal(repeat.body.stage, 'S2')
+    assert.equal(repeat.body.doc.decision.kind, 'approve')
+  })
+}
+
+{
+  const cx = makeHost(cwd, 'sess-race')
+  await cx.tool('flowgate_start', { title: '等待竞争', preset: 'fast' })
+  const scope = {
+    files_expected_to_change: ['src/auth/session.ts'],
+    capabilities: ['会话过期检测'],
+    out_of_scope_explicitly: [],
+    acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
+  }
+  const staleSignal = new AbortController()
+  const freshSignal = new AbortController()
+  const stale = cx.tool('flowgate_doc', { html: '<html><body><p>旧</p></body></html>', scope }, { signal: staleSignal.signal })
+  await tick()
+  const fresh = cx.tool('flowgate_doc', { html: '<html><body><p>新</p></body></html>', scope }, { signal: freshSignal.signal })
+  await tick()
+  const staleResult = await stale
+  check('新门禁取代旧门禁时旧调用返回 pending', () => {
+    assert.equal(staleResult.decision, 'pending')
+  })
+  // 修复前：旧 signal 的 abort 回调会删掉「当前」等待器，后一次调用永远不结算。
+  staleSignal.abort()
+  await tick()
+  const approved = await cx.request('/api/flowgate/action', {
+    sessionId: 'sess-race',
+    action: 'doc',
+    payload: { decision: 'approve' },
+  })
+  const freshResult = await Promise.race([
+    fresh,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('新等待被旧信号误删：批准没有结算它')), 500)),
+  ])
+  check('旧调用中断不影响新等待，批准能结算新调用', () => {
+    assert.equal(approved.status, 200)
+    assert.equal(freshResult.decision, 'approve')
+    assert.equal(freshResult.frozen, true)
+  })
+}
+
+// 门禁等待也可能被中断：S2 的变更摘要已经采集完，用户点「完成开发」不能因为等待器没了而失效。
+{
+  const cx = makeHost(cwd, 'sess-gate')
+  await cx.tool('flowgate_start', { title: '门禁中断', preset: 'fast' })
+  const scope = {
+    files_expected_to_change: ['src/auth/session.ts'],
+    capabilities: ['会话过期检测'],
+    out_of_scope_explicitly: [],
+    acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
+  }
+  const docSignal = new AbortController()
+  const docCall = cx.tool('flowgate_doc', { html: '<html><body><p>门禁</p></body></html>', scope }, { signal: docSignal.signal })
+  await tick()
+  await cx.request('/api/flowgate/action', { sessionId: 'sess-gate', action: 'doc', payload: { decision: 'approve' } })
+  await docCall
+  const gateSignal = new AbortController()
+  const gateCall = cx.tool('flowgate_gate', { summary: '代码已改完' }, { signal: gateSignal.signal })
+  await tick()
+  gateSignal.abort()
+  const waited = await gateCall
+  check('门禁调用中断后返回 wait 而不是报错', () => {
+    assert.equal(waited.decision, 'wait')
+  })
+  const view = await cx.request('/api/flowgate/state?sessionId=sess-gate')
+  check('门禁中断后仍停在 S2 并标记可确认', () => {
+    assert.equal(view.body.stage, 'S2')
+    assert.equal(view.body.gate.pending, true)
+    assert.equal(view.body.gate.interrupted, true)
+  })
+  const passed = await cx.request('/api/flowgate/action', {
+    sessionId: 'sess-gate',
+    action: 'gate',
+    payload: { decision: 'pass' },
+  })
+  check('没有等待器时「完成开发」仍然推进到 S3', () => {
+    assert.equal(passed.status, 200)
+    assert.equal(passed.body.stage, 'S3')
+  })
+  const again = await cx.request('/api/flowgate/action', {
+    sessionId: 'sess-gate',
+    action: 'gate',
+    payload: { decision: 'pass' },
+  })
+  check('S3 还没有评审报告时重复点击会被拒绝并说明原因', () => {
+    assert.equal(again.status, 409)
+    assert.match(again.body.error, /可确认的产物/)
   })
 }
 console.log('\n全部通过：' + passed.length + ' 项')
