@@ -14,11 +14,26 @@ const h = React.createElement
 // ---------------------------------------------------------------------------
 
 const styleNodes = []
+const docListeners = new Map()
 globalThis.document = {
   adoptedStyleSheets: [],
   head: { appendChild(node) { styleNodes.push(node) } },
+  body: { style: { overflow: '' } },
   getElementById() { return null },
   createElement() { return { id: '', textContent: '' } },
+  addEventListener(type, fn) {
+    const list = docListeners.get(type) ?? []
+    list.push(fn)
+    docListeners.set(type, list)
+  },
+  removeEventListener(type, fn) {
+    docListeners.set(type, (docListeners.get(type) ?? []).filter((item) => item !== fn))
+  },
+}
+
+// 模拟按下 Esc：直接触发弹窗注册在 document 上的 keydown 监听。
+function pressEscape() {
+  for (const fn of [...(docListeners.get('keydown') ?? [])]) fn({ key: 'Escape' })
 }
 globalThis.CSSStyleSheet = undefined
 
@@ -203,6 +218,69 @@ async function settle() {
   await act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 40))
   })
+}
+
+// 设置面板收进弹窗：先点开，再断言弹窗里的分组内容。
+async function openSettings(renderer) {
+  await click(buttonByText(renderer.toJSON(), '配置角度与规则'))
+  return renderer.toJSON()
+}
+
+async function switchGroup(renderer, label) {
+  await click(buttonByText(renderer.toJSON(), label))
+  return renderer.toJSON()
+}
+
+function hasButton(tree, needle) {
+  return buttons(tree).some((node) => flat(node).includes(needle))
+}
+
+function checkboxNodes(tree) {
+  const boxes = []
+  const walk = (node) => {
+    if (!node) return
+    if (Array.isArray(node)) { node.forEach(walk); return }
+    if (node.type === 'input' && node.props.type === 'checkbox') boxes.push(node)
+    if (node.children) walk(node.children)
+  }
+  walk(tree)
+  return boxes
+}
+
+function nodeByClass(tree, className) {
+  let found = null
+  const walk = (node) => {
+    if (!node || found) return
+    if (Array.isArray(node)) { node.forEach(walk); return }
+    if (node.props && node.props.className === className) { found = node; return }
+    if (node.children) walk(node.children)
+  }
+  walk(tree)
+  return found
+}
+
+function nodeByRole(tree, role) {
+  let found = null
+  const walk = (node) => {
+    if (!node || found) return
+    if (Array.isArray(node)) { node.forEach(walk); return }
+    if (node.props && node.props.role === role) { found = node; return }
+    if (node.children) walk(node.children)
+  }
+  walk(tree)
+  return found
+}
+
+function inputByPlaceholder(tree, placeholder) {
+  let found = null
+  const walk = (node) => {
+    if (!node || found) return
+    if (Array.isArray(node)) { node.forEach(walk); return }
+    if (node.type === 'input' && node.props.placeholder === placeholder) { found = node; return }
+    if (node.children) walk(node.children)
+  }
+  walk(tree)
+  return found
 }
 
 // ---------------------------------------------------------------------------
@@ -817,43 +895,119 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
 }
 
 {
+  posted = []
   currentView = baseView('S1', { preset: 'fast' })
   const renderer = await render(WorkbenchView, {})
   const text = flat(renderer.toJSON())
-  await check('S1 阶段提供升档按钮', () => {
-    assert.ok(text.includes('升档到大需求严格执行'))
+  await check('侧栏不再直接摆升档按钮', () => {
+    assert.ok(text.includes('阶段设置'))
+    assert.ok(!text.includes('升档到大需求严格执行'), '升档按钮应该收进弹窗')
+  })
+
+  await check('S1 弹窗默认落在执行档位，可升档', async () => {
+    const tree = await openSettings(renderer)
+    assert.ok(flat(tree).includes('升档到大需求严格执行'))
+    await click(buttonByText(renderer.toJSON(), '升档到大需求严格执行'))
+    const last = posted[posted.length - 1]
+    assert.equal(last.action, 'upgrade')
+    assert.equal(last.payload.preset, 'strict')
+    // 收尾关掉弹窗：残留实例会共享 document.body 的滚动锁，影响后续断言。
+    await click(buttonByText(renderer.toJSON(), '关闭'))
   })
 }
 
 {
+  posted = []
   currentView = baseView('S2')
   const renderer = await render(WorkbenchView, {})
-  const tree = renderer.toJSON()
-  const text = flat(tree)
-  await check('设置面板列出可勾选的角度与方向', () => {
+  const text = flat(renderer.toJSON())
+  await check('侧栏退化为统计摘要与打开按钮', () => {
     assert.ok(text.includes('阶段设置'))
-    assert.ok(text.includes('评审角度'))
-    assert.ok(text.includes('测试方向'))
-    assert.ok(text.includes('追加自定义角度'))
-    assert.ok(text.includes('追加自定义方向'))
+    assert.ok(text.includes('评审角度 1/3'))
+    assert.ok(text.includes('测试方向 1/2'))
+    assert.ok(text.includes('开发规则 2/3'))
+    const triggerButton = buttonByText(renderer.toJSON(), '配置角度与规则')
+    assert.equal(triggerButton.props['aria-expanded'], false, '未打开时扩展状态为 false')
+    assert.ok(!text.includes('追加自定义开发规则'), '侧栏不该再堆叠追加入口')
+    assert.ok(!text.includes('与既有代码风格一致'), '侧栏不该再列全部规则')
   })
 
-  await check('设置面板列出开发规则并可追加自定义规则', () => {
-    assert.ok(text.includes('开发规则'))
-    assert.ok(text.includes('与既有代码风格一致'))
-    assert.ok(text.includes('追加自定义开发规则'))
+  const modalTree = await openSettings(renderer)
+
+  await check('弹窗带 dialog 语义，S2 默认落在开发规则组', () => {
+    const dialog = nodeByRole(renderer.toJSON(), 'dialog')
+    assert.ok(dialog, '必须有 dialog 卡片')
+    assert.equal(dialog.props['aria-modal'], 'true')
+    assert.match(dialog.props['aria-labelledby'], /^fg-settings-title/)
+    assert.equal(dialog.props.tabIndex, -1)
+    assert.equal(buttonByText(renderer.toJSON(), '配置角度与规则').props['aria-expanded'], true)
+    const paneText = flat(modalTree)
+    assert.ok(paneText.includes('开发规则'))
+    assert.ok(paneText.includes('与既有代码风格一致'))
+    assert.ok(paneText.includes('追加自定义开发规则'))
+    assert.equal(hasButton(modalTree, '追加自定义角度'), false, '默认组之外的入口不该渲染')
+  })
+
+  await check('打开弹窗时锁背景滚动', () => {
+    assert.equal(globalThis.document.body.style.overflow, 'hidden')
+  })
+
+  await check('切换分组只渲染当前组', async () => {
+    const anglesTree = await switchGroup(renderer, '评审角度')
+    assert.ok(hasButton(anglesTree, '追加自定义角度'))
+    assert.equal(hasButton(anglesTree, '追加自定义开发规则'), false)
+    const backTree = await switchGroup(renderer, '开发规则')
+    assert.ok(hasButton(backTree, '追加自定义开发规则'))
+    assert.equal(hasButton(backTree, '追加自定义角度'), false)
+  })
+
+  await check('列表自己滚动，追加入口不在滚动区里', () => {
+    const list = nodeByClass(renderer.toJSON(), 'fg-modal-list')
+    assert.ok(list, '弹窗列表应有独立滚动容器')
+    assert.equal(hasButton(list, '追加自定义开发规则'), false, '追加入口不能被滚走')
+  })
+
+  await check('Tab 在弹窗内首尾循环，不跑到背景', () => {
+    const dialog = nodeByRole(renderer.toJSON(), 'dialog')
+    assert.equal(typeof dialog.props.onKeyDown, 'function', '弹窗应拦截 Tab')
+    const a = { focus() { a.focused = true } }
+    const b = { focus() { b.focused = true } }
+    const off = { disabled: true, focus() { off.focused = true } }
+    const card = { querySelectorAll: () => [a, off, b] }
+    let prevented = 0
+    const tabEvent = (target, shiftKey) => ({
+      key: 'Tab',
+      shiftKey,
+      target,
+      currentTarget: card,
+      preventDefault() { prevented += 1 },
+    })
+    dialog.props.onKeyDown(tabEvent(b, false))
+    assert.equal(a.focused, true, '末位 Tab 应回绕到首位')
+    dialog.props.onKeyDown(tabEvent(a, true))
+    assert.equal(b.focused, true, '首位 Shift+Tab 应回绕到末位')
+    prevented = 0
+    dialog.props.onKeyDown(tabEvent(card, false))
+    assert.equal(prevented, 0, '卡片自身出发的 Tab 交给浏览器')
+    assert.equal(off.focused, undefined, 'disabled 元素不该被当成回绕目标')
+    prevented = 0
+    const only = { focus() { only.focused = true } }
+    const singleCard = { querySelectorAll: () => [only] }
+    dialog.props.onKeyDown({ key: 'Tab', shiftKey: false, target: only, currentTarget: singleCard, preventDefault() { prevented += 1 } })
+    assert.equal(prevented, 0, '只剩一个可聚焦元素时不拦 Tab')
+  })
+
+  await check('窄屏下弹窗分组导航改横向、卡片占满高度', () => {
+    const css = styleNodes[0].textContent
+    const at = css.indexOf('@container flowgate (max-width: 720px)')
+    assert.ok(at >= 0, '缺少 720px 容器查询')
+    const block = css.slice(at, css.indexOf('@container flowgate (max-width: 480px)'))
+    assert.ok(/\.fg-modal-nav \{[^}]*flex-direction: row/.test(block), '窄屏分组导航应横排')
+    assert.ok(/\.fg-modal-body \{[^}]*grid-template-columns: minmax\(0, 1fr\)/.test(block), '窄屏应改成单列')
   })
 
   await check('勾选开发规则会提交 toggleRule', async () => {
-    const boxes = []
-    const walk = (node) => {
-      if (!node) return
-      if (Array.isArray(node)) { node.forEach(walk); return }
-      if (node.type === 'input' && node.props.type === 'checkbox') boxes.push(node)
-      if (node.children) walk(node.children)
-    }
-    walk(renderer.toJSON())
-    const target = boxes.find((node) => node.props['aria-label'] === '与既有代码风格一致')
+    const target = checkboxNodes(renderer.toJSON()).find((node) => node.props['aria-label'] === '与既有代码风格一致')
     assert.ok(target, '找不到开发规则的勾选框')
     assert.equal(target.props.checked, false)
     await act(async () => {
@@ -865,20 +1019,66 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
     assert.equal(last.payload.id, 'match-style')
     assert.equal(last.payload.enabled, true)
   })
+
+  await check('追加自定义规则后留在当前组且表单收起', async () => {
+    await click(buttonByText(renderer.toJSON(), '追加自定义开发规则'))
+    const input = inputByPlaceholder(renderer.toJSON(), '规则名称')
+    assert.ok(input, '追加表单应出现在列表上方')
+    await act(async () => {
+      input.props.onChange({ target: { value: '禁止新增第三方依赖' } })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    })
+    await click(buttonByText(renderer.toJSON(), '追加'))
+    const last = posted[posted.length - 1]
+    assert.equal(last.action, 'addRule')
+    assert.equal(last.payload.name, '禁止新增第三方依赖')
+    assert.deepEqual(last.payload.points, [])
+    const after = renderer.toJSON()
+    assert.ok(hasButton(after, '追加自定义开发规则'), '提交后仍停在开发规则组')
+    assert.equal(inputByPlaceholder(after, '规则名称'), null, '提交后表单收起')
+  })
+
+  await check('Esc 关闭弹窗并释放背景滚动', async () => {
+    await act(async () => {
+      pressEscape()
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    })
+    assert.equal(nodeByRole(renderer.toJSON(), 'dialog'), null)
+    assert.equal(globalThis.document.body.style.overflow, '')
+  })
+
+  await check('点遮罩关闭弹窗，点卡片内部不关闭', async () => {
+    await openSettings(renderer)
+    const overlay = nodeByClass(renderer.toJSON(), 'fg-modal')
+    const card = nodeByRole(renderer.toJSON(), 'dialog')
+    await act(async () => {
+      overlay.props.onClick({ target: card, currentTarget: overlay })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    })
+    assert.ok(nodeByRole(renderer.toJSON(), 'dialog'), '点卡片内部不该关闭')
+    await act(async () => {
+      overlay.props.onClick({ target: overlay, currentTarget: overlay })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    })
+    assert.equal(nodeByRole(renderer.toJSON(), 'dialog'), null)
+  })
+
+  await check('关闭按钮关闭弹窗，重开后表单为空', async () => {
+    await openSettings(renderer)
+    await click(buttonByText(renderer.toJSON(), '关闭'))
+    assert.equal(nodeByRole(renderer.toJSON(), 'dialog'), null)
+    const reopened = await openSettings(renderer)
+    assert.equal(inputByPlaceholder(reopened, '规则名称'), null)
+    assert.ok(hasButton(reopened, '追加自定义开发规则'))
+  })
 }
 
 {
   posted = []
   currentView = baseView('S3', { waiting: true, waitingKind: 'gate' })
   const renderer = await render(WorkbenchView, {})
-  const boxes = []
-  const walk = (node) => {
-    if (!node) return
-    if (Array.isArray(node)) { node.forEach(walk); return }
-    if (node.type === 'input' && node.props.type === 'checkbox') boxes.push(node)
-    if (node.children) walk(node.children)
-  }
-  walk(renderer.toJSON())
+  // S3 默认落在评审角度组：弹窗一开就是这组勾选框。
+  const boxes = checkboxNodes(await openSettings(renderer))
   await check('勾选评审角度会提交 toggleAngle', async () => {
     assert.ok(boxes.length >= 3, '应至少有三个角度勾选框，实际 ' + boxes.length)
     const target = boxes.find((node) => node.props.checked === false)
@@ -900,15 +1100,10 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
     directionCatalog: [{ id: 'mig', name: '迁移回滚', points: ['回滚可恢复'], needsWrite: true }],
   })
   const renderer = await render(WorkbenchView, {})
-  const boxes = []
-  const walk = (node) => {
-    if (!node) return
-    if (Array.isArray(node)) { node.forEach(walk); return }
-    if (node.type === 'input' && node.props.type === 'checkbox') boxes.push(node)
-    if (node.children) walk(node.children)
-  }
-  walk(renderer.toJSON())
-  const text = flat(renderer.toJSON())
+  // S4 默认落在测试方向组，写权限授权勾选也在这组里。
+  const modalTree = await openSettings(renderer)
+  const boxes = checkboxNodes(modalTree)
+  const text = flat(modalTree)
   await check('S1 追问卡片的跳过按钮不放行追问', async () => {
   currentView = baseView('S1', {
     grill: { pending: { id: 'q-skip', question: '过期后是否强制重新登录？', options: [{ label: '强制重新登录', tradeoff: '更安全' }], recommended: 0 }, answeredCount: 0 },
@@ -953,7 +1148,9 @@ await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
     directionCatalog: [{ id: 'mig', name: '迁移回滚', points: ['回滚可恢复'], needsWrite: true }],
   })
   const renderer = await render(WorkbenchView, {})
-  const text = flat(renderer.toJSON())
+  await openSettings(renderer)
+  // S2 默认组是开发规则，授权说明在测试方向组里。
+  const text = flat(await switchGroup(renderer, '测试方向'))
   await check('D2 非 S4 阶段授权勾选被禁用并说明原因', () => {
     assert.ok(text.includes('写权限例外只在 S4 测试阶段开放'))
   })
