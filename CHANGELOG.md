@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **四阶段工作区规则统一编辑**：需求分析、开发规则、评审角度、测试方向共用一个草稿弹窗。区分内置、已自定义内置与新增条目，可对照内置原文、逐项或逐阶段恢复；保存时原子提交全部修改，取消不落盘。配置版本 2 兼容原有 S2 默认，部分恢复保留其他阶段；状态、分析提示与评审/测试执行统一使用有效配置，测试写权限仍单独授权；方向停用、删除或改为只读时撤销旧授权，重启后需重新勾选。
+- **需求自动生成标题与整理稿**：输入后先提供基础标题与排版，停止输入后复用现有模型整理目标和要求；手动修改、过期响应与跨工作区草稿均有保护。整理失败可重试或直接启动。原文独立保留，进行中、详情与历史以整理稿展示，旧记录继续兼容。长中文需求的路径保真检查按完整候选扫描；模型准备、流读取与结果校验共用 12 秒期限，超期中止并回退本地稿。
+
 - **兼容 DSH 0.2.2-rc.5：`engines.dsh` 改成版本范围**：原来写死精确版本 `0.2.2-rc.3`，宿主升到 rc.5 后准入判定不满足，preflight 把插件行标成 `disabled`，只在 stderr 留一句 `disabling profile plugin ...`——界面与工具全部消失，看起来像插件坏了。现在声明 `>=0.2.2-rc.3 <0.3.0-0`：接受 0.2.2 全系（含 rc.3、rc.5 与后续 0.2.x），挡住 0.1.x 与 0.3.0。下界保留 prerelease、上界写成 `-0` 都是必须的，否则会分别拒绝 rc 版本、放行 0.3.0-rc。
   `dsh.compatibility.dsh` 同步为同一范围，`dshReleases` 补记 rc.5。已按 rc.5 官方源码逐个核对用到的契约：`subagents.startActivation` / `getProvider` / `prepareContinuable` / `delivery`、`tools.guard`、`tools/pre-execute`、`agents.get` 与 `agent.followup`、`sidebar.panellist` 与 `main` 插槽、`uiWorkspace`（`pickDirectory` / `openSession` / `connectWorkspace`）、`workspaces.create({ path })` —— 签名与 rc.3 一致，无需改调用方式。
   `lib/index.js` 的子代理能力探测不再把宿主版本号写进报错，改为指出缺少哪个接口。`test/install.test.mjs` 内置一份最小 semver 判定，与宿主的 `semver.satisfies(..., { includePrerelease: true })` 同规则，把「必须是范围」「覆盖 0.2.2 全系」「挡住 0.1.x 与 0.3.0」「商城口径与引擎声明一致」钉成 4 项断言，防止以后又改回精确版本。

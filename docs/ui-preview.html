@@ -18,43 +18,62 @@ const workspaceState=query.get('state')||'idle';
 const stage=mode==='doc'?'S1':(['home','workspace','rules','missing'].includes(mode)?'S2':mode);
 const ids=['S1','S2','S3','S4'];
 const angleCatalog=[{id:'correctness',name:'正确性',points:['核对核心逻辑与边界条件']},{id:'test-quality',name:'测试质量',points:['检查成功与失败路径的覆盖']},{id:'security',name:'安全',points:['核对敏感信息和访问控制']},{id:'style',name:'风格',points:['遵循项目已有代码约定']}];
-const directionCatalog=[{id:'smoke',name:'冒烟验证',points:['核心使用路径可正常完成']},{id:'boundary',name:'边界与异常',points:['输入为空、超时与重试']},{id:'regression',name:'回归影响',points:['原有功能保持可用']}];
+const directionCatalog=[{id:'functional',name:'功能验证',points:['按验收标准验证完整功能路径']},{id:'smoke',name:'冒烟验证',points:['核心使用路径可正常完成']},{id:'boundary',name:'边界与异常',points:['输入为空、超时与重试']},{id:'regression',name:'回归影响',points:['原有功能保持可用']}];
 const rules=[{id:'scope-only',name:'只改 scope 内的文件',points:['所有修改必须在已批准的文件集合内']},{id:'no-new-dep',name:'不引入未声明的依赖',points:['新增依赖需明确声明']},{id:'explicit-errors',name:'错误路径显式处理',points:['异常输入有可识别的错误提示']},{id:'no-debug-leftovers',name:'不留调试残留',points:['移除临时日志与调试代码']},{id:'match-style',name:'与既有代码风格一致',points:['遵循已有命名与目录约定']}];
+const analysisCatalog=[{id:'clarify-goal',name:'明确目标与验收',points:['先明确用户目标、边界和可验证的结果']},{id:'one-decision',name:'一次只问一个关键问题',points:['不重复追问需求中已明确的内容']},{id:'confirm-scope',name:'确认需求与修改范围',points:['用需求文档给出范围和验收标准后再开始开发']}];
+const stageBuiltins={S1:analysisCatalog,S2:rules,S3:angleCatalog,S4:directionCatalog};
+const stageDefaults={S1:{fast:analysisCatalog.map(r=>r.id),strict:analysisCatalog.map(r=>r.id)},S2:{fast:rules.map(r=>r.id),strict:rules.map(r=>r.id)},S3:{fast:['correctness','test-quality'],strict:angleCatalog.map(r=>r.id)},S4:{fast:['smoke'],strict:['functional','boundary','regression']}};
+const stageLabels={S1:'需求分析',S2:'开发',S3:'评审',S4:'测试'};
 const paths=['src/auth/session.ts','src/api/middleware.ts','src/features/authentication/session-management/handlers/expired-session-notification-handler.ts'];
-const view={active:stage!=='empty',id:'flow-preview',title:'会话过期检测与重新认证提示',stage,preset:'fast',presetInfo:{label:'小功能快速开发',summary:'聚焦核心实现与快速验证'},presets:{fast:{label:'小功能快速开发',summary:'2 个评审角度 · 1 个测试方向'},strict:{label:'大需求严格执行',summary:'4 个评审角度 · 3 个测试方向'}},finished:false,waiting:true,waitingKind:stage==='S1'?'answer':'gate',skippedCount:0,stages:ids.map((id,i)=>({id,label:['需求分析','开发','评审','测试'][i],output:['需求文档 + scope.json','代码变更','评审报告','测试报告'][i],status:i<ids.indexOf(stage)?'passed':id===stage?'active':'pending',skipped:false})),scope:{frozen:stage!=='S1',frozenAt:'2026-11-17T10:00:00Z',withoutDocApproval:false,data:{in_scope:{files_expected_to_change:paths,capabilities:['检测 30 分钟未活动的会话','返回 401 并提供重新认证入口']},out_of_scope_explicitly:['OAuth 第三方登录','权限模型重构'],acceptance_criteria:[{id:'AC-1',when:'会话超过 30 分钟未活动',then:'返回 401，并附带 reauthenticate_url'}]}},doc:{html:null},grill:{pending:null,answeredCount:2},angles:angleCatalog.slice(0,2),angleCatalog,directions:directionCatalog.slice(0,1),directionCatalog,rules,ruleIds:rules.map(r=>r.id),ruleCatalog:rules,review:{blocking:1,angles:[{id:'correctness',name:'正确性',verdict:'blocking',findings:[{file:paths[2],line:128,severity:'MAJOR',summary:'会话续期与过期检测并发时，最后活动时间可能被旧请求覆盖。建议在写入前校验版本，避免活跃会话被误判为过期。'},{file:paths[0],line:42,severity:'MINOR',summary:'建议为临界时间增加注释，说明等于 30 分钟时的处理方式。'}]},{id:'test-quality',name:'测试质量',verdict:'pass',findings:[]}]},reviewOutsideScope:[],test:{failed:1,directions:[{name:'冒烟验证',points:[{point:'有效会话请求能够正常返回业务结果',result:'pass',detail:'核心登录路径验证通过。'},{point:'超过 30 分钟未活动时返回 401，并附带重新认证地址',result:'fail',detail:'在刷新令牌与并发请求同时执行的情况下，响应中缺少 reauthenticate_url。'},{point:'重连后恢复原页面状态',result:'uncovered',detail:'需要真实浏览器中的多标签页场景验证。'}]}]},devChanges:{files:paths,untracked:[paths[2]],added:128,removed:34},canSpawn:true};
+const view={active:stage!=='empty',id:'flow-preview',title:'会话过期检测与重新认证提示',stage,preset:'fast',presetInfo:{label:'小功能快速开发',summary:'聚焦核心实现与快速验证'},presets:{fast:{label:'小功能快速开发',summary:'2 个评审角度 · 1 个测试方向'},strict:{label:'大需求严格执行',summary:'4 个评审角度 · 3 个测试方向'}},finished:false,waiting:true,waitingKind:stage==='S1'?'answer':'gate',skippedCount:0,stages:ids.map((id,i)=>({id,label:['需求分析','开发','评审','测试'][i],output:['需求文档 + scope.json','代码变更','评审报告','测试报告'][i],status:i<ids.indexOf(stage)?'passed':id===stage?'active':'pending',skipped:false})),scope:{frozen:stage!=='S1',frozenAt:'2026-11-17T10:00:00Z',withoutDocApproval:false,data:{in_scope:{files_expected_to_change:paths,capabilities:['检测 30 分钟未活动的会话','返回 401 并提供重新认证入口']},out_of_scope_explicitly:['OAuth 第三方登录','权限模型重构'],acceptance_criteria:[{id:'AC-1',when:'会话超过 30 分钟未活动',then:'返回 401，并附带 reauthenticate_url'}]}},doc:{html:null},grill:{pending:null,answeredCount:2},angles:angleCatalog.slice(0,2),angleCatalog,directions:directionCatalog.filter(direction=>direction.id==='smoke'),directionCatalog,rules,ruleIds:rules.map(r=>r.id),ruleCatalog:rules,review:{blocking:1,angles:[{id:'correctness',name:'正确性',verdict:'blocking',findings:[{file:paths[2],line:128,severity:'MAJOR',summary:'会话续期与过期检测并发时，最后活动时间可能被旧请求覆盖。建议在写入前校验版本，避免活跃会话被误判为过期。'},{file:paths[0],line:42,severity:'MINOR',summary:'建议为临界时间增加注释，说明等于 30 分钟时的处理方式。'}]},{id:'test-quality',name:'测试质量',verdict:'pass',findings:[]}]},reviewOutsideScope:[],test:{failed:1,directions:[{name:'冒烟验证',points:[{point:'有效会话请求能够正常返回业务结果',result:'pass',detail:'核心登录路径验证通过。'},{point:'超过 30 分钟未活动时返回 401，并附带重新认证地址',result:'fail',detail:'在刷新令牌与并发请求同时执行的情况下，响应中缺少 reauthenticate_url。'},{point:'重连后恢复原页面状态',result:'uncovered',detail:'需要真实浏览器中的多标签页场景验证。'}]}]},devChanges:{files:paths,untracked:[paths[2]],added:128,removed:34},canSpawn:true};
 if(stage==='S1') view.grill.pending={id:'question-1',question:'会话过期后，用户应如何重新登录？',context:'选择将决定接口返回内容，以及前端如何引导用户恢复操作。',recommended:0,options:[{label:'保留当前页面并展示重新登录入口',tradeoff:'用户重新认证后可以继续原来的操作，体验更连贯。'},{label:'立即跳转到登录页',tradeoff:'实现直接，但用户可能丢失尚未提交的内容。'},{label:'交由调用方自行处理',tradeoff:'接口更通用，各客户端需要额外实现统一的错误提示。'}]};
 if(mode==='doc') {view.grill.pending=null;view.waitingKind='doc';view.doc={html:'<!doctype html><style>html{color-scheme:light dark}body{max-width:48rem;margin:2em auto;padding:0 1.5em;font-family:system-ui;line-height:1.8}h1{font-size:1.5rem}table{border-collapse:collapse;width:100%}td,th{border:1px solid GrayText;text-align:left;padding:.6em}</style><h1>会话过期检测</h1><p>在会话过期时给出明确、可恢复的用户提示。</p><h2>开发范围</h2><ul><li>会话过期检测</li><li>401 响应与重新认证入口</li></ul><h2>验收标准</h2><table><tr><th>条件</th><th>预期结果</th></tr><tr><td>超过 30 分钟未活动</td><td>返回 401</td></tr></table>',recommendedPreset:'fast',reason:'本次需求范围明确，仅涉及会话检测与响应处理。',pending:true};}
 view.progress={stageIndex:Math.max(0,ids.indexOf(stage)),percent:Math.max(0,ids.indexOf(stage))*25,label:['需求分析','开发','评审','测试'][Math.max(0,ids.indexOf(stage))]};
 view.elapsedMs=12*60*1000;
 window.fixtureActions=[];
-const currentSummary={id:'flow-preview',sessionId:'preview',title:view.title,brief:'超过 30 分钟未活动时返回 401，并提供重新认证入口。',stage:'S2',stageLabel:'开发',percent:25,preset:'fast',waiting:true,finished:false,cancelled:false,updatedAt:'2026-10-01T10:00:00Z'};
-const history=Array.from({length:23},(_,i)=>({id:'history-'+i,sessionId:'history-'+i,title:['修复导出文件名编码','调整通知与消息列表','优化登录页表单反馈','补充操作日志筛选'][i%4]+' · '+(i+1),stage:'S4',stageLabel:'测试',percent:100,preset:'fast',finished:true,cancelled:false,waiting:false,updatedAt:new Date(Date.UTC(2026,10,18-i)).toISOString()}));
+view.brief='会话超过 30 分钟未活动时，接口返回 401，并提供重新认证入口。请保留用户正在编辑的内容。';
+view.summary='目标：让用户在会话过期后顺利恢复操作。\n要求：超过 30 分钟未活动时返回 401；提供重新认证入口；保留正在编辑的内容。';
+const currentSummary={id:'flow-preview',sessionId:'preview',title:view.title,brief:view.brief,summary:view.summary,stage:'S2',stageLabel:'开发',percent:25,preset:'fast',waiting:true,finished:false,cancelled:false,updatedAt:'2026-10-01T10:00:00Z'};
+const history=Array.from({length:23},(_,i)=>({id:'history-'+i,sessionId:'history-'+i,title:['修复导出文件名编码','调整通知与消息列表','优化登录页表单反馈','补充操作日志筛选'][i%4]+' · '+(i+1),summary:'目标：改善用户操作体验。要求：保持现有内容，提供清晰反馈和可恢复操作。',stage:'S4',stageLabel:'测试',percent:100,preset:'fast',finished:true,cancelled:false,waiting:false,updatedAt:new Date(Date.UTC(2026,10,18-i)).toISOString()}));
 let currentFlow=workspaceState==='active'?{...currentSummary}:null;
 // Keep the active flow off page one: the primary entry must use currentFlow.
 if(currentFlow)history[22]=currentFlow;
 if(['finished','cancelled'].includes(workspaceState))history[0]={...currentSummary,stage:'S4',stageLabel:'测试',finished:true,cancelled:workspaceState==='cancelled',percent:100,waiting:false,updatedAt:'2026-11-18T10:00:00Z'};
-let workspaceRules={configured:true,ids:['scope-only','no-new-dep','match-style','team-errors'],custom:[{id:'team-errors',name:'错误提示附带恢复入口',points:['网络或认证失败时提供重试操作']}],catalog:[]};
+let workspaceStages={S1:null,S2:{ids:['scope-only','no-new-dep','explicit-errors','match-style','team-errors'],custom:[{id:'team-errors',name:'错误提示附带恢复入口',points:['网络或认证失败时提供重试操作']}],edits:[{id:'explicit-errors',name:'错误路径显式处理',points:['清晰说明失败原因','提供可恢复的下一步操作']}]},S3:null,S4:null};
+const buildWorkspaceRules=()=>{const stages=Object.fromEntries(ids.map(id=>{const config=workspaceStages[id],builtin=stageBuiltins[id],custom=config?.custom||[],edits=config?.edits||[],selection=config?.ids??null;return[id,{label:stageLabels[id],configured:!!config,selection,ids:selection||stageDefaults[id].fast,defaults:stageDefaults[id],builtin,custom,edits,catalog:builtin.map(item=>edits.find(edit=>edit.id===item.id)||item).concat(custom)}]}));const s2=stages.S2;return{configured:Object.values(stages).some(s=>s.configured),ids:s2.ids,custom:s2.custom,customCount:s2.custom.length,catalog:s2.catalog,stages}};
+view.stageConfigs=Object.fromEntries(ids.map(id=>{const s=buildWorkspaceRules().stages[id];return[id,{ids:s.ids,catalog:s.catalog,items:s.catalog.filter(item=>s.ids.includes(item.id)),source:s.configured?'workspace':'default'}]}));
+window.fixturePrepare={delay:80,status:'ready'};
+window.fixturePreparePending=0;
 const members=mode==='empty'?[]:[{path:'D:/Projects/atlas-console',name:'atlas-console',flowCount:23,activeCount:currentFlow?1:0,waitingCount:currentFlow?1:0,rules:{configured:true,ids:['scope-only','no-new-dep','match-style'],customCount:0},missing:mode==='missing'},{path:'D:/Projects/component-library',name:'component-library',flowCount:0,activeCount:0,waitingCount:0,rules:{configured:false}},{path:'D:/Projects/docs-site',name:'docs-site',flowCount:0,activeCount:0,waitingCount:0,rules:{configured:false}}];
 const endedView=summary=>({...view,...summary,active:true,finished:true,waiting:false,waitingKind:null,progress:{stageIndex:3,percent:100,label:'测试'},stages:view.stages.map(s=>({...s,status:'passed'})),test:{failed:0,directions:[]}});
-window.fixtureState=()=>({currentFlow,history:history.map(f=>({...f}))});
+window.fixtureState=()=>({currentFlow,history:history.map(f=>({...f})),workspaceStages});
 window.fixtureFinish=cancelled=>{if(!currentFlow)return;const index=history.findIndex(f=>f.id===currentFlow.id);history[index]={...currentFlow,finished:true,cancelled,waiting:false,stage:'S4',stageLabel:'测试',percent:100};currentFlow=null;members[0].activeCount=0;members[0].waitingCount=0;};
 window.fixtureRequests=[];
+window.fixtureRuleSaveDelay=0;
 window.fetch=async(url,init)=>{
   const route=String(url),body=init?.body?JSON.parse(init.body):{};window.fixtureRequests.push({route,body});
   const sessionId=body.sessionId||new URL(route,location.href).searchParams.get('sessionId');
   const summary=history.find(f=>f.sessionId===sessionId);
-  let data=summary?.finished?endedView(summary):view;
+  let data=summary?.finished?endedView(summary):{...view,...(summary||{})};
   if(route.includes('/action')){
     window.fixtureActions.push(body);
-    if(body.action==='start'){currentFlow={...currentSummary,title:body.payload?.title||body.payload?.brief?.split('\n')[0]||currentSummary.title,brief:body.payload?.brief||'',stage:'S1',stageLabel:'需求分析',percent:0,preset:body.payload?.preset||'fast'};history.unshift(currentFlow);members[0].flowCount=history.length;members[0].activeCount=1;members[0].waitingCount=1;}
+    if(body.action==='start'){currentFlow={...currentSummary,title:body.payload?.title||body.payload?.brief?.split('\n')[0]||currentSummary.title,brief:body.payload?.brief||'',summary:body.payload?.summary||body.payload?.brief||'',stage:'S1',stageLabel:'需求分析',percent:0,preset:body.payload?.preset||'fast'};history.unshift(currentFlow);members[0].flowCount=history.length;members[0].activeCount=1;members[0].waitingCount=1;}
     data={ok:true};
   }
   if(route.includes('/hub/members'))data={members};
   if(route.includes('/hub/flows')){const list=body.path===members[0]?.path?history:[];const totalPages=Math.max(1,Math.ceil(list.length/10)),page=Math.max(1,Math.min(body.page||1,totalPages));data={flows:list.slice((page-1)*10,page*10),currentFlow:body.path===members[0]?.path?currentFlow:null,total:list.length,page,pageSize:10,totalPages};}
   if(route.includes('/hub/rules')){
-    if('rules' in body)workspaceRules=body.rules===null?{configured:false,ids:rules.map(r=>r.id),custom:[]}: {...body.rules,configured:true};
-    data={rules:{...workspaceRules,customCount:workspaceRules.custom.length,catalog:rules.concat(workspaceRules.custom)}};
+    if(('stages' in body||'rules' in body)&&window.fixtureRuleSaveDelay)await new Promise(resolve=>setTimeout(resolve,window.fixtureRuleSaveDelay));
+    if('stages' in body)workspaceStages=body.stages===null?Object.fromEntries(ids.map(id=>[id,null])):{...workspaceStages,...body.stages};
+    if('rules' in body)workspaceStages.S2=body.rules;
+    data={rules:buildWorkspaceRules()};
   }
+  if(route.includes('/hub/prepare')){
+    const options={...window.fixturePrepare};window.fixturePreparePending++;await new Promise(resolve=>setTimeout(resolve,options.delay));
+    const brief=String(body.brief||'').trim(),first=brief.split(/\r?\n/).map(line=>line.trim()).find(Boolean)||'';
+    data={title:first.replace(/^[#>*\-\s]+/,'').replace(/[。；;，,.！!？?]+$/,'').slice(0,40),summary:brief?(options.status==='fallback'?brief:'目标与要求\n'+brief):'',status:options.status,message:options.status==='fallback'?'整理服务暂不可用，已保留原文与基础排版。':undefined};
+  }
+  if(route.includes('/hub/prepare'))window.fixturePreparePending--;
   return {ok:true,json:async()=>data};
 };
 window.__ModuleLoader__={load(entry){const plugin=window.previewPlugin=entry.factory(name=>{if(name==='react')return React;throw Error(name)});plugin.apply({slots:{inject(_name,fn){fn()},register(options,component){if(options.name==='main') window.Workbench=component;return ()=>{}}}})}};

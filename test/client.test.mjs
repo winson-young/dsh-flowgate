@@ -198,6 +198,8 @@ const flowsByPath = new Map()
 const rulesByPath = new Map()
 let flowHandler = null
 let ruleHandler = null
+let prepareHandler = null
+const prepareCalls = []
 const response = (data, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => data })
 const withoutFlows = ({ flows: _flows, ...member }) => member
 function flowPage(body) {
@@ -207,9 +209,27 @@ function flowPage(body) {
   const pageSize = body.pageSize || 10
   return { flows: flows.slice((page - 1) * pageSize, page * pageSize), currentFlow: flows.find((flow) => !flow.finished && !flow.cancelled) || null, total: flows.length, page, pageSize, totalPages: Math.max(1, Math.ceil(flows.length / pageSize)) }
 }
+const stageLabels = { S1: '需求分析', S2: '开发规则', S3: '评审角度', S4: '测试方向' }
+function resolveWorkspaceStage(stage, input = null, existing = null) {
+  const view = baseView('S2')
+  const builtin = existing?.builtin || ({
+    S1: [{ id: 'clarity', name: '明确需求目标', points: ['说明现状与目标'] }, { id: 'acceptance', name: '明确验收标准', points: ['逐条给出验收行为'] }],
+    S2: view.ruleCatalog, S3: view.angleCatalog, S4: view.directionCatalog,
+  })[stage]
+  const defaults = existing?.defaults || { fast: stage === 'S2' ? builtin.map((item) => item.id) : [builtin[0].id], strict: builtin.map((item) => item.id) }
+  const custom = input?.custom || []
+  const edits = input?.edits || []
+  const selection = input?.ids ?? null
+  const catalog = builtin.map((entry) => edits.find((item) => item.id === entry.id) || entry).concat(custom)
+  return { label: stageLabels[stage], configured: input !== null, selection, ids: selection || defaults.fast, defaults, builtin, custom, edits, catalog }
+}
 function workspaceRules(path) {
-  const catalog = baseView('S2').ruleCatalog
-  return rulesByPath.get(path) ?? { configured: false, ids: catalog.map((rule) => rule.id), custom: [], customCount: 0, catalog }
+  const stored = rulesByPath.get(path)
+  if (stored?.stages) return stored
+  const legacy = stored || { configured: false, ids: baseView('S2').ruleCatalog.map((rule) => rule.id), custom: [], customCount: 0, catalog: baseView('S2').ruleCatalog }
+  const stages = Object.fromEntries(Object.keys(stageLabels).map((stage) => [stage, resolveWorkspaceStage(stage,
+    stage === 'S2' && legacy.configured ? { ids: legacy.ids, custom: legacy.custom || [], edits: [] } : null)]))
+  return { ...legacy, stages }
 }
 globalThis.fetch = async (url, init) => {
   const target = String(url)
@@ -223,12 +243,21 @@ globalThis.fetch = async (url, init) => {
     flowCalls.push(body)
     return flowHandler ? flowHandler(body) : response(flowPage(body))
   }
+  if (target.includes('/hub/prepare')) {
+    const body = JSON.parse(init.body)
+    prepareCalls.push(body)
+    return prepareHandler ? prepareHandler(body) : response({ title: body.brief.split(/\r?\n/).find((line) => line.trim())?.trim() || '', summary: body.brief.trim(), status: 'fallback' })
+  }
   if (target.includes('/hub/rules')) {
     const body = JSON.parse(init.body)
     assert.equal(init.method, 'POST')
     ruleCalls.push(body)
     if (ruleHandler) return ruleHandler(body)
-    if (Object.hasOwn(body, 'rules')) {
+    if (Object.hasOwn(body, 'stages')) {
+      const previous = workspaceRules(body.path)
+      const stages = Object.fromEntries(Object.keys(stageLabels).map((stage) => [stage, resolveWorkspaceStage(stage, body.stages[stage], previous.stages[stage])]))
+      rulesByPath.set(body.path, { ...previous, stages, ...stages.S2, customCount: stages.S2.custom.length })
+    } else if (Object.hasOwn(body, 'rules')) {
       const previous = workspaceRules(body.path)
       const next = body.rules === null
         ? { configured: false, ids: baseView('S2').ruleCatalog.map((rule) => rule.id), custom: [], customCount: 0, catalog: baseView('S2').ruleCatalog }
@@ -492,7 +521,7 @@ const HubPanelIcon = componentOf('sidebar.panellist')
   await check('空态给的是需求描述输入框，不是只能填标题', () => {
     assert.ok(flat(renderer.toJSON()).includes('需求描述'))
     const found = areas()
-    assert.equal(found.length, 1, '必须有一个多行的需求描述输入框')
+    assert.equal(found.length, 2, '分别提供原文与可编辑整理稿')
     assert.equal(found[0].props.rows, 4)
     assert.equal(found[0].props.required, true)
     assert.equal(found[0].props['aria-required'], true)
@@ -534,7 +563,8 @@ const HubPanelIcon = componentOf('sidebar.panellist')
     const last = posted.at(-1)
     assert.equal(last.action, 'start')
     assert.equal(last.payload.preset, 'fast')
-    assert.equal(last.payload.title, '')
+    assert.equal(last.payload.title, '会话过期返回 401，并给出重新认证入口')
+    assert.equal(last.payload.summary, '会话过期返回 401，并给出重新认证入口\n第二行补充说明')
     assert.equal(last.payload.brief, '会话过期返回 401，并给出重新认证入口\n第二行补充说明')
   })
   await check('先切档位再启动，请求里带上选择的档位', async () => {
@@ -1206,11 +1236,31 @@ const HubPanelIcon = componentOf('sidebar.panellist')
     dialog.props.onKeyDown(tabEvent(card, false))
     assert.equal(prevented, 0, '卡片自身出发的 Tab 交给浏览器')
     assert.equal(off.focused, undefined, 'disabled 元素不该被当成回绕目标')
-    prevented = 0
-    const only = { focus() { only.focused = true } }
-    const singleCard = { querySelectorAll: () => [only] }
-    dialog.props.onKeyDown({ key: 'Tab', shiftKey: false, target: only, currentTarget: singleCard, preventDefault() { prevented += 1 } })
-    assert.equal(prevented, 0, '只剩一个可聚焦元素时不拦 Tab')
+  })
+
+  await check('零个可聚焦项时Tab与Shift+Tab留在dialog且阻止默认跳出', () => {
+    const dialog = nodeByRole(renderer.toJSON(), 'dialog')
+    const disabled = { disabled: true, focus() { assert.fail('不能聚焦已禁用控件') } }
+    const card = { focused: 0, querySelectorAll: () => [disabled], focus() { this.focused += 1 } }
+    let prevented = 0
+    for (const shiftKey of [false, true]) {
+      dialog.props.onKeyDown({ key: 'Tab', target: card, currentTarget: card, shiftKey, preventDefault() { prevented += 1 } })
+    }
+    assert.equal(prevented, 2)
+    assert.equal(card.focused, 2, '两个方向都将焦点保留在dialog自身')
+  })
+
+  await check('唯一可聚焦项时正反Tab均回到唯一项，从dialog出发同样受约束', () => {
+    const dialog = nodeByRole(renderer.toJSON(), 'dialog')
+    const disabled = { disabled: true, focus() { assert.fail('不能聚焦已禁用控件') } }
+    const only = { focused: 0, focus() { this.focused += 1 } }
+    const card = { querySelectorAll: () => [disabled, only], focus() { assert.fail('有可用项时应聚焦该项') } }
+    let prevented = 0
+    for (const target of [only, card]) for (const shiftKey of [false, true]) {
+      dialog.props.onKeyDown({ key: 'Tab', target, currentTarget: card, shiftKey, preventDefault() { prevented += 1 } })
+    }
+    assert.equal(prevented, 4)
+    assert.equal(only.focused, 4)
   })
 
   await check('窄屏下弹窗分组导航改横向、卡片占满高度', () => {
@@ -1647,6 +1697,8 @@ const resetHub = (members = []) => {
   rulesByPath.clear()
   flowHandler = null
   ruleHandler = null
+  prepareHandler = null
+  prepareCalls.length = 0
 }
 
 {
@@ -1701,14 +1753,14 @@ const resetHub = (members = []) => {
     assert.ok(text.includes('其中 1 条在等你确认'))
   })
   await check('规则摘要常驻，配置路径仅放在 title 中', () => {
-    assert.ok(text.includes('工作区默认 · 2 条启用'), text)
+    assert.ok(text.includes('工作区默认 · 2 条'), text)
     assert.ok(!text.includes('.dsh-flowgate/config.json'), '配置路径不应挤占常驻内容')
     const card = nodeByClass(renderer.toJSON(), 'fg-hub-section fg-workspace-card fg-workspace-rules')
     assert.ok(card)
     assert.ok(hasButton(card, '编辑规则'))
-    assert.ok(flat(card).includes('只改 scope 内的文件'))
-    assert.ok(flat(card).includes('不留调试残留'))
-    assert.ok(findTags(card, 'div').some((node) => node.props.title === '规则配置：.dsh-flowgate/config.json'))
+    assert.ok(flat(card).includes('S1 · 需求分析'))
+    assert.ok(flat(card).includes('S4 · 测试方向'))
+    assert.ok(flat(card).includes('内置默认'))
   })
   await check('有当前流程时主区提供继续入口，不展示新建表单，记录默认收起', () => {
     const primary = nodeByClass(renderer.toJSON(), 'fg-workspace-primary')
@@ -1760,7 +1812,7 @@ const resetHub = (members = []) => {
   await click(buttonByText(renderer.toJSON(), 'alpha'))
   await check('选中工作区后就能写需求，不用回会话', () => {
     assert.ok(hasButton(renderer.toJSON(), '开始需求分析'))
-    assert.equal(findTags(renderer.toJSON(), 'textarea').length, 1)
+    assert.equal(findTags(renderer.toJSON(), 'textarea').length, 2)
   })
   const area = findTags(renderer.toJSON(), 'textarea')[0]
   await act(async () => {
@@ -1892,7 +1944,14 @@ const emptyMember = (name) => ({
   path: 'D:/repo/' + name, name, missing: false, flowCount: 0, activeCount: 0, waitingCount: 0,
   rules: { configured: false, ids: null, customCount: 0 },
 })
-const ruleWrites = () => ruleCalls.filter((body) => Object.hasOwn(body, 'rules'))
+const ruleWrites = () => ruleCalls.filter((body) => Object.hasOwn(body, 'stages') || Object.hasOwn(body, 'rules'))
+async function openWorkspaceRules(renderer, stage = 'S2') {
+  await click(buttonByText(renderer.toJSON(), '编辑规则'))
+  await click(buttonByText(nodeByRole(renderer.toJSON(), 'dialog'), stage + ' · ' + stageLabels[stage]))
+}
+async function switchRuleStage(renderer, stage) {
+  await click(buttonByText(ruleDialog(renderer), stage + ' · ' + stageLabels[stage]))
+}
 const ruleDialog = (renderer) => nodeByRole(renderer.toJSON(), 'dialog')
 function buttonByAria(tree, label) {
   const found = buttons(tree).find((node) => node.props['aria-label'] === label)
@@ -1930,9 +1989,9 @@ await check('无流程工作区可直接配置规则，新增与取消草稿不�
   try {
     await click(buttonByText(renderer.toJSON(), 'empty'))
     assert.ok(hasButton(renderer.toJSON(), '编辑规则'), '无流程也有常驻规则入口')
-    await click(buttonByText(renderer.toJSON(), '编辑规则'))
+    await openWorkspaceRules(renderer)
     assert.ok(flat(ruleDialog(renderer)).includes('工作区规则'))
-    assert.ok(flat(ruleDialog(renderer)).includes('未单独设置规则的流程将使用此配置。'))
+    assert.ok(flat(ruleDialog(renderer)).includes('四阶段改动统一保存'))
     assert.deepEqual(ruleCalls[0], { path: 'D:/repo/empty' })
     await addDraftRule(renderer, '仅保留在草稿')
     assert.ok(flat(ruleDialog(renderer)).includes('仅保留在草稿'))
@@ -1943,12 +2002,12 @@ await check('无流程工作区可直接配置规则，新增与取消草稿不�
     assert.equal(ruleWrites().length, 0, '加入列表和勾选都不能立即保存')
     await click(buttonByText(ruleDialog(renderer), '取消'))
     assert.equal(ruleDialog(renderer), null)
-    await click(buttonByText(renderer.toJSON(), '编辑规则'))
+    await openWorkspaceRules(renderer)
     assert.ok(!flat(ruleDialog(renderer)).includes('仅保留在草稿'), '取消后重开不保留未保存条目')
     assert.equal(ruleCheckbox(ruleDialog(renderer), '只改 scope 内的文件').props.checked, true)
     await addDraftRule(renderer, '关闭也丢弃草稿')
     await click(buttonByText(ruleDialog(renderer), '关闭'))
-    await click(buttonByText(renderer.toJSON(), '编辑规则'))
+    await openWorkspaceRules(renderer)
     assert.ok(!flat(ruleDialog(renderer)).includes('关闭也丢弃草稿'))
     assert.equal(ruleWrites().length, 0)
     assert.deepEqual(sessions, [])
@@ -1961,27 +2020,27 @@ await check('工作区规则保存失败保留草稿可重试，自定义编辑�
   const renderer = await renderHub()
   try {
     await click(buttonByText(renderer.toJSON(), 'rules'))
-    await click(buttonByText(renderer.toJSON(), '编辑规则'))
+    await openWorkspaceRules(renderer)
     await addDraftRule(renderer, '禁止新增依赖', '  逐项核对依赖  \n\n检查锁文件  ')
     await toggleRule(renderer, '只改 scope 内的文件', false)
-    ruleHandler = (body) => Object.hasOwn(body, 'rules') ? response({ error: '规则保存失败，请重试' }, 500) : response({ rules: workspaceRules(body.path) })
+    ruleHandler = (body) => Object.hasOwn(body, 'stages') ? response({ error: '规则保存失败，请重试' }, 500) : response({ rules: workspaceRules(body.path) })
     await click(buttonByText(ruleDialog(renderer), '保存规则'))
     assert.ok(flat(ruleDialog(renderer)).includes('规则保存失败，请重试'))
     assert.ok(flat(ruleDialog(renderer)).includes('禁止新增依赖'))
     assert.equal(buttonByText(ruleDialog(renderer), '保存规则').props.disabled, false)
     const failedPayload = ruleWrites()[0]
     assert.equal(failedPayload.path, 'D:/repo/rules')
-    assert.equal(failedPayload.rules.custom.length, 1)
-    assert.equal(failedPayload.rules.custom[0].name, '禁止新增依赖')
-    assert.deepEqual(failedPayload.rules.custom[0].points, ['逐项核对依赖', '检查锁文件'])
-    assert.ok(!failedPayload.rules.ids.includes('scope-only'))
-    assert.ok(failedPayload.rules.ids.includes(failedPayload.rules.custom[0].id))
+    assert.equal(failedPayload.stages.S2.custom.length, 1)
+    assert.equal(failedPayload.stages.S2.custom[0].name, '禁止新增依赖')
+    assert.deepEqual(failedPayload.stages.S2.custom[0].points, ['逐项核对依赖', '检查锁文件'])
+    assert.ok(!failedPayload.stages.S2.ids.includes('scope-only'))
+    assert.ok(failedPayload.stages.S2.ids.includes(failedPayload.stages.S2.custom[0].id))
     ruleHandler = null
     await click(buttonByText(ruleDialog(renderer), '保存规则'))
     assert.deepEqual(ruleWrites()[1], failedPayload, '重试应保留同一个规则 id 和草稿')
     assert.equal(ruleDialog(renderer), null)
-    assert.ok(flat(renderer.toJSON()).includes('禁止新增依赖'), '成功后规则卡片刷新摘要')
-    await click(buttonByText(renderer.toJSON(), '编辑规则'))
+    assert.ok(flat(renderer.toJSON()).includes('工作区默认 · 3 条'), '成功后规则卡片刷新阶段摘要')
+    await openWorkspaceRules(renderer)
     await click(buttonByAria(ruleDialog(renderer), '编辑规则：禁止新增依赖'))
     assert.equal(inputByPlaceholder(ruleDialog(renderer), '规则名称').props.value, '禁止新增依赖')
     await changeValue(inputByPlaceholder(ruleDialog(renderer), '规则名称'), '核对新增依赖')
@@ -1989,23 +2048,23 @@ await check('工作区规则保存失败保留草稿可重试，自定义编辑�
     assert.ok(flat(ruleDialog(renderer)).includes('核对新增依赖'))
     await toggleRule(renderer, '核对新增依赖', false)
     await click(buttonByText(ruleDialog(renderer), '保存规则'))
-    const edited = ruleWrites().at(-1).rules
-    assert.equal(edited.custom[0].id, failedPayload.rules.custom[0].id, '编辑保留 id')
+    const edited = ruleWrites().at(-1).stages.S2
+    assert.equal(edited.custom[0].id, failedPayload.stages.S2.custom[0].id, '编辑保留 id')
     assert.equal(edited.custom[0].name, '核对新增依赖')
     assert.ok(!edited.ids.includes(edited.custom[0].id), '自定义规则可以关闭但保留定义')
-    await click(buttonByText(renderer.toJSON(), '编辑规则'))
+    await openWorkspaceRules(renderer)
     await click(buttonByAria(ruleDialog(renderer), '移除规则：核对新增依赖'))
     assert.ok(!flat(ruleDialog(renderer)).includes('核对新增依赖'))
     assert.equal(ruleWrites().length, 3, '移除只改变本地草稿')
     await click(buttonByText(ruleDialog(renderer), '取消'))
-    await click(buttonByText(renderer.toJSON(), '编辑规则'))
+    await openWorkspaceRules(renderer)
     assert.ok(flat(ruleDialog(renderer)).includes('核对新增依赖'), '取消移除后定义仍在')
-    await click(buttonByText(ruleDialog(renderer), '恢复内置默认'))
+    await click(buttonByText(ruleDialog(renderer), '恢复本阶段内置默认'))
     assert.ok(!flat(ruleDialog(renderer)).includes('核对新增依赖'))
     assert.ok(checkboxNodes(ruleDialog(renderer)).every((box) => box.props.checked))
     assert.equal(ruleWrites().length, 3, '恢复默认先留在草稿')
     await click(buttonByText(ruleDialog(renderer), '保存规则'))
-    assert.deepEqual(ruleWrites().at(-1), { path: 'D:/repo/rules', rules: null })
+    assert.deepEqual(ruleWrites().at(-1), { path: 'D:/repo/rules', stages: { S1: null, S2: null, S3: null, S4: null } })
     assert.equal(ruleDialog(renderer), null)
   } finally { ruleHandler = null; await act(async () => { renderer.unmount() }) }
 })
@@ -2081,7 +2140,7 @@ await check('翻页后旧目录的流程和规则迟到响应不能覆盖新选�
     assert.ok(flat(renderer.toJSON()).includes('当前乙任务01'))
     assert.ok(!flat(renderer.toJSON()).includes('迟到甲任务'), '旧目录第二页不能覆盖新目录第一页')
     assert.ok(!flat(renderer.toJSON()).includes('迟到甲规则'))
-    await click(buttonByText(renderer.toJSON(), '编辑规则'))
+    await openWorkspaceRules(renderer)
     assert.ok(!flat(ruleDialog(renderer)).includes('迟到甲规则'))
     assert.ok(flat(ruleDialog(renderer)).includes('只改 scope 内的文件'))
   } finally {
@@ -2138,7 +2197,7 @@ await check('仅有完成或放弃记录时主区直接新建，历史详情不�
       assert.ok(flat(tree).indexOf('开始新流程') < flat(tree).indexOf('流程记录'))
       assert.equal(nodeByClass(tree, 'fg-workspace-card fg-flow-history').props.open, false)
       await click(buttonByText(tree, '导出报表'))
-      assert.equal(findTags(renderer.toJSON(), 'textarea').length, 1, '历史详情不能新增第二个启动表单')
+      assert.equal(findTags(renderer.toJSON(), 'textarea').length, 2, '历史详情不能新增第二份启动表单')
     } finally { await act(async () => { renderer.unmount() }) }
   }
 })
@@ -2192,7 +2251,7 @@ await check('切换工作区等待流程数据时隐藏旧表单和旧继续入�
   const renderer = await renderHub()
   try {
     await click(buttonByText(renderer.toJSON(), 'alpha'))
-    assert.equal(findTags(renderer.toJSON(), 'textarea').length, 1)
+    assert.equal(findTags(renderer.toJSON(), 'textarea').length, 2)
     await click(buttonByText(renderer.toJSON(), '工作区列表'))
     await click(buttonByText(renderer.toJSON(), 'beta'))
     assert.ok(flat(renderer.toJSON()).includes('正在读取当前流程'))
@@ -2262,7 +2321,7 @@ await check('新建需求草稿跨规则保存、历史分页和刷新保留，�
     await changeValue(findTags(renderer.toJSON(), 'textarea')[0], brief)
     await changeValue(inputByPlaceholder(renderer.toJSON(), '默认使用需求第一行'), '入口草稿')
     await click(buttonByText(renderer.toJSON(), '大需求严格执行'))
-    await click(buttonByText(renderer.toJSON(), '编辑规则'))
+    await openWorkspaceRules(renderer)
     await click(buttonByText(ruleDialog(renderer), '保存规则'))
     assertDraft()
     await click(buttonByText(renderer.toJSON(), '下一页'))
@@ -2286,12 +2345,462 @@ await check('新建需求草稿跨规则保存、历史分页和刷新保留，�
     assertDraft()
     await click(buttonByText(renderer.toJSON(), '开始需求分析'))
     assert.deepEqual(sessions, [alpha.path])
-    assert.deepEqual(posted.find((item) => item.action === 'start').payload, { title: '入口草稿', brief, preset: 'strict' })
+    assert.deepEqual(posted.find((item) => item.action === 'start').payload, { title: '入口草稿', brief, summary: brief, preset: 'strict' })
     assert.equal(findTags(renderer.toJSON(), 'textarea')[0].props.value, '', '成功启动才清空本工作区草稿')
     await click(buttonByText(renderer.toJSON(), '工作区列表'))
     await click(buttonByText(renderer.toJSON(), 'beta'))
     assert.equal(findTags(renderer.toJSON(), 'textarea')[0].props.value, '乙工作区自己的草稿')
   } finally { flowHandler = null; await act(async () => { renderer.unmount() }) }
+})
+
+// ---------------------------------------------------------------------------
+// 四阶段统一草稿、内容对照与自动整理的行为契约
+// ---------------------------------------------------------------------------
+
+function fieldByAria(tree, label) {
+  const field = [...findTags(tree, 'textarea'), ...findTags(tree, 'input')].find((node) => node.props['aria-label'] === label)
+  assert.ok(field, '找不到输入：' + label)
+  return field
+}
+async function withPrepareClock(run) {
+  const originalSet = globalThis.setTimeout
+  const originalClear = globalThis.clearTimeout
+  const timers = new Map()
+  const tokens = new Set()
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    if (delay !== 800) return originalSet(callback, delay, ...args)
+    const token = {}
+    tokens.add(token); timers.set(token, () => callback(...args))
+    return token
+  }
+  globalThis.clearTimeout = (token) => tokens.has(token) ? timers.delete(token) : originalClear(token)
+  try {
+    await run({ pending: () => timers.size, flush: async () => {
+      await act(async () => {
+        const callbacks = [...timers.values()]
+        timers.clear()
+        for (const callback of callbacks) void callback()
+        await new Promise((resolve) => originalSet(resolve, 0))
+      })
+    } })
+  } finally { globalThis.setTimeout = originalSet; globalThis.clearTimeout = originalClear }
+}
+
+await check('四阶段草稿切换保留，取消和Esc丢弃全部未保存改动', async () => {
+  resetHub([emptyMember('all-stages')]); posted = []
+  const renderer = await renderHub()
+  try {
+    await click(buttonByText(renderer.toJSON(), 'all-stages'))
+    await openWorkspaceRules(renderer, 'S1')
+    assert.equal(buttonByText(ruleDialog(renderer), 'S1 · 需求分析').props['aria-current'], 'true')
+    await addDraftRule(renderer, 'S1 草稿规则')
+    await switchRuleStage(renderer, 'S3')
+    await addDraftRule(renderer, 'S3 草稿角度')
+    await switchRuleStage(renderer, 'S1')
+    assert.ok(flat(ruleDialog(renderer)).includes('S1 草稿规则'))
+    assert.equal(ruleWrites().length, 0)
+    await click(buttonByText(ruleDialog(renderer), '取消'))
+    await openWorkspaceRules(renderer, 'S1')
+    assert.ok(!flat(ruleDialog(renderer)).includes('S1 草稿规则'))
+    await switchRuleStage(renderer, 'S3')
+    assert.ok(!flat(ruleDialog(renderer)).includes('S3 草稿角度'))
+    await addDraftRule(renderer, 'Esc 丢弃角度')
+    await act(async () => { pressEscape() })
+    assert.equal(ruleDialog(renderer), null)
+    await openWorkspaceRules(renderer, 'S3')
+    assert.ok(!flat(ruleDialog(renderer)).includes('Esc 丢弃角度'))
+    assert.equal(ruleWrites().length, 0)
+    assert.deepEqual(posted, [])
+  } finally { await act(async () => { renderer.unmount() }) }
+})
+
+await check('内置内容自定义保存同id和原文对照，单项与阶段恢复不修改其他阶段', async () => {
+  const member = emptyMember('builtin-edits')
+  resetHub([member])
+  const original = structuredClone(workspaceRules(member.path).stages.S1.builtin[0])
+  const renderer = await renderHub()
+  try {
+    await click(buttonByText(renderer.toJSON(), 'builtin-edits'))
+    await openWorkspaceRules(renderer, 'S1')
+    await toggleRule(renderer, original.name, false)
+    await click(buttonByAria(ruleDialog(renderer), '编辑规则：' + original.name))
+    await changeValue(inputByPlaceholder(ruleDialog(renderer), '规则名称'), '限定需求目标')
+    await changeValue(findTags(ruleDialog(renderer), 'textarea')[0], '保留业务目标\n补全约束')
+    await click(buttonByText(ruleDialog(renderer), '更新规则'))
+    assert.ok(flat(ruleDialog(renderer)).includes('已自定义内置'))
+    const comparison = findTags(ruleDialog(renderer), 'details').find((node) => flat(node).includes(original.name))
+    assert.ok(flat(comparison).includes(original.points[0]))
+    await switchRuleStage(renderer, 'S3')
+    await addDraftRule(renderer, '新增业务评审')
+    await click(buttonByText(ruleDialog(renderer), '保存规则'))
+    const saved = ruleWrites().at(-1).stages
+    assert.deepEqual(Object.keys(saved), ['S1', 'S2', 'S3', 'S4'])
+    assert.deepEqual(saved.S1.edits, [{ id: original.id, name: '限定需求目标', points: ['保留业务目标', '补全约束'] }])
+    assert.deepEqual(saved.S1.custom, [])
+    assert.ok(!saved.S1.ids.includes(original.id))
+    assert.equal(saved.S2, null); assert.equal(saved.S4, null)
+    assert.equal(saved.S3.custom[0].name, '新增业务评审')
+    assert.deepEqual(workspaceRules(member.path).stages.S1.builtin[0], original, '内置原文不得被内容自定义覆盖')
+    await openWorkspaceRules(renderer, 'S1')
+    await click(buttonByAria(ruleDialog(renderer), '恢复内置规则：限定需求目标'))
+    assert.equal(ruleCheckbox(ruleDialog(renderer), original.name).props.checked, false, '恢复内容保留原来的关闭状态')
+    await click(buttonByText(ruleDialog(renderer), '保存规则'))
+    assert.deepEqual(ruleWrites().at(-1).stages.S1.edits, [])
+    assert.deepEqual(ruleWrites().at(-1).stages.S3, saved.S3)
+    await openWorkspaceRules(renderer, 'S1')
+    await click(buttonByText(ruleDialog(renderer), '恢复本阶段内置默认'))
+    await click(buttonByText(ruleDialog(renderer), '保存规则'))
+    assert.equal(ruleWrites().at(-1).stages.S1, null)
+    assert.deepEqual(ruleWrites().at(-1).stages.S3, saved.S3)
+  } finally { await act(async () => { renderer.unmount() }) }
+})
+
+await check('预览档位只切换默认启用项，内容自定义与跟随档位保存ids:null', async () => {
+  resetHub([emptyMember('preset-preview')])
+  const renderer = await renderHub()
+  try {
+    await click(buttonByText(renderer.toJSON(), 'preset-preview'))
+    const overview = nodeByClass(renderer.toJSON(), 'fg-stage-rule-summary')
+    assert.ok(flat(overview).includes('内置默认 · 随档位 · 快速 1 / 严格 2 条'))
+    assert.ok(flat(overview).includes('内置默认 · 随档位 · 3 条'))
+    await openWorkspaceRules(renderer, 'S1')
+    assert.equal(ruleCheckbox(ruleDialog(renderer), '明确验收标准').props.checked, false)
+    await changeValue(findTags(ruleDialog(renderer), 'select')[0], 'strict')
+    assert.equal(ruleCheckbox(ruleDialog(renderer), '明确验收标准').props.checked, true)
+    await click(buttonByAria(ruleDialog(renderer), '编辑规则：明确需求目标'))
+    await changeValue(inputByPlaceholder(ruleDialog(renderer), '规则名称'), '保留档位默认的目标')
+    await click(buttonByText(ruleDialog(renderer), '更新规则'))
+    await click(buttonByText(ruleDialog(renderer), '保存规则'))
+    assert.equal(ruleWrites().at(-1).stages.S1.ids, null)
+    assert.equal(ruleWrites().at(-1).stages.S1.edits[0].id, 'clarity')
+    assert.ok(flat(nodeByClass(renderer.toJSON(), 'fg-stage-rule-summary')).includes('工作区默认 · 随档位 · 快速 1 / 严格 2 条'))
+    await openWorkspaceRules(renderer, 'S1')
+    await toggleRule(renderer, '明确验收标准', true)
+    await click(buttonByText(ruleDialog(renderer), '启用项跟随档位'))
+    assert.equal(ruleCheckbox(ruleDialog(renderer), '明确验收标准').props.checked, false)
+    await click(buttonByText(ruleDialog(renderer), '保存规则'))
+    assert.equal(ruleWrites().at(-1).stages.S1.ids, null)
+    assert.equal(ruleWrites().at(-1).stages.S1.edits[0].name, '保留档位默认的目标')
+  } finally { await act(async () => { renderer.unmount() }) }
+})
+
+await check('工作区S4方向可声明needsWrite，保存不提交任何执行授权', async () => {
+  resetHub([emptyMember('write-direction')]); posted = []
+  const renderer = await renderHub()
+  try {
+    await click(buttonByText(renderer.toJSON(), 'write-direction'))
+    await openWorkspaceRules(renderer, 'S4')
+    await click(buttonByText(ruleDialog(renderer), '添加规则'))
+    await changeValue(inputByPlaceholder(ruleDialog(renderer), '规则名称'), '迁移回滚验证')
+    const declaration = findTags(ruleDialog(renderer), 'label').find((node) => flat(node).includes('仍需在 S4 单独授权'))
+    await act(async () => { checkboxNodes(declaration)[0].props.onChange({ target: { checked: true } }) })
+    await click(buttonByText(ruleDialog(renderer), '加入列表'))
+    assert.ok(flat(ruleDialog(renderer)).includes('新增自定义'))
+    await click(buttonByText(ruleDialog(renderer), '保存规则'))
+    const stage = ruleWrites().at(-1).stages.S4
+    assert.equal(stage.custom[0].needsWrite, true)
+    assert.deepEqual(Object.keys(stage).sort(), ['custom', 'edits', 'ids'])
+    assert.equal(Object.hasOwn(stage.custom[0], 'writeGranted'), false)
+    assert.deepEqual(posted, [])
+  } finally { await act(async () => { renderer.unmount() }) }
+})
+
+await check('流程S1沿用统一目录并支持toggleAnalysisRule和addAnalysisRule', async () => {
+  posted = []
+  const workspace = workspaceRules('D:/unused').stages.S1
+  currentView = baseView('S1', { stageConfigs: { S1: { ids: ['clarity'], catalog: workspace.catalog, items: [workspace.catalog[0]], source: 'workspace' } } })
+  const renderer = await render(FlowDetail, {})
+  try {
+    await openSettings(renderer)
+    assert.ok(flat(nodeByRole(renderer.toJSON(), 'dialog')).includes('工作区默认'))
+    const target = checkboxNodes(renderer.toJSON()).find((node) => node.props['aria-label'] === '明确验收标准')
+    await act(async () => { target.props.onChange({ target: { checked: true } }) })
+    assert.deepEqual(posted.at(-1).payload, { id: 'acceptance', enabled: true })
+    assert.equal(posted.at(-1).action, 'toggleAnalysisRule')
+    await click(buttonByText(renderer.toJSON(), '追加自定义需求规则'))
+    await changeValue(inputByPlaceholder(renderer.toJSON(), '规则名称'), '确认错误路径')
+    await click(buttonByText(nodeByRole(renderer.toJSON(), 'dialog'), '追加'))
+    assert.equal(posted.at(-1).action, 'addAnalysisRule')
+    assert.deepEqual(posted.at(-1).payload, { name: '确认错误路径', points: [] })
+  } finally { await act(async () => { renderer.unmount() }) }
+})
+
+await check('跟随默认只清当前阶段的本次覆盖，不保存工作区或授予写权限', async () => {
+  posted = []
+  currentView = baseView('S3', { stageConfigs: { S3: { ids: ['security'], catalog: baseView('S3').angleCatalog, source: 'flow' } } })
+  const renderer = await render(FlowDetail, {})
+  try {
+    await openSettings(renderer)
+    assert.ok(flat(nodeByRole(renderer.toJSON(), 'dialog')).includes('本次流程临时调整'))
+    await click(buttonByText(nodeByRole(renderer.toJSON(), 'dialog'), '跟随工作区默认'))
+    assert.equal(posted.at(-1).action, 'followStageDefaults')
+    assert.deepEqual(posted.at(-1).payload, { stage: 'S3' })
+    assert.equal(posted.length, 1)
+  } finally { await act(async () => { renderer.unmount() }) }
+})
+
+await check('需求先派生基础标题和排版，800ms去抖只整理最新原文且不创建会话', async () => withPrepareClock(async (clock) => {
+  resetHub([emptyMember('prepare-debounce')]); posted = []
+  const sessions = []
+  const renderer = await renderHub({ sessionForWorkspace: async (path) => { sessions.push(path); return 'unused' } })
+  try {
+    await click(buttonByText(renderer.toJSON(), 'prepare-debounce'))
+    const raw = '  ## 规划需求。\r\n  - 保持缩进\r\n\r\n\r\n第三段  '
+    await changeValue(fieldByAria(renderer.toJSON(), '需求原文'), raw)
+    assert.equal(fieldByAria(renderer.toJSON(), '任务标题').props.value, '规划需求')
+    assert.equal(fieldByAria(renderer.toJSON(), '需求整理稿').props.value, '## 规划需求。\n  - 保持缩进\n\n第三段')
+    assert.equal(prepareCalls.length, 0)
+    await changeValue(fieldByAria(renderer.toJSON(), '需求原文'), '第二份需求\n补充')
+    assert.equal(clock.pending(), 1)
+    await clock.flush()
+    assert.deepEqual(prepareCalls, [{ path: 'D:/repo/prepare-debounce', brief: '第二份需求\n补充' }])
+    assert.deepEqual(sessions, []); assert.deepEqual(posted, [])
+  } finally { await act(async () => { renderer.unmount() }) }
+}))
+
+await check('整理响应乱序与输入途中手改不会覆盖新稿，重新生成只解锁对应字段', async () => withPrepareClock(async (clock) => {
+  resetHub([emptyMember('prepare-race')])
+  const replies = []
+  prepareHandler = (body) => new Promise((resolve) => replies.push({ ...body, resolve }))
+  const renderer = await renderHub()
+  try {
+    await click(buttonByText(renderer.toJSON(), 'prepare-race'))
+    await changeValue(fieldByAria(renderer.toJSON(), '需求原文'), '第一版')
+    await clock.flush()
+    await changeValue(fieldByAria(renderer.toJSON(), '需求原文'), '第二版')
+    await clock.flush()
+    assert.equal(replies.length, 2)
+    await act(async () => { replies[1].resolve(response({ title: '新标题', summary: '新整理稿', status: 'ready' })) })
+    await act(async () => { replies[0].resolve(response({ title: '旧标题', summary: '旧整理稿', status: 'ready' })) })
+    assert.equal(fieldByAria(renderer.toJSON(), '任务标题').props.value, '新标题')
+    assert.equal(fieldByAria(renderer.toJSON(), '需求整理稿').props.value, '新整理稿')
+    await changeValue(fieldByAria(renderer.toJSON(), '需求原文'), '第三版')
+    await clock.flush()
+    await changeValue(fieldByAria(renderer.toJSON(), '任务标题'), '我的标题')
+    await act(async () => { replies[2].resolve(response({ title: '模型标题', summary: '第三版整理', status: 'ready' })) })
+    assert.equal(fieldByAria(renderer.toJSON(), '任务标题').props.value, '我的标题')
+    assert.equal(fieldByAria(renderer.toJSON(), '需求整理稿').props.value, '第三版整理')
+    await changeValue(fieldByAria(renderer.toJSON(), '需求整理稿'), '我的整理稿')
+    await changeValue(fieldByAria(renderer.toJSON(), '需求原文'), '第四版')
+    await clock.flush()
+    assert.equal(replies.length, 3, '两个字段都手改后不再发送无用整理请求')
+    assert.equal(fieldByAria(renderer.toJSON(), '任务标题').props.value, '我的标题')
+    assert.equal(fieldByAria(renderer.toJSON(), '需求整理稿').props.value, '我的整理稿')
+    await click(buttonByAria(renderer.toJSON(), '重新生成标题'))
+    await clock.flush()
+    await act(async () => { replies[3].resolve(response({ title: '第四版自动标题', summary: '不能覆盖的整理稿', status: 'ready' })) })
+    assert.equal(fieldByAria(renderer.toJSON(), '任务标题').props.value, '第四版自动标题')
+    assert.equal(fieldByAria(renderer.toJSON(), '需求整理稿').props.value, '我的整理稿')
+    await changeValue(fieldByAria(renderer.toJSON(), '任务标题'), '保留的新标题')
+    await click(buttonByAria(renderer.toJSON(), '重新整理需求'))
+    await clock.flush()
+    await act(async () => { replies[4].resolve(response({ title: '不能覆盖的新标题', summary: '第四版重新整理', status: 'ready' })) })
+    assert.equal(fieldByAria(renderer.toJSON(), '任务标题').props.value, '保留的新标题')
+    assert.equal(fieldByAria(renderer.toJSON(), '需求整理稿').props.value, '第四版重新整理')
+  } finally { prepareHandler = null; await act(async () => { renderer.unmount() }) }
+}))
+
+await check('切换工作区后迟到整理不串稿，返回原目录保留本地草稿', async () => withPrepareClock(async (clock) => {
+  resetHub([emptyMember('prepare-alpha'), emptyMember('prepare-beta')])
+  let reply
+  prepareHandler = () => new Promise((resolve) => { reply = resolve })
+  const renderer = await renderHub()
+  try {
+    await click(buttonByText(renderer.toJSON(), 'prepare-alpha'))
+    await changeValue(fieldByAria(renderer.toJSON(), '需求原文'), '甲目录原文')
+    await clock.flush()
+    await click(buttonByText(renderer.toJSON(), '工作区列表'))
+    await click(buttonByText(renderer.toJSON(), 'prepare-beta'))
+    await changeValue(fieldByAria(renderer.toJSON(), '需求原文'), '乙目录原文')
+    await act(async () => { reply(response({ title: '迟到甲标题', summary: '迟到甲整理', status: 'ready' })) })
+    assert.equal(fieldByAria(renderer.toJSON(), '任务标题').props.value, '乙目录原文')
+    assert.equal(fieldByAria(renderer.toJSON(), '需求整理稿').props.value, '乙目录原文')
+    await click(buttonByText(renderer.toJSON(), '工作区列表'))
+    await click(buttonByText(renderer.toJSON(), 'prepare-alpha'))
+    assert.equal(fieldByAria(renderer.toJSON(), '任务标题').props.value, '甲目录原文')
+    assert.equal(fieldByAria(renderer.toJSON(), '需求原文').props.value, '甲目录原文')
+  } finally { prepareHandler = null; await act(async () => { renderer.unmount() }) }
+}))
+
+await check('超20000字符保留完整输入并拒绝整理和启动', async () => withPrepareClock(async (clock) => {
+  resetHub([emptyMember('prepare-limit')]); posted = []
+  const sessions = []
+  const renderer = await renderHub({ sessionForWorkspace: async (path) => { sessions.push(path); return 'unused' } })
+  try {
+    await click(buttonByText(renderer.toJSON(), 'prepare-limit'))
+    const raw = '长'.repeat(20001)
+    await changeValue(fieldByAria(renderer.toJSON(), '需求原文'), raw)
+    assert.equal(fieldByAria(renderer.toJSON(), '需求原文').props.value, raw)
+    assert.ok(flat(renderer.toJSON()).includes('原文未被截断'))
+    assert.equal(buttonByText(renderer.toJSON(), '开始需求分析').props.disabled, true)
+    await clock.flush()
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    assert.deepEqual(prepareCalls, []); assert.deepEqual(sessions, []); assert.deepEqual(posted, [])
+  } finally { await act(async () => { renderer.unmount() }) }
+}))
+
+await check('整理失败可直接启动，重复启动幂等且payload独立保留原文和手工整理稿', async () => withPrepareClock(async (clock) => {
+  resetHub([emptyMember('prepare-fallback')]); posted = []
+  prepareHandler = () => response({ error: '模型暂不可用' }, 503)
+  const sessions = []
+  let resolveSession
+  const renderer = await renderHub({ sessionForWorkspace: (path) => { sessions.push(path); return new Promise((resolve) => { resolveSession = resolve }) } })
+  try {
+    await click(buttonByText(renderer.toJSON(), 'prepare-fallback'))
+    const raw = '  原文标题\r\n\r\n\r\n  保留原文缩进  '
+    await changeValue(fieldByAria(renderer.toJSON(), '需求原文'), raw)
+    await clock.flush()
+    assert.ok(flat(renderer.toJSON()).includes('自动整理暂不可用'))
+    assert.equal(fieldByAria(renderer.toJSON(), '需求原文').props.value, raw)
+    await changeValue(fieldByAria(renderer.toJSON(), '需求整理稿'), '我的结构化整理\n保留验收标准')
+    const button = buttonByText(renderer.toJSON(), '开始需求分析')
+    await act(async () => { button.props.onClick(); button.props.onClick() })
+    assert.deepEqual(sessions, ['D:/repo/prepare-fallback'])
+    await act(async () => { resolveSession('prepared-session') })
+    const start = posted.filter((item) => item.action === 'start')
+    assert.equal(start.length, 1)
+    assert.deepEqual(start[0].payload, { title: '原文标题', preset: 'fast', brief: raw, summary: '我的结构化整理\n保留验收标准' })
+  } finally { prepareHandler = null; await act(async () => { renderer.unmount() }) }
+}))
+
+await check('进行中以整理稿展示并可展开原文，详情取最新view而非打开时快照', async () => {
+  const flow = { ...alphaMember.flows[0], sessionId: 'sess-latest-requirement', brief: '快照旧原文', summary: '快照旧整理稿' }
+  resetHub([{ ...alphaMember, flows: [flow] }])
+  currentView = baseView('S2', { title: '最新流程标题', brief: '  最新原文\n  保留缩进  ', summary: '最新整理稿\n第二条验收' })
+  const renderer = await renderHub()
+  try {
+    await click(buttonByText(renderer.toJSON(), 'alpha'))
+    const current = nodeByClass(renderer.toJSON(), 'fg-hub-section fg-workspace-card fg-current-flow')
+    assert.ok(current, '主区应有当前流程卡片')
+    assert.equal(findTags(nodeByClass(current, 'fg-requirement'), 'p')[0].children.join(''), '快照旧整理稿')
+    assert.ok(findTags(current, 'details').some((node) => flat(node).includes('查看需求原文')))
+    await click(buttonByText(renderer.toJSON(), '继续流程'))
+    const detail = nodeByClass(renderer.toJSON(), 'fg-flow-requirement')
+    assert.ok(flat(detail).includes('最新流程标题'))
+    assert.ok(!flat(detail).includes('快照旧整理稿'))
+    assert.ok(!flat(detail).includes('快照旧原文'))
+    const paragraphs = findTags(detail, 'p')
+    assert.equal(paragraphs[0].children.join(''), currentView.summary)
+    assert.equal(paragraphs[1].children.join(''), currentView.brief)
+  } finally { await act(async () => { renderer.unmount() }) }
+})
+
+await check('旧流程没有summary时仍展示brief并提供原文展开', async () => {
+  currentView = baseView('S2', { brief: '旧需求第一行\n第二行' })
+  const renderer = await render(FlowDetail, {})
+  try {
+    const detail = nodeByClass(renderer.toJSON(), 'fg-flow-requirement')
+    assert.equal(findTags(detail, 'p')[0].children.join(''), currentView.brief)
+    assert.ok(flat(findTags(detail, 'details')[0]).includes('查看需求原文'))
+  } finally { await act(async () => { renderer.unmount() }) }
+})
+
+await check('长整理稿可展开和收起全文，原文独立保留且按钮关联正文', async () => {
+  const summary = Array.from({ length: 9 }, (_, index) => '第' + (index + 1) + '项验收：' + '长整理稿'.repeat(20)).join('\n')
+  const brief = '  未整理原文\n' + '原始约束'.repeat(220) + '  '
+  currentView = baseView('S2', { brief, summary })
+  const renderer = await render(FlowDetail, {})
+  try {
+    let requirement = nodeByClass(renderer.toJSON(), 'fg-requirement')
+    let paragraph = findTags(requirement, 'p')[0]
+    const preview = paragraph.children.join('')
+    assert.ok(preview.length <= 241)
+    assert.ok(preview.endsWith('…'))
+    assert.ok(!preview.includes('第9项验收'))
+    const expand = buttonByText(requirement, '展开整理稿全文')
+    assert.equal(expand.props['aria-expanded'], false)
+    assert.equal(expand.props['aria-controls'], paragraph.props.id)
+    assert.equal(findTags(findTags(requirement, 'details')[0], 'p')[0].children.join(''), brief)
+    await click(expand)
+    requirement = nodeByClass(renderer.toJSON(), 'fg-requirement')
+    paragraph = findTags(requirement, 'p')[0]
+    assert.equal(paragraph.children.join(''), summary)
+    assert.equal(buttonByText(requirement, '收起整理稿').props['aria-expanded'], true)
+    assert.equal(findTags(findTags(requirement, 'details')[0], 'p')[0].children.join(''), brief)
+    await click(buttonByText(requirement, '收起整理稿'))
+    assert.equal(findTags(nodeByClass(renderer.toJSON(), 'fg-requirement'), 'p')[0].children.join(''), preview)
+  } finally { await act(async () => { renderer.unmount() }) }
+})
+
+await check('历史行直接呈现整理摘要，旧记录以brief兜底而非仅依赖tooltip', async () => {
+  resetHub([{ ...idleAlphaMember, flows: [
+    { ...idleAlphaMember.flows[0], summary: '整理后的可见历史摘要\n含验收标准', brief: '不应取代整理稿的旧原文' },
+    { ...idleAlphaMember.flows[1], brief: '没有整理稿时的旧需求摘要' },
+  ] }])
+  const renderer = await renderHub()
+  try {
+    await click(buttonByText(renderer.toJSON(), 'alpha'))
+    const rows = findTags(renderer.toJSON(), 'button').filter((node) => node.props.className === 'fg-flow-row')
+    assert.equal(rows.length, 2)
+    const summaries = rows.map((row) => nodeByClass(row, 'fg-flow-summary').children.join(''))
+    assert.deepEqual(summaries, ['整理后的可见历史摘要\n含验收标准', '没有整理稿时的旧需求摘要'])
+    assert.ok(!summaries[0].includes('不应取代整理稿'))
+  } finally { await act(async () => { renderer.unmount() }) }
+})
+
+// 只实现模态框使用的选择器，保留渲染后的DOM顺序与焦点身份。
+function focusDomOf(tree) {
+  const nodes = []
+  const append = (source, parentElement = null) => {
+    if (!source || typeof source !== 'object') return null
+    const node = { tagName: source.type, props: source.props, disabled: source.props?.disabled, parentElement, children: [],
+      focus() { card.activeElement = node } }
+    nodes.push(node)
+    for (const child of source.children || []) { const element = append(child, node); if (element) node.children.push(element) }
+    return node
+  }
+  const card = append(tree)
+  card.querySelectorAll = (selector) => nodes.slice(1).filter((node) => selector.split(',').some((part) => {
+    const value = part.trim()
+    if (['button', 'input', 'select', 'textarea', 'summary'].includes(value)) return node.tagName === value
+    if (value === 'a[href]') return node.tagName === 'a' && node.props.href !== undefined
+    if (value === '[tabindex]:not([tabindex="-1"])') return node.props.tabIndex !== undefined && node.props.tabIndex !== -1
+    if (value === 'details > summary:first-of-type:not([tabindex="-1"])') {
+      return node.tagName === 'summary' && node.props.tabIndex !== -1 && node.parentElement?.tagName === 'details'
+        && node.parentElement.children.find((child) => child.tagName === 'summary') === node
+    }
+    return false
+  }))
+  return card
+}
+
+await check('延迟保存禁用控件时原生summary仍参与Tab与Shift+Tab首尾回绕', async () => {
+  const member = emptyMember('saving-focus')
+  resetHub([member])
+  let release
+  ruleHandler = (body) => Object.hasOwn(body, 'stages') ? new Promise((resolve) => { release = resolve }) : response({ rules: workspaceRules(body.path) })
+  const renderer = await renderHub()
+  try {
+    await click(buttonByText(renderer.toJSON(), 'saving-focus'))
+    await openWorkspaceRules(renderer, 'S1')
+    await click(buttonByText(ruleDialog(renderer), '保存规则'))
+    const dialog = ruleDialog(renderer)
+    assert.ok(buttons(dialog).every((button) => button.props.disabled), '延迟保存期间所有按钮均禁用')
+    assert.ok([...findTags(dialog, 'input'), ...findTags(dialog, 'select')].every((node) => node.props.disabled))
+    const card = focusDomOf(dialog)
+    const summaries = card.querySelectorAll('summary')
+    assert.equal(summaries.length, 2, '夹具应提供两个仍可展开的原生summary')
+    let prevented = 0
+    const tab = (target, shiftKey) => dialog.props.onKeyDown({ key: 'Tab', target, currentTarget: card, shiftKey, preventDefault() { prevented += 1 } })
+    const [first, last] = summaries
+    last.focus(); tab(last, false)
+    assert.equal(prevented, 1)
+    assert.equal(card.activeElement, first, '末个summary按Tab应回到首个summary')
+    tab(first, true)
+    assert.equal(prevented, 2)
+    assert.equal(card.activeElement, last, '首个summary按Shift+Tab应回到末个summary')
+    card.focus(); tab(card, true)
+    assert.equal(prevented, 3)
+    assert.equal(card.activeElement, last, '从dialog反向Tab仍应留在summary序列内')
+    await act(async () => { pressEscape() })
+    assert.ok(ruleDialog(renderer), '正在保存时Esc不应卸载弹窗')
+    await act(async () => { release(response({ rules: workspaceRules(member.path) })) })
+    assert.equal(ruleDialog(renderer), null)
+  } finally {
+    if (release) await act(async () => { release(response({ rules: workspaceRules(member.path) })) })
+    ruleHandler = null
+    await act(async () => { renderer.unmount() })
+  }
 })
 
 // ---------------------------------------------------------------------------

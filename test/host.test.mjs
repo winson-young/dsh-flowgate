@@ -4,7 +4,8 @@ import { syncBuiltinESMExports } from 'node:module'
 import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply, scopeDenial } from '../lib/index.js'
+import { apply, scopeDenial, currentService } from '../lib/index.js'
+import { prepareRequirement } from '../lib/requirements.js'
 
 // ---------------------------------------------------------------------------
 // 宿主端 mock：只实现插件实际用到的 ctx 成员。
@@ -47,6 +48,7 @@ function makeHost(cwd, sessionId, options = {}) {
       return () => {}
     },
     get(name) {
+      if (Object.prototype.hasOwnProperty.call(options.services ?? {}, name)) return options.services[name]
       // noShell 用来模拟 dsh-ops 这类退掉官方 shell 行的 profile。
       if (name === 'shell') return options.noShell ? undefined : shell
       // 界面一键启动靠它把 sessionId 换成工作目录；sess-no-cwd 用来验失败分支。
@@ -1229,6 +1231,7 @@ rmSync(cwd, { recursive: true, force: true })
       texts.some((text) => /用户通过了 S2 门禁/.test(text)),
       '唤醒消息没有说明是哪一次门禁',
     )
+    assert.ok(texts.some((text) => /先调用 flowgate_status 读取当前有效规则、ID 与要点/.test(text)), '主会话开始下一阶段前必须先读取完整检查清单')
   })
   const again = await cx.request('/api/flowgate/action', {
     sessionId: 'sess-gate',
@@ -1467,8 +1470,8 @@ rmSync(cwd, { recursive: true, force: true })
     assert.equal(saved.body.workspaceRules.configured, true)
     assert.ok(existsSync(configFile), 'config.json 没有落盘')
     const config = JSON.parse(readFileSync(configFile, 'utf8'))
-    assert.deepEqual(config.rules.ids, saved.body.ruleIds)
-    assert.equal(config.rules.ids.includes('no-debug-leftovers'), false)
+    assert.deepEqual(config.stages.S2.ids, saved.body.ruleIds)
+    assert.equal(config.stages.S2.ids.includes('no-debug-leftovers'), false)
   })
   check('A 工作区配置里没有写权限之类的流程内授权', () => {
     const raw = readFileSync(configFile, 'utf8')
@@ -1493,8 +1496,8 @@ rmSync(cwd, { recursive: true, force: true })
   check('A 自定义规则能存进工作区默认', () => {
     assert.ok(customRule, '自定义规则没有生成 id')
     const config = JSON.parse(readFileSync(configFile, 'utf8'))
-    assert.ok(config.rules.custom.some((rule) => rule.id === customRule.id))
-    assert.deepEqual(config.rules.custom.find((rule) => rule.id === customRule.id).points, ['不拼字符串'])
+    assert.ok(config.stages.S2.custom.some((rule) => rule.id === customRule.id))
+    assert.deepEqual(config.stages.S2.custom.find((rule) => rule.id === customRule.id).points, ['不拼字符串'])
   })
 
   const thirdSid = 'sess-ws-third'
@@ -1630,8 +1633,8 @@ rmSync(cwd, { recursive: true, force: true })
       assert.deepEqual(saved.body.rules.custom, [custom])
       assert.equal(saved.body.rules.catalog.length, 6)
       const config = JSON.parse(readFileSync(configFile, 'utf8'))
-      assert.deepEqual(Object.keys(config).sort(), ['rules', 'updatedAt', 'version'])
-      assert.deepEqual(config.rules.custom, [custom])
+      assert.deepEqual(Object.keys(config).sort(), ['stages', 'updatedAt', 'version'])
+      assert.deepEqual(config.stages.S2.custom, [custom])
     })
     const invalid = [
       {}, [], false, { ids: [], custom: null }, { ids: ['unknown'], custom: [] },
@@ -1699,7 +1702,7 @@ rmSync(cwd, { recursive: true, force: true })
     writeFileSync(configFile, JSON.stringify({ version: 1, rules: { ids: ['match-style', 'unknown', 'match-style'], custom: [] } }))
     const external = await post('rules', { path: ws })
     assert.deepEqual(external.body.rules.ids, ['match-style'])
-    assert.deepEqual((await cx.request('/api/flowgate/state?sessionId=hub-new-flow')).body.ruleIds, ['match-style', 'unknown', 'match-style'])
+    assert.deepEqual((await cx.request('/api/flowgate/state?sessionId=hub-new-flow')).body.ruleIds, ['match-style'])
     const cleared = await post('rules', { path: ws, rules: null })
     check('Hub 外部规则更新刷新缓存，null 恢复内置默认且不创建流程', () => {
       assert.equal(external.body.rules.configured, true)
@@ -1786,4 +1789,691 @@ rmSync(cwd, { recursive: true, force: true })
     rmSync(root, { recursive: true, force: true })
   }
 }
+// 四阶段统一配置：旧格式迁移、内置对照、来源优先、局部重置与原子失败。
+{
+  const root = mkdtempSync(join(tmpdir(), 'flowgate-stages-'))
+  const ws = join(root, 'workspace'), other = join(root, 'other')
+  mkdirSync(ws); mkdirSync(other)
+  const previousHome = process.env.DSH_FLOWGATE_HOME
+  process.env.DSH_FLOWGATE_HOME = join(root, 'home')
+  const configFile = join(ws, '.dsh-flowgate', 'config.json')
+  const sid = 'all-stages'
+  const cx = makeHost(ws, sid)
+  const post = (route, body) => cx.request('/api/flowgate/hub/' + route, body)
+  const act = (action, payload, sessionId = sid) => cx.request('/api/flowgate/action', { sessionId, action, payload })
+  const originalRename = fs.renameSync
+  try {
+    await post('add', { path: ws }); await post('add', { path: other })
+    const defaults = (await post('rules', { path: ws })).body.rules.stages
+    check('四阶段 Hub 读出各阶段内置目录、档位默认和未配置状态', () => {
+      assert.deepEqual(Object.keys(defaults), ['S1', 'S2', 'S3', 'S4'])
+      for (const value of Object.values(defaults)) {
+        assert.equal(value.configured, false)
+        assert.equal(value.selection, null)
+        assert.deepEqual(value.ids, value.defaults.fast)
+        assert.ok(value.builtin.length > 0 && value.defaults.strict.length > 0)
+      }
+      assert.equal(existsSync(join(ws, '.dsh-flowgate')), false)
+    })
+    mkdirSync(join(ws, '.dsh-flowgate'))
+    const legacy = { version: 1, rules: { ids: ['match-style', 'unknown', 'match-style'], custom: [] }, writeGrants: ['unsafe'], scope: { frozen: true } }
+    writeFileSync(configFile, JSON.stringify(legacy))
+    const migrated = (await post('rules', { path: ws })).body.rules.stages
+    check('旧 rules 只迁移 S2，读取不改盘且过滤重复未知ID', () => {
+      assert.deepEqual(migrated.S2.ids, ['match-style'])
+      assert.equal(migrated.S2.configured, true)
+      assert.ok(['S1', 'S3', 'S4'].every((stage) => !migrated[stage].configured))
+      assert.deepEqual(JSON.parse(readFileSync(configFile, 'utf8')), legacy)
+    })
+    const chosen = { S1: 'clarify-goal', S2: 'scope-only', S3: 'correctness', S4: 'smoke' }
+    const stages = Object.fromEntries(Object.entries(chosen).map(([stage, id]) => {
+      const custom = { id: 'project-' + stage, name: '新增 ' + stage, points: ['新增要点 ' + stage], ...(stage === 'S4' ? { needsWrite: true } : {}) }
+      const edit = { ...defaults[stage].builtin.find((item) => item.id === id), name: '已编辑 ' + stage, points: ['执行标记 ' + stage], ...(stage === 'S4' ? { needsWrite: true } : {}) }
+      return [stage, { ids: stage === 'S1' ? null : [id, custom.id], custom: [custom], edits: [edit] }]
+    }))
+    const saved = await post('rules', { path: ws, stages, scope: { frozen: true }, writeGrants: ['smoke'] })
+    check('四阶段整体保存，保留内置原文并单独提供编辑版和新增条目', () => {
+      assert.equal(saved.status, 200)
+      for (const stage of Object.keys(chosen)) {
+        const value = saved.body.rules.stages[stage]
+        assert.equal(value.configured, true)
+        assert.deepEqual(value.selection, stages[stage].ids)
+        assert.deepEqual(value.builtin, defaults[stage].builtin)
+        assert.deepEqual(value.catalog.find((item) => item.id === chosen[stage]).points, ['执行标记 ' + stage])
+        assert.deepEqual(value.custom, stages[stage].custom)
+      }
+      assert.ok(!saved.body.rules.stages.S1.ids.includes('project-S1'), '跟随档位不应自动启用新增条目')
+      const disk = JSON.parse(readFileSync(configFile, 'utf8'))
+      assert.equal(disk.version, 2)
+      assert.deepEqual(disk.stages, stages)
+      assert.deepEqual(Object.keys(disk).sort(), ['stages', 'updatedAt', 'version'])
+    })
+    const savedRaw = readFileSync(configFile, 'utf8')
+    const invalidStages = [
+      { S1: null }, { ...stages, S5: null }, { ...stages, S3: { ...stages.S3, ids: ['unknown'] } },
+      { ...stages, S1: { ...stages.S1, edits: [{ id: 'security', name: '跨阶段编辑', points: [] }] } },
+      { ...stages, S3: { ...stages.S3, edits: [...stages.S3.edits, ...stages.S3.edits] } },
+      { ...stages, S4: { ...stages.S4, custom: [{ id: 'smoke', name: '冲突', points: [] }] } },
+      { ...stages, S4: { ...stages.S4, edits: [{ ...stages.S4.edits[0], needsWrite: 'true' }] } },
+      { ...stages, S2: { ...stages.S2, custom: [{ ...stages.S2.custom[0], points: [1] }] } },
+    ]
+    for (const invalid of invalidStages) assert.equal((await post('rules', { path: ws, stages: invalid })).status, 400)
+    assert.equal((await post('rules', { path: ws, stages, rules: null })).status, 400)
+    check('任一阶段非法则全部拒绝，配置与有效目录都不发生部分更新', () => {
+      assert.equal(readFileSync(configFile, 'utf8'), savedRaw)
+    })
+    fs.renameSync = function (from, to) {
+      if (String(to) === configFile) throw Object.assign(new Error('原子保存 EACCES'), { code: 'EACCES' })
+      return originalRename.call(this, from, to)
+    }
+    syncBuiltinESMExports()
+    const failed = await post('rules', { path: ws, stages: { ...stages, S1: null } })
+    fs.renameSync = originalRename; syncBuiltinESMExports()
+    const afterFailure = (await post('rules', { path: ws })).body.rules.stages
+    check('四阶段原子重命名失败显式报错，盘与缓存继续保持旧配置', () => {
+      assert.equal(failed.status, 500)
+      assert.match(failed.body.error, /EACCES/)
+      assert.equal(readFileSync(configFile, 'utf8'), savedRaw)
+      assert.deepEqual(afterFailure, saved.body.rules.stages)
+    })
+    const brief = '  需求原文含路径 src/a.js 与数字 123\n' + '完整保留需求原文。\n'.repeat(650) + '\n '
+    const summary = '整理后的需求\n\n' + '验证整理稿完整恢复。'.repeat(35)
+    const started = await act('start', { title: '语义标题', brief, summary, preset: 'strict' })
+    const duplicate = await act('start', { title: '重复标题', brief: '替换原文', summary: '替换摘要', preset: 'fast' })
+    check('流程完整独立保存原文和整理稿，重复启动保持幂等', () => {
+      assert.equal(started.status, 200)
+      assert.equal(started.body.title, '语义标题')
+      assert.equal(started.body.brief, brief)
+      assert.equal(started.body.summary, summary)
+      assert.equal(duplicate.body.id, started.body.id)
+      assert.equal(duplicate.body.brief, brief)
+      assert.equal(duplicate.body.summary, summary)
+      assert.equal(duplicate.body.preset, 'strict')
+      assert.equal(started.body.scope.frozen, false)
+      assert.deepEqual(started.body.writeGrants, [])
+      for (const stage of Object.keys(chosen)) assert.equal(started.body.stageConfigs[stage].source, 'workspace')
+      assert.deepEqual(started.body.stageConfigs.S1.ids, defaults.S1.defaults.strict)
+      assert.ok(started.body.directions.every((item) => !item.writeGranted))
+      assert.match(cx.delivered[0].message.content.map((item) => item.text).join('\n'), /执行标记 S1/)
+      assert.match(cx.delivered[0].message.content.map((item) => item.text).join('\n'), /整理后的需求/)
+    })
+    const status = await cx.tool('flowgate_status', {})
+    const page = await post('flows', { path: ws })
+    check('S1 消费工作区需求规则，当前流程全文与历史短摘要独立', () => {
+      assert.match(status.summary, /执行标记 S1/)
+      assert.equal(page.body.currentFlow.summary, summary)
+      assert.equal(page.body.currentFlow.brief, brief)
+      assert.equal(page.body.flows.find((flow) => flow.id === started.body.id).summary, summary.slice(0, 200))
+      assert.equal(page.body.flows.find((flow) => flow.id === started.body.id).brief, brief.slice(0, 200))
+      assert.equal(started.body.stage, 'S1')
+    })
+    for (const [stage, id] of Object.entries(chosen)) {
+      const action = { S1: 'toggleAnalysisRule', S2: 'toggleRule', S3: 'toggleAngle', S4: 'toggleDirection' }[stage]
+      const changed = await act(action, { id, enabled: false })
+      assert.equal(changed.status, 200)
+      assert.equal(changed.body.stageConfigs[stage].source, 'flow')
+      assert.ok(!changed.body.stageConfigs[stage].ids.includes(id))
+    }
+    const analysisAdded = await act('addAnalysisRule', { name: '本次需求补充', points: ['仅本次启用的需求要点'] })
+    check('S1 新增需求规则仅作用本次流程，保留工作区配置', () => {
+      assert.equal(analysisAdded.status, 200)
+      assert.ok(analysisAdded.body.stageConfigs.S1.items.some((item) => item.name === '本次需求补充' && item.points[0] === '仅本次启用的需求要点'))
+      assert.equal(analysisAdded.body.stageConfigs.S1.source, 'flow')
+      assert.equal(readFileSync(configFile, 'utf8'), savedRaw)
+    })
+    const followed = await act('followStageDefaults', { stage: 'S3' })
+    check('本次选择优先于工作区，恢复跟随只清指定阶段覆盖', () => {
+      assert.equal(followed.body.stageConfigs.S3.source, 'workspace')
+      assert.deepEqual(followed.body.stageConfigs.S3.ids, stages.S3.ids)
+      for (const stage of ['S1', 'S2', 'S4']) assert.equal(followed.body.stageConfigs[stage].source, 'flow')
+      assert.equal(readFileSync(configFile, 'utf8'), savedRaw)
+      assert.deepEqual(followed.body.writeGrants, [])
+    })
+    const reset = await post('rules', { path: ws, rules: null })
+    await act('followStageDefaults', { stage: 'S2' })
+    check('旧 rules:null 仅重置 S2，其他阶段配置及内置编辑保留', () => {
+      assert.equal(reset.body.rules.stages.S2.configured, false)
+      for (const stage of ['S1', 'S3', 'S4']) assert.deepEqual(reset.body.rules.stages[stage], saved.body.rules.stages[stage])
+      assert.equal(existsSync(configFile), true)
+    })
+    const restoredBuiltin = await post('rules', { path: ws, stages: { ...stages, S2: null, S3: { ...stages.S3, ids: null, edits: [] } } })
+    const current = await cx.request('/api/flowgate/state?sessionId=' + sid)
+    check('去掉内置编辑恢复原文，ids:null 在严格档位跟随严格默认', () => {
+      assert.equal(restoredBuiltin.status, 200)
+      assert.deepEqual(current.body.stageConfigs.S3.ids, defaults.S3.defaults.strict)
+      assert.equal(current.body.stageConfigs.S3.catalog.find((item) => item.id === 'correctness').name, '正确性')
+      assert.equal(current.body.stageConfigs.S2.source, 'default')
+    })
+    const otherConfig = await post('rules', { path: other })
+    check('工作区配置相互隔离且任何阶段配置均不创建 scope 或授权', () => {
+      assert.ok(Object.values(otherConfig.body.rules.stages).every((value) => !value.configured))
+      assert.equal(existsSync(join(other, '.dsh-flowgate')), false)
+      assert.equal(existsSync(join(ws, '.dsh-flowgate', 'scope.json')), false)
+      assert.equal(JSON.stringify(JSON.parse(readFileSync(configFile, 'utf8'))).includes('writeGrants'), false)
+    })
+    const tooLong = await act('start', { brief: 'x'.repeat(20001) }, 'overlong-start')
+    check('启动明确拒绝超限需求且不静默截断', () => {
+      assert.equal(tooLong.status, 409)
+      assert.match(tooLong.body.error, /20000/)
+    })
+    const file = join(ws, '.dsh-flowgate', 'flows', started.body.id + '.json')
+    const restarted = makeHost(ws, sid)
+    const loaded = await restarted.request('/api/flowgate/state?sessionId=' + sid)
+    check('重启恢复需求原文和整理稿全文', () => {
+      assert.equal(loaded.body.brief, brief)
+      assert.equal(loaded.body.summary, summary)
+    })
+    const old = JSON.parse(readFileSync(file, 'utf8')); delete old.summary
+    writeFileSync(file, JSON.stringify(old))
+    const legacyHost = makeHost(ws, sid)
+    const legacyPage = await legacyHost.request('/api/flowgate/hub/flows', { path: ws })
+    const legacyPageAgain = await legacyHost.request('/api/flowgate/hub/flows', { path: ws, pageSize: 1 })
+    const legacyState = await legacyHost.request('/api/flowgate/state?sessionId=' + sid)
+    check('旧流程没有 summary 时详情和 Hub 都回落原文', () => {
+      assert.equal(legacyState.body.summary, brief)
+      assert.equal(legacyPage.body.flows.find((flow) => flow.id === old.id).summary, brief.slice(0, 200))
+      assert.equal(legacyPage.body.currentFlow.summary, brief)
+      assert.equal(legacyPage.body.currentFlow.brief, brief)
+      assert.deepEqual(legacyPageAgain.body.currentFlow, legacyPage.body.currentFlow)
+    })
+  } finally {
+    fs.renameSync = originalRename; syncBuiltinESMExports()
+    if (previousHome === undefined) delete process.env.DSH_FLOWGATE_HOME
+    else process.env.DSH_FLOWGATE_HOME = previousHome
+    rmSync(root, { recursive: true, force: true })
+  }
+}
+
+// 授权状态的跨工作区与磁盘恢复：只使用真实宿主工具、路由和已有公开服务接口。
+{
+  const root = mkdtempSync(join(tmpdir(), 'flowgate-grant-state-'))
+  const ws = join(root, 'workspace'), other = join(root, 'other')
+  mkdirSync(ws); mkdirSync(other)
+  const previousHome = process.env.DSH_FLOWGATE_HOME
+  process.env.DSH_FLOWGATE_HOME = join(root, 'home')
+  const sid = 'grant-main', foreignSid = 'grant-other'
+  const sessionDirs = new Map([[sid, ws], [foreignSid, other]])
+  const services = { sessions: { get: (id) => ({ header: { id, cwd: sessionDirs.get(id) ?? ws } }) } }
+  let cx = makeHost(ws, sid, { services })
+  const post = (route, body) => cx.request('/api/flowgate/hub/' + route, body)
+  const act = (action, payload, id = sid) => cx.request('/api/flowgate/action', { sessionId: id, action, payload })
+  const state = (id = sid) => cx.request('/api/flowgate/state?sessionId=' + encodeURIComponent(id))
+  const call = (name, args, id = sid) => cx.tools.get(name).execute(args, {
+    name, arguments: args, agent: { session: { header: { id, cwd: sessionDirs.get(id) } } },
+  })
+  const stages = { S1: null, S2: null, S3: null, S4: {
+    ids: ['smoke'], custom: [], edits: [{ id: 'smoke', name: '授权恢复验证', points: ['当前声明与本次授权一致'], needsWrite: true }],
+  } }
+  const disabled = structuredClone(stages)
+  disabled.S4.edits[0].needsWrite = false
+  const configFile = join(ws, '.dsh-flowgate', 'config.json')
+  const originalRename = fs.renameSync
+  try {
+    for (const path of [ws, other]) {
+      assert.equal((await post('add', { path })).status, 200)
+      assert.equal((await post('rules', { path, stages })).status, 200)
+    }
+    for (const id of [sid, foreignSid]) {
+      await call('flowgate_start', { title: '授权恢复验证', preset: 'fast' }, id)
+      const doc = call('flowgate_doc', { html: '<html><body>授权恢复</body></html>', scope: {
+        files_expected_to_change: ['src/auth/session.ts'], capabilities: ['授权恢复'], out_of_scope_explicitly: [],
+        acceptance_criteria: [{ id: 'AC-1', when: '配置变化', then: '旧授权不会复活' }],
+      } }, id)
+      await tick(); assert.equal((await act('doc', { decision: 'approve' }, id)).status, 200); await doc
+      const dev = call('flowgate_gate', {}, id)
+      await tick(); assert.equal((await act('gate', { decision: 'pass' }, id)).status, 200); await dev
+      const review = call('flowgate_review', { angles: [{ id: 'correctness', name: '正确性', verdict: 'pass', findings: [] }] }, id)
+      await tick(); assert.equal((await act('gate', { decision: 'pass' }, id)).status, 200); await review
+      assert.equal((await act('toggleWriteGrant', { id: 'smoke', enabled: true }, id)).status, 200)
+    }
+    const initial = (await state()).body
+    const activeService = currentService()
+    const activeFlow = activeService.get(sid)
+    activeService.hydrate(ws)
+    activeService.hydrate(ws + '/.')
+    const refreshed = (await state()).body
+    await post('flows', { path: ws })
+    check('首次显式授权正常生效，同服务hydrate与Hub刷新保留内存授权', () => {
+      assert.equal(activeService.get(sid), activeFlow)
+      assert.deepEqual(refreshed.writeGrants, ['smoke'])
+      assert.equal(refreshed.directions[0].writeGranted, true)
+      assert.deepEqual(activeService.get(sid).writeGrants, ['smoke'])
+    })
+    const flowFile = join(ws, '.dsh-flowgate', 'flows', initial.id + '.json')
+    const oldConfig = readFileSync(configFile, 'utf8'), oldFlow = readFileSync(flowFile, 'utf8')
+    fs.renameSync = function (from, to) {
+      if (String(to) === configFile) throw Object.assign(new Error('配置提交 EACCES'), { code: 'EACCES' })
+      return originalRename.call(this, from, to)
+    }
+    syncBuiltinESMExports()
+    const failed = await post('rules', { path: ws, stages: disabled })
+    fs.renameSync = originalRename; syncBuiltinESMExports()
+    const retained = (await state()).body
+    check('配置提交失败不修改旧配置、内存授权或磁盘授权', () => {
+      assert.equal(failed.status, 500)
+      assert.match(failed.body.error, /EACCES/)
+      assert.equal(readFileSync(configFile, 'utf8'), oldConfig)
+      assert.equal(readFileSync(flowFile, 'utf8'), oldFlow)
+      assert.deepEqual(retained.writeGrants, ['smoke'])
+      assert.equal(retained.directions[0].needsWrite, true)
+    })
+    assert.equal((await post('rules', { path: ws, stages: disabled })).status, 200)
+    const foreign = (await state(foreignSid)).body
+    check('只收敛当前工作区授权，不影响另一个cwd的既有授权', () => {
+      assert.deepEqual(JSON.parse(readFileSync(flowFile, 'utf8')).writeGrants, [])
+      assert.deepEqual(foreign.writeGrants, ['smoke'])
+      assert.equal(foreign.directions[0].needsWrite, true)
+      const foreignFile = join(other, '.dsh-flowgate', 'flows', foreign.id + '.json')
+      assert.deepEqual(JSON.parse(readFileSync(foreignFile, 'utf8')).writeGrants, ['smoke'])
+    })
+    assert.equal((await post('rules', { path: ws, stages })).status, 200)
+    cx = makeHost(ws, sid, { services })
+    const restored = (await state()).body
+    check('needsWrite false→true后正常持久化与冷恢复均不复活旧授权', () => {
+      assert.equal(restored.directions[0].needsWrite, true)
+      assert.deepEqual(restored.writeGrants, [])
+      assert.equal(restored.directions[0].writeGranted, false)
+      assert.deepEqual(JSON.parse(readFileSync(flowFile, 'utf8')).writeGrants, [])
+    })
+    assert.equal((await act('toggleWriteGrant', { id: 'smoke', enabled: true })).status, 200)
+    assert.deepEqual((await state()).body.writeGrants, ['smoke'])
+    cx = makeHost(ws, sid, { services })
+    const coldWithValidGrant = (await state()).body
+    check('即使配置未变且磁盘完好，冷恢复也不自动继承上次测试授权', () => {
+      assert.equal(coldWithValidGrant.directions[0].needsWrite, true)
+      assert.deepEqual(coldWithValidGrant.writeGrants, [])
+      assert.deepEqual(JSON.parse(readFileSync(flowFile, 'utf8')).writeGrants, [])
+    })
+    assert.equal((await act('toggleWriteGrant', { id: 'smoke', enabled: true })).status, 200)
+    let failedFlowWrites = 0
+    fs.renameSync = function (from, to) {
+      if (String(to) === flowFile) {
+        failedFlowWrites++
+        throw Object.assign(new Error('快照提交 EACCES'), { code: 'EACCES' })
+      }
+      return originalRename.call(this, from, to)
+    }
+    syncBuiltinESMExports()
+    const readonlySaved = await post('rules', { path: ws, stages: disabled })
+    const inMemory = (await state()).body.writeGrants
+    const writableSaved = await post('rules', { path: ws, stages })
+    const staleDisk = JSON.parse(readFileSync(flowFile, 'utf8')).writeGrants
+    cx = makeHost(ws, sid, { services })
+    const afterRestart = (await state()).body
+    const service = currentService()
+    service.registerChild(sid, 'restored-child', { allowShellWrite: true, flowId: afterRestart.id, directionId: 'smoke' })
+    const denial = service.childDenial({ name: 'ops_bash', arguments: { command: 'touch fixture-output' },
+      agent: { session: { header: { id: 'restored-child', cwd: ws } } } })
+    check('快照持续提交失败后恢复needsWrite并重启仍不得复活旧授权', () => {
+      assert.equal(readonlySaved.status, 200)
+      assert.equal(writableSaved.status, 200)
+      assert.deepEqual(inMemory, [])
+      assert.deepEqual(staleDisk, ['smoke'], '故障注入必须实际留下含旧授权的快照')
+      assert.ok(failedFlowWrites >= 2, '撤销与冷恢复期间快照提交都必须持续失败')
+      assert.deepEqual(afterRestart.writeGrants, [])
+      assert.equal(afterRestart.directions[0].needsWrite, true)
+      assert.equal(afterRestart.directions[0].writeGranted, false)
+      assert.ok(denial, '恢复后的子代理不得获得变更性shell')
+    })
+  } finally {
+    fs.renameSync = originalRename; syncBuiltinESMExports()
+    if (previousHome === undefined) delete process.env.DSH_FLOWGATE_HOME
+    else process.env.DSH_FLOWGATE_HOME = previousHome
+    rmSync(root, { recursive: true, force: true })
+  }
+}
+
+// 需求整理只借用工作区已有模型：无会话创建、流程落盘、工具调用或 Agent 唤醒。
+{
+  const root = mkdtempSync(join(tmpdir(), 'flowgate-prepare-'))
+  const ws = join(root, 'workspace'), foreign = join(root, 'foreign')
+  mkdirSync(ws); mkdirSync(foreign)
+  const previousHome = process.env.DSH_FLOWGATE_HOME
+  process.env.DSH_FLOWGATE_HOME = join(root, 'home')
+  const live = [
+    { header: { id: 'foreign', cwd: foreign } },
+    { header: { id: 'same-workspace', cwd: ws } },
+    { header: { id: 'missing-model', cwd: ws } },
+    { header: { id: 'child', cwd: ws, delegationDepth: 1 } },
+  ]
+  const calls = [], streams = []
+  let created = 0, delivered = 0, modelFails = false
+  let modelResult = { title: '工作区模型生成标题', summary: '目标\n\n完整整理后的需求：src/a.js，保留 123 与约束。' }
+  const services = {
+    sessions: { list: () => live, get: (id) => live.find((session) => session.header.id === id), create() { created++; throw new Error('不许创建会话') } },
+    agents: { get: (id) => ({ model: { current: () => id === 'missing-model' ? undefined : { provider: 'fixture-provider', model: 'fixture-' + id } }, followup() { delivered++ } }) },
+    agentDefaultModel: { currentSelection: () => ({ provider: 'default-provider', model: 'default-model' }) },
+    llm: { async prepareCall(config, signal) {
+      calls.push({ config, signal })
+      if (modelFails) throw new Error('credential secret-forbidden')
+      return { config: { ...config, maxTokens: 2048 }, async *stream(options) {
+        streams.push(options)
+        yield { type: 'text-delta', index: 0, text: JSON.stringify(modelResult) }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      } }
+    } },
+  }
+  const cx = makeHost(ws, 'prepare-view', { services })
+  const post = (route, body) => cx.request('/api/flowgate/hub/' + route, body)
+  try {
+    await post('add', { path: ws })
+    const brief = '  原文含路径 src/a.js\n保留 123 与约束。\n '
+    const prepared = await post('prepare', { path: ws, brief })
+    const state = await cx.request('/api/flowgate/state?sessionId=prepare-view')
+    const page = await post('flows', { path: ws })
+    check('prepare 优先当前工作区已有模型，跳过其他工作区和子会话且不创建流程', () => {
+      assert.equal(prepared.status, 200)
+      assert.deepEqual(prepared.body, { title: '工作区模型生成标题', summary: '目标\n\n完整整理后的需求：src/a.js，保留 123 与约束。', status: 'ready' })
+      assert.equal(calls.length, 1)
+      assert.equal(calls[0].config.model, 'fixture-same-workspace')
+      assert.equal(streams[0].sessionId, 'same-workspace')
+      assert.deepEqual(streams[0].tools, [])
+      assert.equal(streams[0].maxTokens, 2048)
+      assert.equal(JSON.parse(streams[0].messages[0].content[0].text).brief, brief)
+      assert.equal(state.body.active, false)
+      assert.equal(page.body.total, 0)
+      assert.equal(created, 0)
+      assert.equal(delivered, 0)
+      assert.equal(existsSync(join(ws, '.dsh-flowgate')), false)
+    })
+    for (const value of [null, [], {}, 1, false]) assert.equal((await post('prepare', { path: ws, brief: value })).status, 400)
+    assert.equal((await post('prepare', { path: ws, brief: 'x'.repeat(20001) })).status, 400)
+    assert.equal((await post('prepare', { path: foreign, brief })).status, 400)
+    assert.equal((await post('prepare', { path: 'relative/path', brief })).status, 400)
+    const maxInput = 'x'.repeat(20000)
+    const maximum = await post('prepare', { path: ws, brief: maxInput })
+    check('prepare 拒绝非法需求和未登记路径，20000字符边界原样交给模型', () => {
+      assert.equal(maximum.status, 200)
+      assert.equal(calls.length, 2)
+      assert.equal(JSON.parse(streams[1].messages[0].content[0].text).brief, maxInput)
+    })
+    const criticalBrief = '最大 20000 字符；文件 src/flow.ts；参考 https://example.com/spec?v=3 。'
+    for (const [label, summary, title] of [
+      ['缺少数字', '文件 src/flow.ts；参考 https://example.com/spec?v=3 。'],
+      ['修改路径', '最大 20000 字符；文件 src/other.ts；参考 https://example.com/spec?v=3 。'],
+      ['修改 URL', '最大 20000 字符；文件 src/flow.ts；参考 https://example.com/other?v=3 。'],
+      ['仅标题保留', '只调整了排版。', '20000 src/flow.ts https://example.com/spec?v=3'],
+    ]) {
+      modelResult = { title: title ?? '整理标题', summary }
+      const result = await post('prepare', { path: ws, brief: criticalBrief })
+      check('模型整理稿关键字保真失败自动降级：' + label, () => {
+        assert.equal(result.status, 200)
+        assert.equal(result.body.status, 'fallback')
+        assert.equal(result.body.summary, criticalBrief)
+        assert.match(result.body.message, /原文信息保留校验/)
+      })
+    }
+    modelResult = { title: '保留错误处理要求', summary: '文件 src/flow.ts 错误后返回可诊断信息。' }
+    const errorBrief = '文件 src/flow.ts 的错误码 INVALID_BRIEF 与 ENOENT 必须保留。'
+    const missingCode = await post('prepare', { path: ws, brief: errorBrief })
+    check('模型不能省掉原文的明确错误码', () => {
+      assert.equal(missingCode.body.status, 'fallback')
+      assert.equal(missingCode.body.summary, errorBrief)
+    })
+    modelResult = { title: '保留关键约束', summary: '文件 src/flow.ts；参考 https://example.com/spec?v=3 。最大 20,000 字符。' }
+    const faithful = await post('prepare', { path: ws, brief: criticalBrief })
+    check('模型保留路径URL和等值数字时可返回整理稿', () => {
+      assert.equal(faithful.status, 200)
+      assert.equal(faithful.body.status, 'ready')
+      assert.equal(faithful.body.summary, modelResult.summary)
+    })
+    for (const [label, brief, summary, expected] of [
+      ['感叹号不能省略', '参考 "https://example.com/run!"。', '参考 https://example.com/run 。', 'fallback'],
+      ['中文路径不能省略', '参考 "https://example.com/需求"。', '参考 https://example.com/ 。', 'fallback'],
+      ['带引号的 URL 原样保留', '参考 "https://example.com/run!"。', '参考 "https://example.com/run!"。', 'ready'],
+      ['去引号保留完整 URL', '参考 "https://example.com/需求"。', '参考 https://example.com/需求 。', 'ready'],
+      ['普通引号 URL 删除', '参考文档要求：“请参照 https://example.com/spec”。', '请参考文档。', 'fallback'],
+      ['普通引号 URL 替换', '参考文档要求：“请参照 https://example.com/spec”。', '请参照 https://example.com/other 。', 'fallback'],
+      ['普通引号 URL 保留', '参考文档要求：“请参照 https://example.com/spec”。', '参考文档要求：“请参照 https://example.com/spec”。', 'ready'],
+      ['普通引号 URL 去引号', '参考文档要求：“请参照 https://example.com/spec”。', '请参照 https://example.com/spec 。', 'ready'],
+      ['普通引号路径删除', '参考文档要求：“修改 src/client.js”。', '请参考文档。', 'fallback'],
+      ['普通引号路径替换', '参考文档要求：“修改 src/client.js”。', '修改 src/other.js 。', 'fallback'],
+      ['普通引号路径保留', '参考文档要求：“修改 src/client.js”。', '参考文档要求：“修改 src/client.js”。', 'ready'],
+      ['普通引号路径去引号', '参考文档要求：“修改 src/client.js”。', '修改 src/client.js 。', 'ready'],
+      ['普通引号 Unicode 路径删除', '参考文档要求：“修改 D:/项目/需求.md”。', '完成修改。', 'fallback'],
+      ['普通引号 Unicode 路径替换', '参考文档要求：“修改 D:/项目/需求.md”。', '修改 D:/项目/其他.md 。', 'fallback'],
+      ['普通引号 Unicode 路径原样安全保留', '参考文档要求：“修改 D:/项目/需求.md”。', '参考文档要求：“修改 D:/项目/需求.md”。', 'ready'],
+      ['普通引号 Unicode 路径去引号安全保留', '参考文档要求：“修改 D:/项目/需求.md”。', '修改 D:/项目/需求.md 。', 'ready'],
+      ['普通引号内空格路径删除保守降级', '参考文档要求：“修改 D:/项目/需求 说明.md”。', '完成修改。', 'fallback'],
+      ['普通引号内空格路径原样保守降级', '参考文档要求：“修改 D:/项目/需求 说明.md”。', '参考文档要求：“修改 D:/项目/需求 说明.md”。', 'fallback'],
+      ['完整literal Unicode路径原样保留', '修改 "D:/项目/需求.md"。', '修改 "D:/项目/需求.md"。', 'ready'],
+      ['完整literal Unicode路径去引号', '修改 "D:/项目/需求.md"。', '修改 D:/项目/需求.md 。', 'ready'],
+      ['整理稿普通句引号中含空格歧义路径应降级', '修改 "D:/项目/需求.md"。', '“修改 D:/项目/需求.md 说明.md”。', 'fallback'],
+      ['整理稿普通句引号中完整无歧义路径可保留', '修改 "D:/项目/需求.md"。', '“修改 D:/项目/需求.md”。', 'ready'],
+      ['未知冒号 ASCII 路径不能漏检', '修改 foo:src/x.md。', '完成修改。', 'fallback'],
+      ['未知冒号 Unicode 路径不能截成绝对路径', '修改 foo:中文/x.md。', '修改 /x.md。', 'fallback'],
+      ['未知冒号 Unicode 路径不能截成相对路径', '修改 foo:中文/x.md。', '修改 文/x.md。', 'fallback'],
+      ['整理稿未知冒号路径不能补偿原路径', '修改 "文/x.md"。', '修改 foo:中文/x.md。', 'fallback'],
+      ['完整 Unicode 相对路径可去引号保留', '修改 "foo/中文/x.md"。', '修改 foo/中文/x.md 。', 'ready'],
+      ['完整盘符 Unicode 路径可去引号保留', '修改 "D:/项目/需求.md"。', '修改 D:/项目/需求.md 。', 'ready'],
+    ]) {
+      modelResult = { title: '保留参考地址', summary }
+      const result = await post('prepare', { path: ws, brief })
+      check('quoted URL 字面保真：' + label, () => {
+        assert.equal(result.status, 200)
+        assert.equal(result.body.status, expected)
+        assert.equal(result.body.summary, result.body.status === 'ready' ? summary : brief)
+      })
+    }
+    modelFails = true
+    const fallback = await post('prepare', { path: ws, brief: '  # 本地标题。\n\n\n保留原文 456  ' })
+    check('模型不可用时本地规范排版并安全降级，原始错误不进用户消息', () => {
+      assert.equal(fallback.status, 200)
+      assert.equal(fallback.body.status, 'fallback')
+      assert.equal(fallback.body.title, '本地标题')
+      assert.equal(fallback.body.summary, '# 本地标题。\n\n保留原文 456')
+      assert.equal(JSON.stringify(fallback.body).includes('secret-forbidden'), false)
+      assert.equal(created, 0)
+      assert.equal(delivered, 0)
+      assert.equal(existsSync(join(ws, '.dsh-flowgate')), false)
+    })
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_FLOWGATE_HOME
+    else process.env.DSH_FLOWGATE_HOME = previousHome
+    rmSync(root, { recursive: true, force: true })
+  }
+}
+
+// 直接调用公开 helper，避免期限替身经过 Hub 的文件或 JSON 请求链路。
+{
+  const realNow = performance.now.bind(performance)
+  const pad = (length, tail) => '中'.repeat(length - tail.length) + tail
+  const immediateContext = (summary) => ({
+    agentDefaultModel: { currentSelection: () => ({ provider: 'fixture', model: 'fixture' }) },
+    llm: {
+      async prepareCall(config) {
+        return {
+          config,
+          async *stream() {
+            yield { type: 'text-delta', index: 0, text: JSON.stringify({ title: '需求标题', summary }) }
+            yield { type: 'finish', reason: { kind: 'stop' } }
+          },
+        }
+      },
+    },
+  })
+
+  for (const [label, brief, summary] of [
+    ['中文原文与整理稿均达合法上限', '中'.repeat(20_000), '中'.repeat(32_000)],
+    ['32k中文附未完成路径尾部', '需求。', '中'.repeat(31_999) + '/'],
+    ['最大中文文本附真实相对路径', pad(20_000, ' src/x.md'), pad(32_000, ' src/x.md')],
+    ['近32k完整引用多目录无扩展名', '需求。', '"' + '中/'.repeat(15_997) + '尾"'],
+    ['32k完整引用多目录含扩展名', '需求。', '"' + '中/'.repeat(15_997) + '尾.md"'],
+  ]) {
+    const ctx = immediateContext(summary)
+    const started = realNow()
+    const result = await prepareRequirement(ctx, { brief })
+    const elapsed = realNow() - started
+    check('需求整理性能：' + label, () => {
+      assert.equal(result.status, 'ready')
+      assert.equal(result.summary, summary)
+      assert.ok(elapsed < 2_000, label + ' 用时 ' + elapsed.toFixed(2) + 'ms，必须低于2000ms')
+    })
+    console.log('       性能耗时：' + elapsed.toFixed(2) + 'ms')
+  }
+
+  async function deadlineProbe(phase, elapsed, { invalidJson = false } = {}) {
+    const brief = '原始需求。'
+    const summary = '整理需求。'
+    const payload = invalidJson ? '{' : JSON.stringify({ title: '需求标题', summary })
+    const origin = 40_000
+    let logicalNow = origin
+    let signal
+    let streamCalls = 0
+    let nextCalls = 0
+    let closed = 0
+    let result
+    const events = []
+    const timers = []
+    const restores = []
+    const perf = globalThis.performance
+    const originalParse = JSON.parse
+    const originalMatchAll = String.prototype.matchAll
+    const properties = [
+      [globalThis, 'performance'],
+      [perf, 'now'],
+      [globalThis, 'setTimeout'],
+      [globalThis, 'clearTimeout'],
+      [JSON, 'parse'],
+      [String.prototype, 'matchAll'],
+    ].map(([object, key]) => ({ object, key, descriptor: Object.getOwnPropertyDescriptor(object, key) }))
+
+    function reach(event) {
+      events.push(event)
+      if (event === 'prepare') logicalNow = origin + 9_000
+      if (event === phase) logicalNow = origin + elapsed
+    }
+
+    function replace(object, key, value) {
+      const descriptor = Object.getOwnPropertyDescriptor(object, key)
+      Object.defineProperty(object, key, { configurable: true, writable: true, value })
+      restores.push(() => {
+        if (descriptor) Object.defineProperty(object, key, descriptor)
+        else Reflect.deleteProperty(object, key)
+      })
+    }
+
+    try {
+      replace(perf, 'now', () => logicalNow)
+      // 不执行定时器回调：逻辑期限必须独立发现同步工作已超时。
+      replace(globalThis, 'setTimeout', (callback, delay) => {
+        const timer = { callback, delay, cleared: false, unref() { return this } }
+        timers.push(timer)
+        return timer
+      })
+      replace(globalThis, 'clearTimeout', (timer) => { timer.cleared = true })
+      replace(JSON, 'parse', function (text, ...args) {
+        try {
+          return Reflect.apply(originalParse, this, [text, ...args])
+        } finally {
+          // 原生解析成功和抛错都在完成这个响应时推进时间。
+          if (text === payload) reach('json')
+        }
+      })
+      replace(String.prototype, 'matchAll', function (pattern) {
+        const iterator = Reflect.apply(originalMatchAll, this, [pattern])
+        if (String(this) !== summary) return iterator
+        return (function* () {
+          yield* iterator
+          // 以实际扫描对象标记保真工作，不依赖checkTime调用次数。
+          reach('fidelity')
+        })()
+      })
+
+      const ctx = {
+        agentDefaultModel: { currentSelection: () => ({ provider: 'fixture', model: 'fixture' }) },
+        llm: {
+          async prepareCall(config, receivedSignal) {
+            signal = receivedSignal
+            await Promise.resolve()
+            reach('prepare')
+            return {
+              config,
+              stream(options) {
+                assert.equal(options.signal, signal)
+                streamCalls++
+                reach('stream-open')
+                const cut = Math.floor(payload.length / 2)
+                const steps = [
+                  ['first', { type: 'text-delta', index: 0, text: payload.slice(0, cut) }],
+                  ['chunk', { type: 'text-delta', index: 0, text: payload.slice(cut) }],
+                  ['finish', { type: 'finish', reason: { kind: 'stop' } }],
+                ]
+                let index = 0
+                return {
+                  [Symbol.asyncIterator]() { return this },
+                  next() {
+                    nextCalls++
+                    const step = steps[index++]
+                    if (!step) return Promise.resolve({ done: true })
+                    reach(step[0])
+                    return Promise.resolve({ done: false, value: step[1] })
+                  },
+                  return() {
+                    closed++
+                    return Promise.resolve({ done: true })
+                  },
+                }
+              },
+            }
+          },
+        },
+      }
+      result = await prepareRequirement(ctx, { brief })
+    } finally {
+      for (let index = restores.length - 1; index >= 0; index--) restores[index]()
+      // 同时比较函数和自有属性；原型上的now不能被恢复成新增自有属性。
+      for (const { object, key, descriptor } of properties) {
+        assert.deepEqual(Object.getOwnPropertyDescriptor(object, key), descriptor, key + '替身未完整恢复')
+      }
+      assert.equal(globalThis.performance, perf)
+      assert.equal(JSON.parse, originalParse)
+      assert.equal(String.prototype.matchAll, originalMatchAll)
+    }
+    return { result, signal, events, timers, streamCalls, nextCalls, closed, brief, summary }
+  }
+
+  // 所有替身串行安装、finally恢复，断言与日志在恢复后运行。
+  for (const [label, phase, elapsed, invalidJson, expected] of [
+    ['JSON完成11999ms仍成功', 'json', 11_999, false, 'ready'],
+    ['prepare完成12000ms中止且不开始流', 'prepare', 12_000, false, 'fallback'],
+    ['stream返回12000ms中止且不读取', 'stream-open', 12_000, false, 'fallback'],
+    ['中途片段12000ms中止并关闭流', 'chunk', 12_000, false, 'fallback'],
+    ['finish完成12000ms中止并关闭流', 'finish', 12_000, false, 'fallback'],
+    ['JSON成功解析12000ms仍按超时降级', 'json', 12_000, false, 'fallback'],
+    ['JSON抛错12000ms优先超时文案', 'json', 12_000, true, 'fallback'],
+    ['保真扫描12000ms中止并降级', 'fidelity', 12_000, false, 'fallback'],
+  ]) {
+    const probe = await deadlineProbe(phase, elapsed, { invalidJson })
+    check('需求整理统一期限：' + label, () => {
+      assert.equal(probe.result.status, expected)
+      assert.ok(probe.events.includes(phase))
+      assert.ok(probe.timers.length > 0)
+      assert.ok(probe.timers.every((timer) => timer.cleared))
+      if (expected === 'ready') {
+        assert.equal(probe.result.summary, probe.summary)
+        assert.equal(probe.signal.aborted, false)
+      } else {
+        assert.equal(probe.result.summary, probe.brief)
+        assert.equal(probe.result.message, '需求整理超时，已使用本地整理。')
+        assert.equal(probe.signal.aborted, true)
+        assert.equal(probe.signal.reason?.code, 'timeout')
+      }
+      if (phase === 'prepare') {
+        assert.equal(probe.streamCalls, 0)
+        assert.equal(probe.nextCalls, 0)
+        assert.equal(probe.closed, 0)
+      } else if (phase === 'stream-open') {
+        assert.equal(probe.streamCalls, 1)
+        assert.equal(probe.nextCalls, 0)
+        assert.equal(probe.closed, 0)
+      } else {
+        assert.equal(probe.streamCalls, 1)
+        assert.ok(probe.nextCalls > 0)
+        assert.equal(probe.closed, 1)
+      }
+    })
+  }
+}
+
 console.log('\n全部通过：' + passed.length + ' 项')

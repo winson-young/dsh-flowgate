@@ -2,7 +2,7 @@
  * Verify plugin components with file: fixtures; this does not verify deployed DSH.
  * Node 22+ and existing React dev dependencies are required. Connect Chrome CDP
  * with file access enabled, then run: node docs/capture-ui.mjs [--verify-only]
- * FLOWGATE_CDP overrides http://127.0.0.1:9229. Only workspace.png is written.
+ * FLOWGATE_CDP overrides http://127.0.0.1:9229. Workspace and rules images are written.
  * A dedicated tab is created and closed without navigating existing tabs.
  */
 import { writeFile } from 'node:fs/promises'
@@ -69,11 +69,11 @@ const navigate = async (stage, state, theme) => {
   await ready('document.querySelector(".fg-root") && !document.body.textContent.includes("正在连接宿主端")')
 }
 const inspectLayout = async phase => {
-  const info = await evaluate('(()=>({overflow:[...document.querySelectorAll(".fg-root,.fg-content,.fg-head,.fg-card,.fg-opt,.fg-hub-ws,.fg-stage-list,.fg-gate,.fg-workspace-overview,.fg-workspace-primary,.fg-workspace-card,.fg-pagination,.fg-modal,.fg-workspace-rule-row")].filter(el=>el.getClientRects().length&&el.scrollWidth>el.clientWidth+2).map(el=>({class:el.className,width:el.clientWidth,scroll:el.scrollWidth})),background:getComputedStyle(document.querySelector(".fg-root")).backgroundColor}))()')
+  const info = await evaluate('(()=>({overflow:[...document.querySelectorAll(".fg-root,.fg-content,.fg-head,.fg-card,.fg-opt,.fg-hub-ws,.fg-stage-list,.fg-gate,.fg-workspace-overview,.fg-workspace-primary,.fg-workspace-card,.fg-pagination,.fg-modal,.fg-workspace-rule-row,.fg-workspace-rule-body,.fg-workspace-rule-footer,.fg-requirement")].filter(el=>el.getClientRects().length&&el.scrollWidth>el.clientWidth+2).map(el=>({class:el.className,width:el.clientWidth,scroll:el.scrollWidth})),background:getComputedStyle(document.querySelector(".fg-root")).backgroundColor}))()')
   cases.push({ ...currentCase, phase, ...info })
 }
 const inspectWorkspace = async state => {
-  const info = await evaluate('(()=>{const primary=document.querySelector(".fg-workspace-primary"),overview=document.querySelector(".fg-workspace-overview"),history=document.querySelector(".fg-flow-history"),rules=document.querySelector(".fg-workspace-tools"),form=primary?.querySelector(".fg-start-section"),current=primary?.querySelector(".fg-current-flow");return {formTag:form?.tagName,current:!!current,forms:document.querySelectorAll("textarea.fg-textarea").length,historyClosed:!history?.open,historyAfterOverview:!!(overview.compareDocumentPosition(history)&Node.DOCUMENT_POSITION_FOLLOWING),rulesAside:rules?.tagName==="ASIDE",primaryBeforeRules:!!(primary.compareDocumentPosition(rules)&Node.DOCUMENT_POSITION_FOLLOWING),primaryVisible:(form||current)?.getBoundingClientRect().top<innerHeight,firstPageHasCurrent:[...document.querySelectorAll(".fg-flow-row")].some(row=>row.textContent.includes("会话过期检测与重新认证提示"))}})()')
+  const info = await evaluate('(()=>{const primary=document.querySelector(".fg-workspace-primary"),overview=document.querySelector(".fg-workspace-overview"),history=document.querySelector(".fg-flow-history"),rules=document.querySelector(".fg-workspace-tools"),form=primary?.querySelector(".fg-start-section"),current=primary?.querySelector(".fg-current-flow");return {formTag:form?.tagName,current:!!current,forms:document.querySelectorAll(".fg-start-section").length,historyClosed:!history?.open,historyAfterOverview:!!(overview.compareDocumentPosition(history)&Node.DOCUMENT_POSITION_FOLLOWING),rulesAside:rules?.tagName==="ASIDE",primaryBeforeRules:!!(primary.compareDocumentPosition(rules)&Node.DOCUMENT_POSITION_FOLLOWING),primaryVisible:(form||current)?.getBoundingClientRect().top<innerHeight,firstPageHasCurrent:[...document.querySelectorAll(".fg-flow-row")].some(row=>row.textContent.includes("会话过期检测与重新认证提示"))}})()')
   check('primary entry matches workspace state', state === 'active' ? info.current && info.forms === 0 : info.formTag === 'SECTION' && info.forms === 1, info)
   check('history starts collapsed after overview; rules follow primary in aside', info.historyClosed && info.historyAfterOverview && info.rulesAside && info.primaryBeforeRules && info.primaryVisible, info)
   if (state === 'active') check('current flow is available independently of first history page', !info.firstPageHasCurrent && info.current)
@@ -102,27 +102,118 @@ const openAndInspectDetail = async state => {
     await focus('.fg-flow-row'); await key('Enter')
   }
   await ready('document.querySelector(".fg-hub-flow .fg-nav")')
-  const info = await evaluate('(()=>{const flow=document.querySelector(".fg-hub-flow"),detail=flow.closest("section"),history=document.querySelector(".fg-flow-history");return {historyAfterDetail:!!(detail.compareDocumentPosition(history)&Node.DOCUMENT_POSITION_FOLLOWING),detailForms:flow.querySelectorAll("textarea.fg-textarea").length,allForms:document.querySelectorAll("textarea.fg-textarea").length,text:flow.textContent}})()')
+  const info = await evaluate('(()=>{const flow=document.querySelector(".fg-hub-flow"),detail=flow.closest("section"),history=document.querySelector(".fg-flow-history");return {historyAfterDetail:!!(detail.compareDocumentPosition(history)&Node.DOCUMENT_POSITION_FOLLOWING),detailForms:flow.querySelectorAll(".fg-start-section").length,allForms:document.querySelectorAll(".fg-start-section").length,text:flow.textContent}})()')
   check('detail precedes history and has no restart form', info.historyAfterDetail && info.detailForms === 0 && info.allForms === (state === 'active' ? 0 : 1), { historyAfterDetail: info.historyAfterDetail, detailForms: info.detailForms, allForms: info.allForms })
   if (state === 'finished' || state === 'cancelled') check('ended history detail shows final status', info.text.includes(state === 'cancelled' ? '已放弃' : '已完成'))
   await inspectLayout('detail opened')
   await click('收起')
   await ready('!document.querySelector(".fg-hub-flow")')
 }
+const fill = async (selector, text) => {
+  await focus(selector)
+  await evaluate('document.querySelector(' + JSON.stringify(selector) + ').select()')
+  await send('Input.insertText', { text })
+}
+const saveScreenshot = async name => {
+  if (verifyOnly || currentCase.width !== 1280 || currentCase.theme !== 'light') return
+  const shot = await send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false, clip: { x: 0, y: 0, width: currentCase.width, height: 1000, scale: 1 } })
+  const dest = new URL('./images/' + name + '.png', import.meta.url)
+  await writeFile(dest, Buffer.from(shot.data, 'base64')); screenshots.push(fileURLToPath(dest))
+}
 const startWithKeyboard = async theme => {
-  await focus('.fg-start-section textarea')
-  await send('Input.insertText', { text: '为过期会话提供重新登录入口。' })
-  await ready('!' + button('开始需求分析') + '.disabled')
-  await key('Tab')
-  check('Tab moves from brief to optional title', await evaluate('document.activeElement.matches(".fg-start-section input")'))
+  const raw = '.fg-start-section textarea[aria-label="需求原文"]'
+  const title = '.fg-start-section input[aria-label="任务标题"]'
+  const summary = '.fg-start-section textarea[aria-label="需求整理稿"]'
+  const firstBrief = '会话超过 30 分钟未活动时，接口返回 401，并提供重新认证入口。'
+  await fill(raw, firstBrief)
+  check('basic title and summary appear immediately', await evaluate('document.querySelector(' + JSON.stringify(title) + ').value.length>0 && document.querySelector(' + JSON.stringify(summary) + ').value===' + JSON.stringify(firstBrief)))
+  await ready('document.querySelector(".fg-start-section [role=status]")?.textContent.includes("已自动整理")')
+  check('debounced preparation uses raw requirement', await evaluate('window.fixtureRequests.some(r=>r.route.includes("/hub/prepare")&&r.body.brief===' + JSON.stringify(firstBrief) + ')'))
+  await inspectLayout('requirement prepared')
+  await saveScreenshot('workspace')
+  await evaluate('window.fixturePrepare.delay=1500')
+  const oldBrief = '旧需求：保留 30 分钟与 401。'
+  await fill(raw, oldBrief)
+  await ready('window.fixtureRequests.some(r=>r.route.includes("/hub/prepare")&&r.body.brief===' + JSON.stringify(oldBrief) + ')')
+  await fill(title, '手动标题：会话恢复')
+  await fill(summary, '手动整理稿：保留 30 分钟、401 与 C:/Projects/atlas-console。')
+  await evaluate('window.fixturePrepare.delay=80')
+  const nextBrief = '新需求：超过 30 分钟返回 401，保留 C:/Projects/atlas-console。'
+  await fill(raw, nextBrief)
+  await ready('window.fixturePreparePending===0 && window.fixtureRequests.some(r=>r.route.includes("/hub/prepare")&&r.body.brief===' + JSON.stringify(oldBrief) + ')')
+  check('late preparation cannot overwrite manual title and summary', await evaluate('document.querySelector(' + JSON.stringify(title) + ').value==="手动标题：会话恢复" && document.querySelector(' + JSON.stringify(summary) + ').value.startsWith("手动整理稿")'))
+  await evaluate('window.fixturePrepare.status="fallback"')
+  await click('重新整理需求')
+  await ready('document.querySelector(".fg-start-section [role=status]")?.textContent.includes("基础整理稿")')
+  check('fallback retains complete requirement and allows start', await evaluate('document.querySelector(' + JSON.stringify(raw) + ').value===' + JSON.stringify(nextBrief) + ' && document.querySelector(' + JSON.stringify(summary) + ').value===' + JSON.stringify(nextBrief) + ' && !' + button('开始需求分析') + '.disabled'))
+  await evaluate('window.fixturePrepare.status="ready"')
+  await click('重新整理需求')
+  await ready('document.querySelector(".fg-start-section [role=status]")?.textContent.includes("已自动整理")')
+  check('explicit retry updates only unlocked summary', await evaluate('document.querySelector(' + JSON.stringify(title) + ').value==="手动标题：会话恢复" && document.querySelector(' + JSON.stringify(summary) + ').value.startsWith("目标与要求")'))
   if (theme === 'light') {
-    await focus('.fg-start-section textarea'); await key('Enter', 2)
+    await focus(raw); await key('Enter', 2)
   } else {
     await evaluate('(' + button('开始需求分析') + ').focus()'); await key('Enter')
   }
   await ready('window.fixtureActions.some(a=>a.action==="start") && document.querySelector(".fg-current-flow")')
   const actions = await evaluate('window.fixtureActions.filter(a=>a.action==="start")')
-  check(theme === 'light' ? 'Ctrl+Enter starts once with brief' : 'Enter activates start button once with brief', actions.length === 1 && actions[0].payload.brief === '为过期会话提供重新登录入口。')
+  check(theme === 'light' ? 'Ctrl+Enter starts once with original and summary' : 'Enter starts once with original and summary', actions.length === 1 && actions[0].payload.brief === nextBrief && actions[0].payload.summary.startsWith('目标与要求') && actions[0].payload.title === '手动标题：会话恢复')
+  check('current flow shows summary and expandable original', await evaluate('document.querySelector(".fg-current-flow .fg-requirement-text")?.textContent.startsWith("目标与要求") && document.querySelector(".fg-current-flow .fg-requirement-original")?.textContent.includes("C:/Projects/atlas-console")'))
+}
+const inspectRules = async () => {
+  const modal = 'document.querySelector("[role=dialog]")'
+  const stageLabels = ['S1 · 需求分析', 'S2 · 开发规则', 'S3 · 评审角度', 'S4 · 测试方向']
+  const before = await evaluate('JSON.stringify(window.fixtureState().workspaceStages)')
+  await click('编辑规则'); await ready('document.querySelector("[role=dialog]")')
+  check('all four stages are editable without a session', await evaluate(modal + '.querySelectorAll("nav[aria-label=工作区规则分组] button").length===4'))
+  const initialChecked = await evaluate(modal + '.querySelector(".fg-workspace-rule-row input").checked')
+  await evaluate(modal + '.querySelector(".fg-workspace-rule-row input").click()')
+  await key('Escape'); await ready('!document.querySelector("[role=dialog]")')
+  check('Escape discards edits without writing', await evaluate('JSON.stringify(window.fixtureState().workspaceStages)===' + JSON.stringify(before) + ' && !window.fixtureRequests.some(r=>r.route.includes("/hub/rules")&&r.body.stages)'))
+  check('Escape returns focus to edit trigger', await evaluate('document.activeElement.textContent.trim()==="编辑规则"'))
+  await click('编辑规则'); await ready('document.querySelector("[role=dialog]")')
+  await evaluate(modal + '.querySelector("button").focus()'); await key('Tab', 8)
+  check('Shift+Tab stays within dialog', await evaluate(modal + '.contains(document.activeElement)'))
+  await key('Tab')
+  check('Tab wraps to dialog first button', await evaluate('document.activeElement===' + modal + '.querySelector("button")'))
+  check('cancelled stage draft was reset', await evaluate(modal + '.querySelector(".fg-workspace-rule-row input").checked===' + initialChecked))
+  await evaluate(modal + '.querySelector(".fg-workspace-rule-row input").click()')
+  await click(stageLabels[1], modal)
+  check('default, edited builtin and custom origins are distinct', await evaluate('["内置","已自定义内置","新增自定义"].every(label=>[...' + modal + '.querySelectorAll(".fg-badge")].some(b=>b.textContent===label))'))
+  const original = modal + '.querySelector("button[aria-label^=恢复内置规则]").closest(".fg-workspace-rule-item").querySelector("details")'
+  await evaluate('(' + original + ').querySelector("summary").focus()'); await key('Enter')
+  check('builtin original expands for comparison', await evaluate('(' + original + ').open'))
+  await inspectLayout('builtin original expanded')
+  await saveScreenshot('rules')
+  await click('恢复内置', modal)
+  check('single restore removes only the builtin edit', await evaluate('!' + modal + '.textContent.includes("已自定义内置") && ' + modal + '.textContent.includes("新增自定义")'))
+  await click(stageLabels[2], modal)
+  await evaluate(modal + '.querySelector(".fg-workspace-rule-row input").click()')
+  await click(stageLabels[3], modal)
+  await click('添加规则', modal)
+  await fill('[role=dialog] input[placeholder="规则名称"]', '检查会话恢复')
+  await fill('[role=dialog] textarea[placeholder="检查要点，每行一条"]', '保留 30 分钟与 401\n写入仅在单独授权后执行')
+  await evaluate(modal + '.querySelector(".fg-modal-form input[type=checkbox]").click()')
+  await click('加入列表', modal)
+  await inspectLayout('custom test direction added')
+  await click(stageLabels[0], modal)
+  check('stage switching keeps unsaved selections', await evaluate(modal + '.querySelector(".fg-workspace-rule-row input").checked!==' + initialChecked))
+  await click(stageLabels[1], modal)
+  await click('恢复本阶段内置默认', modal)
+  await evaluate('window.fixtureRuleSaveDelay=1500')
+  await click('保存规则', modal)
+  await ready(button('保存中…', modal) + '?.disabled')
+  await evaluate('const summaries=' + modal + '.querySelectorAll("details > summary");summaries[summaries.length-1].focus()')
+  await key('Tab')
+  check('Tab wraps between builtin originals while save is pending', await evaluate('document.activeElement===' + modal + '.querySelector("details > summary")'))
+  await key('Tab', 8)
+  check('Shift+Tab stays within pending save dialog', await evaluate('(()=>{const summaries=' + modal + '.querySelectorAll("details > summary");return document.activeElement===summaries[summaries.length-1]})()'))
+  await ready('!document.querySelector("[role=dialog]")')
+  await evaluate('window.fixtureRuleSaveDelay=0')
+  const writes = await evaluate('window.fixtureRequests.filter(r=>r.route.includes("/hub/rules")&&r.body.stages).map(r=>r.body.stages)')
+  const stages = writes[0]
+  check('one save commits all stages and preserves other stage drafts on reset', writes.length === 1 && stages.S1 !== null && stages.S2 === null && stages.S3 !== null && stages.S4.custom.some(rule => rule.name === '检查会话恢复' && rule.needsWrite))
+  check('test direction configuration grants no write permission', !JSON.stringify(stages).includes('writeGrants'))
 }
 try {
   if (!target.id || !target.webSocketDebuggerUrl) throw Error('Chrome did not create a dedicated preview tab')
@@ -155,10 +246,7 @@ try {
           await ready('document.querySelector(".fg-workspace-primary .fg-start-section,.fg-workspace-primary .fg-current-flow") && document.querySelectorAll(".fg-flow-row").length===10 && ' + button('编辑规则') + ' && !' + button('编辑规则') + '.disabled')
         }
         if (scenario.stage === 'rules') {
-          await click('编辑规则'); await ready('document.querySelector("[role=dialog]")')
-          await key('Escape'); await ready('!document.querySelector("[role=dialog]")')
-          check('Escape closes workspace rules dialog', true)
-          await click('编辑规则'); await ready('document.querySelector("[role=dialog]")')
+          await inspectRules()
         }
       } else if (!['home', 'empty'].includes(scenario.stage)) {
         await ready('document.querySelector(".fg-nav")')
@@ -166,11 +254,6 @@ try {
       await inspectLayout('initial')
       if (scenario.stage === 'workspace') {
         await inspectWorkspace(scenario.state)
-        if (!verifyOnly && width === 1280 && theme === 'light' && scenario.state === 'idle') {
-          const shot = await send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false, clip: { x: 0, y: 0, width, height: 1000, scale: 1 } })
-          const dest = new URL('./images/workspace.png', import.meta.url)
-          await writeFile(dest, Buffer.from(shot.data, 'base64')); screenshots.push(fileURLToPath(dest))
-        }
         await historyAndKeyboard(scenario.state)
         await openAndInspectDetail(scenario.state)
         if (scenario.state === 'idle') await startWithKeyboard(theme)

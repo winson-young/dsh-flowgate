@@ -135,7 +135,7 @@ const check = async (name, fn) => {
   console.log('ok   ' + name)
 }
 
-await check('apply 注册 10 个工具与 8 条路由', () => {
+await check('apply 注册 10 个工具与 9 条路由', () => {
   assert.deepEqual([...host.tools.keys()].sort(), [
     'flowgate_ask', 'flowgate_cancel', 'flowgate_doc', 'flowgate_gate', 'flowgate_review',
     'flowgate_review_run', 'flowgate_start', 'flowgate_status', 'flowgate_test', 'flowgate_test_run',
@@ -148,8 +148,9 @@ await check('apply 注册 10 个工具与 8 条路由', () => {
   assert.ok(host.routes.has('/api/flowgate/hub/remove'))
   assert.ok(host.routes.has('/api/flowgate/hub/flows'))
   assert.ok(host.routes.has('/api/flowgate/hub/rules'))
+  assert.ok(host.routes.has('/api/flowgate/hub/prepare'))
   // state 是 GET，其余都是 POST —— 工作台读名单、添加、移除、按目录拉快照。
-  assert.deepEqual([...host.routes.values()].map((r) => r.methods.join(',')).sort(), ['GET', 'POST', 'POST', 'POST', 'POST', 'POST', 'POST', 'POST'])
+  assert.deepEqual([...host.routes.values()].map((r) => r.methods.join(',')).sort(), ['GET', 'POST', 'POST', 'POST', 'POST', 'POST', 'POST', 'POST', 'POST'])
 })
 
 await check('未启动时 status 给出引导', async () => {
@@ -168,20 +169,42 @@ await check('Hub 无流程时保存规则，不建立流程或 scope 授权', as
   assert.equal(added.status, 200)
   assert.equal(added.data.member.flowCount, 0)
   assert.equal(Object.hasOwn(added.data.member, 'flows'), false)
-  const saved = await postHubApi('rules', { path: CWD, rules: {
-    ids: ['scope-only', 'integration-rule'],
-    custom: [{ id: 'integration-rule', name: '集成规则', points: ['输出结构化日志'] }],
-  } })
+  const defaults = (await postHubApi('rules', { path: CWD })).data.rules.stages
+  const ids = { S1: 'clarify-goal', S2: 'scope-only', S3: 'correctness', S4: 'smoke' }
+  const stages = Object.fromEntries(Object.entries(ids).map(([stage, id]) => [stage, {
+    ids: null, custom: [], edits: [{ ...defaults[stage].builtin.find((item) => item.id === id), points: ['集成工作区规则 ' + stage] }],
+  }]))
+  stages.S2.ids = ['scope-only', 'integration-rule']
+  stages.S2.custom = [{ id: 'integration-rule', name: '集成规则', points: ['输出结构化日志'] }]
+  const saved = await postHubApi('rules', { path: CWD, stages })
   assert.equal(saved.status, 200)
   assert.deepEqual(saved.data.rules.ids, ['scope-only', 'integration-rule'])
   assert.equal((await getState()).active, false)
   const config = JSON.parse(readFileSync(join(CWD, '.dsh-flowgate', 'config.json'), 'utf8'))
-  assert.deepEqual(Object.keys(config).sort(), ['rules', 'updatedAt', 'version'])
+  assert.deepEqual(Object.keys(config).sort(), ['stages', 'updatedAt', 'version'])
+  assert.ok(Object.values(saved.data.rules.stages).every((value) => value.configured))
+  assert.deepEqual(config.stages, stages)
+  assert.equal(existsSync(join(CWD, '.dsh-flowgate', 'scope.json')), false)
+})
+
+const REQUIREMENT_BRIEF = '  原文需求 src/auth/session.ts\n约束 123 保持完整。  '
+const REQUIREMENT_SUMMARY = '整理后的需求：会话过期时返回 401。'
+
+await check('prepare 在没有模型能力时降级，不启动流程也不改变配置', async () => {
+  const file = join(CWD, '.dsh-flowgate', 'config.json')
+  const before = readFileSync(file, 'utf8')
+  const prepared = await postHubApi('prepare', { path: CWD, brief: REQUIREMENT_BRIEF })
+  assert.equal(prepared.status, 200)
+  assert.equal(prepared.data.status, 'fallback')
+  assert.equal(prepared.data.title, '原文需求 src/auth/session.ts')
+  assert.equal(prepared.data.summary, REQUIREMENT_BRIEF.trim())
+  assert.equal((await getState()).active, false)
+  assert.equal(readFileSync(file, 'utf8'), before)
   assert.equal(existsSync(join(CWD, '.dsh-flowgate', 'scope.json')), false)
 })
 
 await check('flowgate_start 启动流程并进入 S1', async () => {
-  const value = await call('flowgate_start', { title: '会话过期检测', preset: 'fast' })
+  const value = await call('flowgate_start', { title: '会话过期检测', preset: 'fast', brief: REQUIREMENT_BRIEF, summary: REQUIREMENT_SUMMARY })
   assert.equal(value.stage, 'S1')
   const view = await getState()
   assert.equal(view.active, true)
@@ -189,6 +212,10 @@ await check('flowgate_start 启动流程并进入 S1', async () => {
   assert.equal(view.preset, 'fast')
   assert.equal(view.ruleSource, 'workspace')
   assert.deepEqual(view.ruleIds, ['scope-only', 'integration-rule'])
+  assert.equal(view.brief, REQUIREMENT_BRIEF)
+  assert.equal(view.summary, REQUIREMENT_SUMMARY)
+  for (const stage of ['S1', 'S2', 'S3', 'S4']) assert.equal(view.stageConfigs[stage].source, 'workspace')
+  assert.match((await call('flowgate_status', {})).summary, /集成工作区规则 S1/)
 })
 
 await check('S1 阶段的写操作被拒绝', async () => {
@@ -477,6 +504,7 @@ await check('hub 按工作区返回流程摘要与待确认数', async () => {
   assert.equal(typeof workspace.waitingCount, 'number')
   assert.equal(workspace.activeCount, workspace.flows.filter((item) => !item.finished && !item.cancelled).length)
   assert.ok(flow.brief.length <= 200, 'brief 要截断，别把长需求整段塞进面板')
+  assert.equal(flow.summary, REQUIREMENT_SUMMARY)
 })
 
 await check('hub 带上重复路径时不重复计入', async () => {
@@ -502,6 +530,7 @@ await check('Hub 成员摘要与分页计数一致，分页包含完成及活跃
   assert.equal(cleared.status, 200)
   assert.equal(cleared.data.rules.configured, false)
   assert.equal(cleared.data.rules.ids.length, 5)
+  for (const stage of ['S1', 'S3', 'S4']) assert.equal(cleared.data.rules.stages[stage].configured, true)
 })
 
 if (PREVIOUS_HUB_HOME === undefined) delete process.env.DSH_FLOWGATE_HOME
