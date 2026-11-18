@@ -128,14 +128,19 @@ const check = async (name, fn) => {
   console.log('ok   ' + name)
 }
 
-await check('apply 注册 10 个工具与 2 条路由', () => {
+await check('apply 注册 10 个工具与 6 条路由', () => {
   assert.deepEqual([...host.tools.keys()].sort(), [
     'flowgate_ask', 'flowgate_cancel', 'flowgate_doc', 'flowgate_gate', 'flowgate_review',
     'flowgate_review_run', 'flowgate_start', 'flowgate_status', 'flowgate_test', 'flowgate_test_run',
   ])
   assert.ok(host.routes.has('/api/flowgate/state'))
   assert.ok(host.routes.has('/api/flowgate/action'))
-  assert.deepEqual([...host.routes.values()].map((r) => r.methods.join(',')).sort(), ['GET', 'POST'])
+  assert.ok(host.routes.has('/api/flowgate/hub'))
+  assert.ok(host.routes.has('/api/flowgate/hub/members'))
+  assert.ok(host.routes.has('/api/flowgate/hub/add'))
+  assert.ok(host.routes.has('/api/flowgate/hub/remove'))
+  // state 是 GET，其余都是 POST —— 工作台读名单、添加、移除、按目录拉快照。
+  assert.deepEqual([...host.routes.values()].map((r) => r.methods.join(',')).sort(), ['GET', 'POST', 'POST', 'POST', 'POST', 'POST'])
 })
 
 await check('未启动时 status 给出引导', async () => {
@@ -413,6 +418,42 @@ await check('flowgate_review_run 为每个角度 spawn 只读子代理并带上�
   const value = await reviewPending
   assert.equal(value.decision, 'skip')
   assert.equal(value.next, 'S4')
+})
+
+// 侧栏全局面板：不属于任何会话，只按盘上的 flows/ 做跨工作区只读清单。
+const hubRoute = host.routes.get('/api/flowgate/hub')
+const postHub = async (body) => {
+  const res = await hubRoute.fetch({ json: async () => body })
+  return { status: res.status, data: await res.json() }
+}
+
+await check('hub 拒绝非法路径，不越界读盘', async () => {
+  const res = await postHub({ paths: ['relative/dir', 42] })
+  assert.equal(res.status, 200)
+  assert.deepEqual(res.data.workspaces, [])
+})
+
+await check('hub 按工作区返回流程摘要与待确认数', async () => {
+  const res = await postHub({ paths: [CWD] })
+  assert.equal(res.status, 200)
+  assert.equal(res.data.workspaces.length, 1, '同一路径重复时只算一个工作区')
+  const workspace = res.data.workspaces[0]
+  assert.equal(workspace.path, CWD)
+  // 同一目录可能有多个会话的流程：面板列出全部，不按会话过滤。
+  assert.ok(workspace.flows.length >= 1)
+  const flow = workspace.flows.find((item) => item.sessionId === SESSION)
+  assert.ok(flow, '必须包含本会话的流程')
+  assert.equal(flow.finished, true, '这条流程已经验收通过')
+  assert.equal(flow.stage, 'S4')
+  assert.equal(flow.stageLabel, '测试')
+  assert.equal(typeof workspace.waitingCount, 'number')
+  assert.equal(workspace.activeCount, workspace.flows.filter((item) => !item.finished && !item.cancelled).length)
+  assert.ok(flow.brief.length <= 200, 'brief 要截断，别把长需求整段塞进面板')
+})
+
+await check('hub 带上重复路径时不重复计入', async () => {
+  const res = await postHub({ paths: [CWD, CWD] })
+  assert.equal(res.data.workspaces.length, 1)
 })
 
 rmSync(CWD, { recursive: true, force: true })

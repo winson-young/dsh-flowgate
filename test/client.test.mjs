@@ -185,8 +185,50 @@ function baseView(stage, patch = {}) {
 
 let currentView = null
 let posted = []
+// 面板读的是「用户添加过的工作区」名单：默认空，用例里按需塞。
+let currentMembers = []
+// add 的返回值要能定制：空目录与有任务/规则的目录要分别断言。
+let addResult = null
+const listCalls = []
+const addCalls = []
+const removeCalls = []
 globalThis.fetch = async (url, init) => {
   const target = String(url)
+  if (target.includes('/hub/members')) {
+    listCalls.push(1)
+    return { ok: true, status: 200, json: async () => ({ members: currentMembers, file: '~/.dsh-flowgate/hub.json' }) }
+  }
+  if (target.includes('/hub/add')) {
+    const body = JSON.parse(init.body)
+    addCalls.push(body)
+    const member = addResult || {
+      path: body.path,
+      name: body.path.split('/').pop(),
+      missing: false,
+      flows: [],
+      flowCount: 0,
+      activeCount: 0,
+      waitingCount: 0,
+      rules: { configured: false, ids: null, customCount: 0 },
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        member,
+        created: true,
+        imported: {
+          flows: member.flowCount,
+          rules: member.rules.ids ? member.rules.ids.length : 0,
+          customRules: member.rules.customCount,
+        },
+      }),
+    }
+  }
+  if (target.includes('/hub/remove')) {
+    removeCalls.push(JSON.parse(init.body))
+    return { ok: true, status: 200, json: async () => ({ removed: true }) }
+  }
   if (target.includes('/action')) {
     posted.push(JSON.parse(init.body))
     return { ok: true, status: 200, json: async () => ({ ok: true }) }
@@ -212,6 +254,18 @@ async function click(node) {
     node.props.onClick()
     await new Promise((resolve) => setTimeout(resolve, 40))
   })
+}
+
+async function changeValue(node, value) {
+  await act(async () => { node.props.onChange({ target: { value } }) })
+}
+
+async function pressKey(node, modifiers = {}) {
+  let prevented = 0
+  await act(async () => {
+    node.props.onKeyDown({ key: 'Enter', preventDefault() { prevented += 1 }, ...modifiers })
+  })
+  return prevented
 }
 
 async function settle() {
@@ -289,27 +343,37 @@ function inputByPlaceholder(tree, placeholder) {
 
 await check('模块导出 name / inject / apply', () => {
   assert.equal(plugin.name, 'dsh-flowgate')
-  assert.deepEqual(plugin.inject, ['slots'])
+  // workspaces 是可选服务：靠 ctx.get 取，缺了也只影响面板，不该拖垮会话视图。
+  assert.deepEqual([...plugin.inject], ['slots'])
   assert.equal(typeof plugin.apply, 'function')
 })
 
 const registrations = []
+const fakeWorkspaces = { list: { getSnapshot: () => ({ items: [] }), subscribe: () => () => {} } }
 plugin.apply({
   slots: {
     inject(_name, callback) { callback() },
     register(options, Component) { registrations.push({ options, Component }) },
   },
+  get(name) { return name === 'workspaces' ? fakeWorkspaces : undefined },
 })
 
-await check('apply 注册 conversation.view 与 conversation.input.dock', () => {
+await check('apply 只注册左侧栏面板（图标 + 面板本体）', () => {
+  // 入口收敛到左侧栏：会话视图「本次流程」与输入框上方常驻条都已移除，
+  // 否则同一件事有三个入口，用户每次都要判断该点哪个。
   assert.equal(registrations.length, 2)
-  assert.equal(registrations[0].options.name, 'conversation.view')
-  assert.equal(registrations[0].options.id, 'flowgate')
-  assert.equal(registrations[0].options.label(), '流程工作台')
-  assert.equal(registrations[1].options.name, 'conversation.input.dock')
-  assert.equal(registrations[1].options.id, 'flowgate-dock')
-  // 宿主同槽条目 order 升序：任务 0、目标 10、排队 20；取 15 才贴在输入框上方。
-  assert.equal(registrations[1].options.order, 15)
+  const names = registrations.map((item) => item.options.name).sort()
+  assert.deepEqual(names, ['main', 'sidebar.panellist'])
+  const byName = (name) => registrations.find((item) => item.options.name === name)
+  // 侧栏条目 id 与 main 的 key 必须同名，否则点图标打不开面板。
+  assert.equal(byName('sidebar.panellist').options.id, 'flowgate-hub')
+  assert.equal(byName('sidebar.panellist').options.label(), '流程工作台')
+  assert.equal(byName('main').options.key, 'flowgate-hub')
+})
+
+await check('会话视图与输入框常驻条都不再注册', () => {
+  assert.equal((registrations.filter((item) => item.options.name === 'conversation.view')).length, 0)
+  assert.equal((registrations.filter((item) => item.options.name === 'conversation.input.dock')).length, 0)
 })
 
 await check('样式只注入一次', () => {
@@ -341,33 +405,18 @@ await check('样式不写死颜色，全部走 DSH 主题 token', () => {
   assert.ok(used.length > 8, '样式应当大量复用主题 token')
 })
 
-const WorkbenchView = registrations[0].Component
-const FlowgateDock = registrations[1].Component
-
-// ---------------------------------------------------------------------------
-// 1b. 滚动归属：视图必须声明自己拥有滚动条
-// ---------------------------------------------------------------------------
-
-await check('三种状态下的根节点都声明 data-conversation-composer-overlay', async () => {
-  // 没有这个属性时 ConversationRoot 仍把 .scrollBody 当滚动容器，.viewArea 是
-  // flex:1 0 auto + min-height:auto，.fg-root 的 height:100% 解析成 auto、内容整个摊开；
-  // 切到本 tab 就会继承聊天视图留下的 scrollTop 并被 clamp 到最底部。
-  const seen = []
-  for (const view of [null, { active: false, presets: {} }, baseView('S2')]) {
-    currentView = view
-    const renderer = await render(WorkbenchView, {})
-    const root = renderer.toJSON()
-    seen.push(root?.props?.['data-conversation-composer-overlay'])
-  }
-  assert.deepEqual(seen, ['', '', ''], '根节点必须带 data-conversation-composer-overlay（值为空串）')
-})
+const componentOf = (name) => registrations.find((item) => item.options.name === name).Component
+// 流程详情没有独立插槽：它是面板内部组件，由插件单独导出给单测用。
+const FlowDetail = plugin.components.FlowDetail
+assert.equal(typeof FlowDetail, 'function', '面板内嵌的流程详情要能被单测直接渲染')
+const HubPanelIcon = componentOf('sidebar.panellist')
 
 // ---------------------------------------------------------------------------
 // 2. 空态
 // ---------------------------------------------------------------------------
 
 {
-  const renderer = await render(WorkbenchView, {}, false)
+  const renderer = await render(FlowDetail, {}, false)
   await check('没有 sessionId 时不渲染任何东西', () => {
     assert.equal(renderer.toJSON(), null)
   })
@@ -375,7 +424,7 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
 
 {
   currentView = null
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   await check('拿不到宿主状态时提示正在连接', () => {
     assert.ok(flat(renderer.toJSON()).includes('正在连接宿主端'))
   })
@@ -392,12 +441,10 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
     builtinAngles: [],
     builtinDirections: [],
   }
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   await check('流程未启动时可以直接在界面启动', () => {
     const text = flat(renderer.toJSON())
     assert.ok(text.includes('当前会话还没有流程'))
-    // Agent 仍然是可用路径，只是不再是唯一路径。
-    assert.ok(text.includes('flowgate_start'))
     assert.ok(text.includes('开始一次新流程'))
     assert.ok(text.includes('小功能快速开发'))
   })
@@ -407,12 +454,34 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
     const found = areas()
     assert.equal(found.length, 1, '必须有一个多行的需求描述输入框')
     assert.equal(found[0].props.rows, 4)
+    assert.equal(found[0].props.required, true)
+    assert.equal(found[0].props['aria-required'], true)
+    const label = findTags(renderer.toJSON(), 'label').find((node) => findTags(node, 'textarea').length)
+    assert.ok(flat(label).includes('需求描述'))
+    const marker = nodeByClass(label, 'fg-required')
+    assert.equal(flat(marker), '*')
+    assert.equal(marker.props['aria-hidden'], true)
   })
   await check('需求描述为空时按钮不可点，点也不发请求', async () => {
     const button = buttonByText(renderer.toJSON(), '开始需求分析')
     assert.equal(button.props.disabled, true, '空需求时启动按钮应当禁用')
     await click(button)
     assert.equal(posted.length, 0, '空需求不该发出 start')
+  })
+  await check('需求描述纯空白时快捷键不启动并给出必填提示', async () => {
+    posted = []
+    await changeValue(areas()[0], ' \n  ')
+    assert.equal(buttonByText(renderer.toJSON(), '开始需求分析').props.disabled, true)
+    assert.equal(await pressKey(areas()[0], { ctrlKey: true }), 1)
+    assert.equal(posted.length, 0)
+    assert.ok(flat(nodeByRole(renderer.toJSON(), 'alert')).includes('先写一句这次要做什么'))
+  })
+  await check('需求描述普通 Enter 换行，不启动流程', async () => {
+    await changeValue(areas()[0], '第一行需求\n第二行补充')
+    const before = posted.length
+    assert.equal(await pressKey(areas()[0]), 0)
+    assert.equal(posted.length, before)
+    assert.equal(areas()[0].props.value, '第一行需求\n第二行补充')
   })
   await check('点「开始需求分析」发出 start 动作（标题可以留空）', async () => {
     // 先把需求写进去：这段文字会随 start 一起提交，宿主用它派生标题。
@@ -461,11 +530,12 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
     waiting: true,
     waitingKind: 'answer',
   })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   const tree = renderer.toJSON()
   const text = flat(tree)
 
   await check('S1 追问卡片显示问题、上下文与已回答数', () => {
+    assert.ok(text.includes('拍板'))
     assert.ok(text.includes('过期判定用滑动窗口还是绝对时间？'))
     assert.ok(text.includes('影响是否需要额外的活动时间戳字段。'))
     assert.ok(text.includes('已回答 2 个决策问题'))
@@ -484,6 +554,112 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
     assert.equal(posted[0].action, 'answer')
     assert.equal(posted[0].payload.choiceIndex, 0)
     assert.equal(posted[0].payload.customText, '')
+  })
+
+  const customArea = () => findTags(renderer.toJSON(), 'textarea').find((node) => node.props['aria-label'] === '自定义答案')
+  await check('自定义答案点击后才展开多行输入', async () => {
+    assert.equal(customArea(), undefined)
+    await click(buttonByText(renderer.toJSON(), '自定义答案'))
+    assert.equal(customArea().props.rows, 3)
+    assert.equal(customArea().props.autoFocus, true)
+    assert.equal(hasButton(renderer.toJSON(), '提交答案'), true)
+  })
+  await check('自定义答案为空或纯空白时不可提交，快捷键也不发请求', async () => {
+    const before = posted.length
+    assert.equal(buttonByText(renderer.toJSON(), '提交答案').props.disabled, true)
+    assert.equal(await pressKey(customArea(), { ctrlKey: true }), 1)
+    await changeValue(customArea(), ' \n  ')
+    assert.equal(buttonByText(renderer.toJSON(), '提交答案').props.disabled, true)
+    assert.equal(await pressKey(customArea(), { metaKey: true }), 1)
+    assert.equal(posted.length, before)
+  })
+  await check('自定义答案普通 Enter 保留多行，不提交', async () => {
+    const before = posted.length
+    await changeValue(customArea(), '保留滑动窗口\n超时后允许重新认证')
+    assert.equal(await pressKey(customArea()), 0)
+    assert.equal(posted.length, before)
+    assert.equal(customArea().props.value, '保留滑动窗口\n超时后允许重新认证')
+  })
+  await check('输入法组合输入期间 Ctrl/Cmd+Enter 不提交', async () => {
+    const before = posted.length
+    for (const modifiers of [{ ctrlKey: true }, { metaKey: true }]) {
+      assert.equal(await pressKey(customArea(), { ...modifiers, nativeEvent: { isComposing: true } }), 0)
+    }
+    assert.equal(posted.length, before)
+  })
+  await check('取消自定义答案只收起输入并保留草稿', async () => {
+    const before = posted.length
+    const draft = customArea().props.value
+    await click(buttonByText(renderer.toJSON(), '取消'))
+    assert.equal(customArea(), undefined)
+    assert.equal(hasButton(renderer.toJSON(), '提交答案'), false)
+    assert.equal(posted.length, before)
+    await click(buttonByText(renderer.toJSON(), '自定义答案'))
+    assert.equal(customArea().props.value, draft)
+  })
+  for (const [label, modifiers] of [['Ctrl', { ctrlKey: true }], ['Cmd', { metaKey: true }]]) {
+    await check('自定义答案 ' + label + '+Enter 提交完整多行并去掉首尾空白', async () => {
+      const before = posted.length
+      await changeValue(customArea(), '  第一行方案\n第二行说明  ')
+      assert.equal(await pressKey(customArea(), modifiers), 1)
+      assert.equal(posted.length, before + 1)
+      assert.equal(posted.at(-1).action, 'answer')
+      assert.deepEqual(posted.at(-1).payload, { choiceIndex: -1, customText: '第一行方案\n第二行说明' })
+    })
+  }
+  await check('自定义答案按钮也提交完整多行内容', async () => {
+    const before = posted.length
+    await changeValue(customArea(), '按钮提交\n保留换行')
+    await click(buttonByText(renderer.toJSON(), '提交答案'))
+    assert.equal(posted.length, before + 1)
+    assert.deepEqual(posted.at(-1).payload, { choiceIndex: -1, customText: '按钮提交\n保留换行' })
+  })
+  await check('提交未完成时拦截同一轮快捷键与选项的重复提交', async () => {
+    const originalFetch = globalThis.fetch
+    let release
+    const pendingResponse = new Promise((resolve) => { release = resolve })
+    let calls = 0
+    globalThis.fetch = async (url, init) => {
+      if (String(url).includes('/action')) {
+        calls += 1
+        await pendingResponse
+      }
+      return originalFetch(url, init)
+    }
+    const before = posted.length
+    try {
+      const area = customArea()
+      const option = buttonByText(renderer.toJSON(), '滑动窗口')
+      await act(async () => {
+        const event = { key: 'Enter', ctrlKey: true, preventDefault() {} }
+        area.props.onKeyDown(event)
+        area.props.onKeyDown(event)
+        option.props.onClick()
+      })
+      assert.equal(calls, 1, 'React 重渲染前的重复事件也只能发出一次请求')
+      assert.equal(customArea().props.disabled, true)
+      assert.equal(buttonByText(renderer.toJSON(), '取消').props.disabled, true)
+      assert.equal(buttonByText(renderer.toJSON(), '滑动窗口').props.disabled, true)
+      assert.equal(nodeByClass(renderer.toJSON(), 'fg-list fg-options').props['aria-busy'], true)
+    } finally {
+      await act(async () => { release(); await pendingResponse })
+      globalThis.fetch = originalFetch
+    }
+    assert.equal(posted.length, before + 1)
+    assert.equal(customArea().props.disabled, false)
+  })
+  await act(async () => { renderer.unmount() })
+}
+
+{
+  currentView = baseView('S1', {
+    grill: { pending: { id: 'q-no-custom', question: '是否启用？', options: [{ label: '启用' }], allowCustom: false }, answeredCount: 0 },
+  })
+  const renderer = await render(FlowDetail, {})
+  await check('禁止自定义时仅提供可直接提交的选项', () => {
+    assert.equal(hasButton(renderer.toJSON(), '自定义答案'), false)
+    assert.equal(findTags(renderer.toJSON(), 'textarea').length, 0)
+    assert.ok(hasButton(renderer.toJSON(), '启用'))
   })
 }
 
@@ -504,7 +680,7 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
     waiting: true,
     waitingKind: 'doc',
   })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   const tree = renderer.toJSON()
   const text = flat(tree)
 
@@ -549,7 +725,7 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
     waiting: false,
     waitingKind: null,
   })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   const tree = renderer.toJSON()
   await check('确认入口中断后按钮仍然在，并说明文档已保存', () => {
     assert.ok(buttonByText(tree, '批准并冻结 scope'))
@@ -572,7 +748,7 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
     },
     waiting: false,
   })
-  const tree = (await render(WorkbenchView, {})).toJSON()
+  const tree = (await render(FlowDetail, {})).toJSON()
   await check('已决策的文档不再显示批准按钮', () => {
     let approveButton = null
     try { approveButton = buttonByText(tree, '批准并冻结 scope') } catch { approveButton = null }
@@ -591,7 +767,7 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
     waiting: true,
     waitingKind: 'gate',
   })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   const tree = renderer.toJSON()
   const text = flat(tree)
 
@@ -633,7 +809,7 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
     waiting: false,
     waitingKind: null,
   })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   const tree = renderer.toJSON()
   await check('门禁中断后按钮仍然可点并说明原因', async () => {
     assert.ok(flat(tree).includes('上次的门禁请求被中断'))
@@ -666,7 +842,7 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
     waiting: false,
     waitingKind: null,
   })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   const tree = renderer.toJSON()
   await check('S3 评审交上来后门禁按钮可点', async () => {
     assert.ok(flat(tree).includes('上次的门禁请求被中断'))
@@ -689,7 +865,7 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
     waiting: false,
     waitingKind: null,
   })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   const tree = renderer.toJSON()
   await check('S4 测试结果交上来后门禁按钮可点', async () => {
     assert.ok(flat(tree).includes('上次的门禁请求被中断'))
@@ -713,7 +889,7 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
     waiting: true,
     waitingKind: 'gate',
   })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   const tree = renderer.toJSON()
   const text = flat(tree)
 
@@ -738,7 +914,7 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
     waiting: true,
     waitingKind: 'gate',
   })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   const text = flat(renderer.toJSON())
 
   await check('S2 采集失败时显示宿主给的原因', () => {
@@ -775,7 +951,7 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
     waiting: true,
     waitingKind: 'gate',
   })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   const tree = renderer.toJSON()
   const text = flat(tree)
 
@@ -838,7 +1014,7 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
     waiting: true,
     waitingKind: 'gate',
   })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   const tree = renderer.toJSON()
   const text = flat(tree)
 
@@ -875,7 +1051,7 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
     stages: stagesFor('S2').map((stage) => (stage.id === 'S1' ? { ...stage, status: 'skipped_by_user', skipped: true } : stage)),
     waiting: false,
   })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   const tree = renderer.toJSON()
   const text = flat(tree)
 
@@ -890,14 +1066,14 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
   await check('门禁未就绪时按钮不可点并给出说明', () => {
     const node = buttonByText(tree, '完成开发')
     assert.equal(node.props.disabled, true)
-    assert.ok(text.includes('门禁未就绪'))
+    assert.ok(text.includes('等待 Agent 提交本阶段结果。'))
   })
 }
 
 {
   posted = []
   currentView = baseView('S1', { preset: 'fast' })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   const text = flat(renderer.toJSON())
   await check('侧栏不再直接摆升档按钮', () => {
     assert.ok(text.includes('阶段设置'))
@@ -919,7 +1095,7 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
 {
   posted = []
   currentView = baseView('S2')
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   const text = flat(renderer.toJSON())
   await check('侧栏退化为统计摘要与打开按钮', () => {
     assert.ok(text.includes('阶段设置'))
@@ -1001,7 +1177,7 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
     const css = styleNodes[0].textContent
     const at = css.indexOf('@container flowgate (max-width: 720px)')
     assert.ok(at >= 0, '缺少 720px 容器查询')
-    const block = css.slice(at, css.indexOf('@container flowgate (max-width: 480px)'))
+    const block = css.slice(at, css.indexOf('@container flowgate (max-width: 480px)', at))
     assert.ok(/\.fg-modal-nav \{[^}]*flex-direction: row/.test(block), '窄屏分组导航应横排')
     assert.ok(/\.fg-modal-body \{[^}]*grid-template-columns: minmax\(0, 1fr\)/.test(block), '窄屏应改成单列')
   })
@@ -1076,7 +1252,7 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
 {
   posted = []
   currentView = baseView('S3', { waiting: true, waitingKind: 'gate' })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   // S3 默认落在评审角度组：弹窗一开就是这组勾选框。
   const boxes = checkboxNodes(await openSettings(renderer))
   await check('勾选评审角度会提交 toggleAngle', async () => {
@@ -1099,27 +1275,27 @@ await check('三种状态下的根节点都声明 data-conversation-composer-ove
     directions: [{ id: 'mig', name: '迁移回滚', points: ['回滚可恢复'], needsWrite: true, writeGranted: false }],
     directionCatalog: [{ id: 'mig', name: '迁移回滚', points: ['回滚可恢复'], needsWrite: true }],
   })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   // S4 默认落在测试方向组，写权限授权勾选也在这组里。
   const modalTree = await openSettings(renderer)
   const boxes = checkboxNodes(modalTree)
   const text = flat(modalTree)
-  await check('S1 追问卡片的跳过按钮不放行追问', async () => {
+  await check('S1 拍板不再提供无实际作用的跳过按钮', async () => {
   currentView = baseView('S1', {
     grill: { pending: { id: 'q-skip', question: '过期后是否强制重新登录？', options: [{ label: '强制重新登录', tradeoff: '更安全' }], recommended: 0 }, answeredCount: 0 },
   })
   posted = []
-  const tree = await render(WorkbenchView, {})
-  const skip = buttonByText(tree.toJSON(), '跳过')
-  await click(skip)
-  assert.equal(posted.length, 0, '跳过不能提交任何动作')
-  const text = flat(tree.toJSON())
-  assert.ok(text.includes('跳过不会放行追问'), '必须说明跳过不放行')
+  const tree = await render(FlowDetail, {})
+  const card = nodeByClass(tree.toJSON(), 'fg-q')
+  assert.ok(card)
+  assert.equal(hasButton(tree.toJSON(), '跳过'), false)
+  assert.ok(hasButton(tree.toJSON(), '强制重新登录'))
+  assert.equal(posted.length, 0)
 })
 
 await check('点「修改需求」后回到追问流程并说明下一步', async () => {
   currentView = baseView('S1', { doc: { html: null, revisedAt: '2026-11-17T10:00:00Z' } })
-  const tree = await render(WorkbenchView, {})
+  const tree = await render(FlowDetail, {})
   const text = flat(tree.toJSON())
   assert.ok(text.includes('你点了「修改需求」'))
 })
@@ -1147,7 +1323,7 @@ await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
     directions: [{ id: 'mig', name: '迁移回滚', points: ['回滚可恢复'], needsWrite: true, writeGranted: false }],
     directionCatalog: [{ id: 'mig', name: '迁移回滚', points: ['回滚可恢复'], needsWrite: true }],
   })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   await openSettings(renderer)
   // S2 默认组是开发规则，授权说明在测试方向组里。
   const text = flat(await switchGroup(renderer, '测试方向'))
@@ -1171,7 +1347,7 @@ await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
     },
     reviewOutsideScope: [{ file: 'src/config/secrets.ts', severity: 'CRITICAL', angle: '安全' }],
   })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   const text = flat(renderer.toJSON())
   await check('D4 评审卡片提示 scope 外发现需要回 S1 调 scope', () => {
     assert.ok(text.includes('1 条发现落在冻结 scope 之外'))
@@ -1191,7 +1367,7 @@ await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
     },
     reviewOutsideScope: [],
   })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   const text = flat(renderer.toJSON())
   await check('D4 没有 scope 外发现时不显示回 S1 提示', () => {
     assert.ok(!text.includes('落在冻结 scope 之外'))
@@ -1211,7 +1387,7 @@ await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
     },
     reviewOutsideScope: [{ file: 'src/config/secrets.ts', severity: 'CRITICAL', angle: '安全' }],
   })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   const tree = renderer.toJSON()
   const back = buttonByText(tree, '回到需求分析调整 scope')
   await check('D4 有 scope 外发现时 S3 门禁出现回 S1 的按钮', () => {
@@ -1238,7 +1414,7 @@ await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
     },
     reviewOutsideScope: [],
   })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   await check('D4 没有 scope 外发现时 S3 门禁不显示回 S1 按钮', () => {
     assert.ok(!flat(renderer.toJSON()).includes('回到需求分析调整 scope'))
   })
@@ -1251,7 +1427,7 @@ await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
 {
   posted = []
   currentView = baseView('S2', { waiting: true, waitingKind: 'gate' })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   await check('门禁面板底部有「放弃这次流程」入口', () => {
     assert.ok(flat(renderer.toJSON()).includes('放弃这次流程'))
   })
@@ -1279,7 +1455,7 @@ await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
 {
   // 没有挂起门禁时也要能放弃：用户卡在 S1 想换个需求是常见情形。
   currentView = baseView('S1', { waiting: false })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   await check('没有挂起门禁时也能放弃流程', () => {
     assert.ok(flat(renderer.toJSON()).includes('放弃这次流程'))
   })
@@ -1292,7 +1468,7 @@ await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
     cancelledAt: '2026-11-17T10:30:00Z',
     cancelReason: '这个需求先不做了',
   })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   const text = flat(renderer.toJSON())
   await check('已放弃的流程显示放弃标记与原因', () => {
     assert.ok(text.includes('流程已放弃'))
@@ -1304,81 +1480,9 @@ await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
   })
 }
 
-// ---------------------------------------------------------------------------
-// 9. 输入区上方的常驻条
-// ---------------------------------------------------------------------------
-
-{
-  currentView = baseView('S3', { waiting: true, waitingKind: 'gate' })
-  const renderer = await render(FlowgateDock, {})
-  const text = flat(renderer.toJSON())
-  await check('dock 显示当前阶段与等待状态', () => {
-    assert.ok(text.includes('S3 评审'))
-    assert.ok(text.includes('门禁等你点击确认'))
-  })
-}
-
-{
-  posted = []
-  currentView = { active: false }
-  const renderer = await render(FlowgateDock, {})
-  await check('流程未启动时 dock 也能启动', () => {
-    const text = flat(renderer.toJSON())
-    assert.ok(text.includes('这个会话还没有流程'))
-    assert.ok(text.includes('开始需求分析'))
-  })
-  await check('点开始时先就地展开需求输入，不直接建流程', async () => {
-    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
-    assert.equal(posted.length, 0, '没填需求之前不该发出 start')
-    assert.ok(flat(renderer.toJSON()).includes('先写一句这次要做什么'), '应当展开填写区')
-    assert.equal(findTags(renderer.toJSON(), 'textarea').length, 1, '展开后要有一个需求输入框')
-  })
-  await check('展开后需求为空时按钮禁用，填了才发出带 brief 的 start', async () => {
-    assert.equal(buttonByText(renderer.toJSON(), '开始需求分析').props.disabled, true, '空需求时按钮应当禁用')
-    const area = findTags(renderer.toJSON(), 'textarea')[0]
-    await act(async () => {
-      area.props.onChange({ target: { value: '会话过期返回 401，并给出重新认证入口' } })
-      await new Promise((resolve) => setTimeout(resolve, 20))
-    })
-    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
-    assert.equal(posted.at(-1).action, 'start')
-    assert.equal(posted.at(-1).payload.preset, 'fast')
-    assert.equal(posted.at(-1).payload.brief, '会话过期返回 401，并给出重新认证入口')
-  })
-}
-
-{
-  // 流程结束（含放弃）后 view 仍然是 active，dock 不能因此把启动入口藏起来：
-  // 用户在对话里看到「流程已结束」，下一步往往就是想接着做下一件事。
-  posted = []
-  currentView = baseView('S4', { finished: true, skippedCount: 2 })
-  const renderer = await render(FlowgateDock, {})
-  const text = flat(renderer.toJSON())
-  await check('流程结束后 dock 显示已结束与跳过计数', () => {
-    assert.ok(text.includes('流程已结束'))
-    assert.ok(text.includes('已跳过 2 个阶段'))
-  })
-  await check('流程结束后 dock 仍然给得出开始入口', () => {
-    assert.ok(text.includes('开始需求分析'), '已结束的流程也要能直接开新的')
-  })
-  await check('已结束时点开始同样先展开填写区，填了才发 start', async () => {
-    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
-    assert.equal(posted.length, 0, '展开阶段不该发请求')
-    const area = findTags(renderer.toJSON(), 'textarea')[0]
-    assert.ok(area, '展开后要有需求输入框')
-    await act(async () => {
-      area.props.onChange({ target: { value: '接着做登录限流' } })
-      await new Promise((resolve) => setTimeout(resolve, 20))
-    })
-    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
-    assert.equal(posted.at(-1).action, 'start')
-    assert.equal(posted.at(-1).payload.brief, '接着做登录限流')
-  })
-}
-
 {
   currentView = baseView('S4', { finished: true })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   const text = flat(renderer.toJSON())
   await check('已结束时工作台仍然能开始新流程', () => {
     assert.ok(text.includes('这次流程已结束'))
@@ -1389,7 +1493,7 @@ await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
 
 {
   currentView = baseView('S2', { finished: true, cancelled: true, cancelReason: '先不做了' })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   await check('已放弃时工作台也能开始新流程', () => {
     const text = flat(renderer.toJSON())
     assert.ok(text.includes('这次流程已放弃'))
@@ -1408,7 +1512,7 @@ await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
     activity: { tool: 'read', text: '读取文件：src/auth/session.ts', elapsedMs: 2000 },
     elapsedMs: 65000,
   })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   const text = flat(renderer.toJSON())
   await check('工作台顶部显示阶段进度、正在做什么与已用时间', () => {
     assert.ok(text.includes('S1 需求分析 · 正在读取文件：src/auth/session.ts'), text)
@@ -1424,7 +1528,7 @@ await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
     progress: { percent: 50, stageIndex: 1, label: '开发' },
     elapsedMs: 125000,
   })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   const text = flat(renderer.toJSON())
   await check('门禁等待时进度条说明在等你，不假装 Agent 还在跑', () => {
     assert.ok(text.includes('S2 开发 · 门禁等你确认'), text)
@@ -1439,7 +1543,7 @@ await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
     progress: { percent: 100, stageIndex: 3, label: '测试' },
     elapsedMs: 600000,
   })
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   const text = flat(renderer.toJSON())
   await check('流程结束后收起进度条，结果页不再被占一行', () => {
     assert.ok(!text.includes('已用'))
@@ -1450,11 +1554,273 @@ await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
 {
   // 旧宿主不给 progress 时也不能崩：这条条是纯增量字段。
   currentView = baseView('S1')
-  const renderer = await render(WorkbenchView, {})
+  const renderer = await render(FlowDetail, {})
   await check('宿主没给进度字段时进度条不出现，布局也不塌', () => {
     assert.ok(!flat(renderer.toJSON()).includes('等待 Agent 下一步'))
   })
 }
+// ---------------------------------------------------------------------------
+// 左侧栏全局面板：面板不属于任何会话，只读盘上快照
+// ---------------------------------------------------------------------------
+
+const HubPanel = componentOf('main')
+const useWorkspacesOf = (items) => (selector) => selector({ items })
+
+/** 面板的宿主动作替身：挑目录、登记工作区、跳会话。 */
+const hubActionsWith = (overrides = {}) => ({
+  pickDirectory: async () => null,
+  createWorkspace: async (path) => ({ workspaceId: 'w-new', path }),
+  openSession: () => {},
+  ...overrides,
+})
+
+const alphaMember = {
+  path: 'D:/repo/alpha',
+  name: 'alpha',
+  addedAt: '2026-11-18T08:00:00Z',
+  missing: false,
+  activeCount: 2,
+  waitingCount: 1,
+  flowCount: 2,
+  updatedAt: '2026-11-18T08:00:00Z',
+  rules: { configured: true, ids: ['scope-only', 'no-debug-leftovers'], customCount: 1 },
+  flows: [
+    { id: 'f1', sessionId: 'sess-alpha-1', title: '会话过期检测', brief: '细节…', preset: 'fast', stage: 'S2', stageLabel: '开发', finished: false, cancelled: false, waiting: true, waitingKind: 'gate', skippedCount: 0, percent: 45, createdAt: '…', updatedAt: '…' },
+    { id: 'f2', sessionId: 'sess-alpha-2', title: '导出报表', brief: '', preset: 'strict', stage: 'S4', stageLabel: '测试', finished: true, cancelled: false, waiting: false, waitingKind: null, skippedCount: 1, percent: 100, createdAt: '…', updatedAt: '…' },
+  ],
+}
+
+const resetHub = (members = []) => {
+  currentMembers = members
+  addResult = null
+  listCalls.length = 0
+  addCalls.length = 0
+  removeCalls.length = 0
+}
+
+{
+  // 用户没添加过任何工作区：工作台必须是空的，不能把宿主的工作区摊出来。
+  resetHub([])
+  const renderer = await render(HubPanel, {
+    useHubWorkspaces: useWorkspacesOf([{ workspaceId: 'w1', path: 'D:/repo/alpha', title: 'alpha' }]),
+    hubActions: hubActionsWith(),
+  })
+  const text = flat(renderer.toJSON())
+  await check('名单为空时工作台是空的，不把宿主工作区摊出来', () => {
+    assert.ok(text.includes('添加第一个工作区，集中查看需求、进度与待办。'), text)
+    assert.ok(!text.includes('D:/repo/alpha'), '没添加过的工作区不该出现在工作台里')
+    assert.equal(listCalls.length, 1, '只读一次名单，不读任何工作区目录')
+    assert.equal(addCalls.length, 0)
+  })
+  await check('空名单给出两个添加入口', () => {
+    assert.ok(hasButton(renderer.toJSON(), '添加目录…'))
+    assert.ok(hasButton(renderer.toJSON(), '添加工作区'))
+  })
+}
+
+{
+  // 添加工作区：候选只来自宿主里还没加进名单的那些。
+  resetHub([])
+  addResult = alphaMember
+  const renderer = await render(HubPanel, {
+    useHubWorkspaces: useWorkspacesOf([{ workspaceId: 'w1', path: 'D:/repo/alpha', title: 'alpha' }]),
+    hubActions: hubActionsWith(),
+  })
+  await click(buttonByText(renderer.toJSON(), '添加工作区'))
+  await check('「添加工作区」列出的是宿主里还没添加过的', () => {
+    assert.ok(flat(renderer.toJSON()).includes('D:/repo/alpha'))
+  })
+  await click(buttonByText(renderer.toJSON(), 'D:/repo/alpha'))
+  await check('选中的工作区会被登记进名单', () => {
+    assert.deepEqual(addCalls[0], { path: 'D:/repo/alpha' })
+  })
+  const text = flat(renderer.toJSON())
+  await check('添加后顺手导入任务与规则', () => {
+    assert.ok(text.includes('导入 2 条任务'), text)
+    assert.ok(text.includes('2 条规则'), text)
+    assert.ok(text.includes('含自定义 1 条'), text)
+  })
+  await check('详情列出这个工作区的任务', () => {
+    assert.ok(text.includes('会话过期检测'))
+    assert.ok(text.includes('导出报表'))
+    assert.ok(text.includes('等你确认'))
+    assert.ok(text.includes('进行中 2 条'))
+    assert.ok(text.includes('其中 1 条在等你确认'))
+  })
+  await check('规则摘要常驻，配置路径仅放在 title 中', () => {
+    assert.ok(text.includes('工作区默认 · 2 条规则，其中自定义 1 条'), text)
+    assert.ok(!text.includes('.dsh-flowgate/config.json'), '配置路径不应挤占常驻内容')
+    assert.equal(nodeByClass(renderer.toJSON(), 'fg-ws-rules').props.title, '规则配置：.dsh-flowgate/config.json')
+  })
+  await check('已有流程时新建入口默认折叠，summary 保留入口', () => {
+    const start = findTags(renderer.toJSON(), 'details').find((node) => node.props.className?.includes('fg-start-section'))
+    assert.ok(start, '新建流程必须使用可展开的 details')
+    assert.equal(start.props.open, false)
+    assert.equal(flat(findTags(start, 'summary')[0]), '开始新流程')
+  })
+
+  await click(buttonByText(renderer.toJSON(), '会话过期检测'))
+  const detail = flat(renderer.toJSON())
+  await check('点任务展开详情，详情里就是完整工作台', () => {
+    assert.ok(detail.includes('会话过期检测'), '详情标题用任务名')
+    assert.ok(detail.includes('S2 开发'), '详情里要能看到当前阶段')
+    // 面板内可以直接操作门禁与规则，不再把用户赶回会话。
+    assert.ok(detail.includes('出口门禁'), '详情里要有门禁面板')
+    assert.ok(detail.includes('阶段设置'), '详情里要有阶段设置')
+  })
+
+  const opened = []
+  renderer.unmount()
+  resetHub([alphaMember])
+  const again = await render(HubPanel, {
+    useHubWorkspaces: useWorkspacesOf([]),
+    hubActions: hubActionsWith({ openSession: (id) => opened.push(id) }),
+  })
+  await click(buttonByText(again.toJSON(), 'alpha'))
+  await click(buttonByText(again.toJSON(), '会话过期检测'))
+  await click(buttonByText(again.toJSON(), '打开会话'))
+  await check('详情里能把这个会话打开', () => {
+    assert.deepEqual(opened, ['sess-alpha-1'])
+  })
+}
+
+{
+  // 面板里直接开一条流程：面板不属于任何会话，所以要先向宿主换一个属于这个工作区的会话。
+  resetHub([alphaMember])
+  posted = []
+  const asked = []
+  const renderer = await render(HubPanel, {
+    useHubWorkspaces: useWorkspacesOf([]),
+    hubActions: hubActionsWith({
+      sessionForWorkspace: async (path) => { asked.push(path); return 'sess-new' },
+    }),
+  })
+  await click(buttonByText(renderer.toJSON(), 'alpha'))
+  await check('选中工作区后就能写需求，不用回会话', () => {
+    assert.ok(hasButton(renderer.toJSON(), '开始需求分析'))
+    assert.equal(findTags(renderer.toJSON(), 'textarea').length, 1)
+  })
+  const area = findTags(renderer.toJSON(), 'textarea')[0]
+  await act(async () => {
+    area.props.onChange({ target: { value: '会话过期要返回 401' } })
+    await new Promise((resolve) => setTimeout(resolve, 40))
+  })
+  await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+  await check('点开始时先向宿主换一个属于这个工作区的会话', () => {
+    assert.deepEqual(asked, ['D:/repo/alpha'])
+  })
+  await check('需求原文作为 brief 直接发给宿主', () => {
+    const start = posted.find((item) => item.action === 'start')
+    assert.ok(start, JSON.stringify(posted))
+    assert.equal(start.sessionId, 'sess-new')
+    assert.equal(start.payload.brief, '会话过期要返回 401')
+  })
+  await check('启动成功后显示状态提示并刷新流程名单', () => {
+    assert.equal(flat(nodeByRole(renderer.toJSON(), 'status')), '流程已启动')
+    assert.ok(listCalls.length >= 2, '成功启动后应重新读取工作区流程')
+  })
+  renderer.unmount()
+}
+
+{
+  // 拿不到会话时不能假装成功：错误就地显示，一个请求都不发。
+  resetHub([alphaMember])
+  posted = []
+  const renderer = await render(HubPanel, {
+    useHubWorkspaces: useWorkspacesOf([]),
+    hubActions: hubActionsWith({
+      sessionForWorkspace: async () => { throw new Error('这个目录还不是宿主的工作区') },
+    }),
+  })
+  await click(buttonByText(renderer.toJSON(), 'alpha'))
+  const area = findTags(renderer.toJSON(), 'textarea')[0]
+  await act(async () => {
+    area.props.onChange({ target: { value: '随便写点需求' } })
+    await new Promise((resolve) => setTimeout(resolve, 40))
+  })
+  await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+  await check('换不到会话时显示原因且不发 start', () => {
+    assert.ok(flat(renderer.toJSON()).includes('这个目录还不是宿主的工作区'), flat(renderer.toJSON()))
+    assert.equal(posted.filter((item) => item.action === 'start').length, 0)
+  })
+  renderer.unmount()
+}
+
+{
+  // 添加目录：调宿主选择器，目录还不是工作区就先 create。
+  resetHub([])
+  const created = []
+  const renderer = await render(HubPanel, {
+    useHubWorkspaces: useWorkspacesOf([]),
+    hubActions: hubActionsWith({
+      pickDirectory: async () => 'D:/repo/beta',
+      createWorkspace: async (path) => { created.push(path); return { workspaceId: 'w2', path } },
+    }),
+  })
+  await click(buttonByText(renderer.toJSON(), '添加目录…'))
+  await check('选中的目录会先登记成工作区再进名单', () => {
+    assert.deepEqual(created, ['D:/repo/beta'])
+    assert.deepEqual(addCalls[0], { path: 'D:/repo/beta' })
+  })
+  await check('工作区尚无流程时新建入口默认展开', () => {
+    const start = findTags(renderer.toJSON(), 'details').find((node) => node.props.className?.includes('fg-start-section'))
+    assert.ok(start)
+    assert.equal(start.props.open, true)
+    assert.ok(findTags(start, 'textarea').some((node) => node.props.required))
+    assert.ok(hasButton(start, '开始需求分析'))
+  })
+}
+
+{
+  // 取消选目录：什么都不发生。
+  resetHub([])
+  const created = []
+  const renderer = await render(HubPanel, {
+    useHubWorkspaces: useWorkspacesOf([]),
+    hubActions: hubActionsWith({ createWorkspace: async (path) => { created.push(path); return { path } } }),
+  })
+  await click(buttonByText(renderer.toJSON(), '添加目录…'))
+  await check('取消选目录不会登记任何东西', () => {
+    assert.deepEqual(created, [])
+    assert.equal(addCalls.length, 0)
+    assert.ok(flat(renderer.toJSON()).includes('添加第一个工作区，集中查看需求、进度与待办。'))
+  })
+}
+
+{
+  // 移除：只改名单，回到列表。
+  resetHub([alphaMember])
+  const renderer = await render(HubPanel, {
+    useHubWorkspaces: useWorkspacesOf([]),
+    hubActions: hubActionsWith(),
+  })
+  await click(buttonByText(renderer.toJSON(), 'alpha'))
+  await click(buttonByText(renderer.toJSON(), '移除'))
+  await check('移除只改名单，回到工作区列表', () => {
+    assert.deepEqual(removeCalls[0], { path: 'D:/repo/alpha' })
+    assert.ok(!flat(renderer.toJSON()).includes('D:/repo/alpha'))
+  })
+}
+
+{
+  // 宿主读名单失败时不能白屏。
+  resetHub([])
+  const saved = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/hub/members')) return { ok: false, status: 500, json: async () => ({ error: '读盘失败' }) }
+    return saved(url, init)
+  }
+  const renderer = await render(HubPanel, {
+    useHubWorkspaces: useWorkspacesOf([]),
+    hubActions: hubActionsWith(),
+  })
+  const text = flat(renderer.toJSON())
+  globalThis.fetch = saved
+  await check('名单读取失败时面板显示错误而不是空白', () => {
+    assert.match(text, /读盘失败/)
+  })
+}
+
 // ---------------------------------------------------------------------------
 // 收尾
 // ---------------------------------------------------------------------------

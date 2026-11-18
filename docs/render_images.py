@@ -1,8 +1,8 @@
-"""Render the two README illustrations (Python 3 + Pillow).
+"""Render the README workflow illustration (Python 3 + Pillow).
 
 Run: python docs/render_images.py
 Set FLOWGATE_DOC_FONT and FLOWGATE_DOC_FONT_BOLD to Chinese font paths if needed.
-These are explanatory illustrations, not screenshots of a running DSH session.
+UI screenshots are captured separately with docs/capture-ui.mjs.
 """
 from pathlib import Path
 import os
@@ -91,67 +91,5 @@ def workflow():
     save(im, "workflow.png")
 
 
-def workbench():
-    im, d = canvas(1060)
-    text(d, (64, 35), "工作台怎么用？看进度、读产物、做决定", 43, bold=True)
-    text(d, (66, 101), "S1 文档待确认时的布局示意 · 并非实机截图", 27, MUTED)
-    box(d, (48, 162, 1552, 822), radius=22)
-    d.line((49, 237, 1551, 237), fill=LINE, width=2)
-    text(d, (78, 184), "对话", 27, MUTED)
-    text(d, (190, 184), "流程工作台", 27, BLUE, True)
-    d.line((190, 233, 336, 233), fill=BLUE, width=5)
-    text(d, (1300, 185), "小功能快速开发", 24, MUTED)
-    # Left navigation: stages show progress, not links that jump stages.
-    badge(d, (75, 265), "1")
-    text(d, (130, 269), "当前阶段", 28, bold=True)
-    for i, (sid, name, state) in enumerate([
-        ("S1", "需求分析", "等待确认"), ("S2", "开发", "未开始"),
-        ("S3", "评审", "未开始"), ("S4", "测试", "未开始")
-    ]):
-        y = 332 + i * 101
-        box(d, (74, y, 304, y + 84), fill="#EDF2FF" if i == 0 else WHITE,
-            outline="#B7CAF9" if i == 0 else LINE, radius=12)
-        text(d, (91, y + 11), f"{sid}  {name}", 25, BLUE if i == 0 else INK, True)
-        text(d, (91, y + 47), state, 21, MUTED)
-    # Main document area.
-    badge(d, (347, 265), "2")
-    text(d, (402, 269), "需求文档与修改范围", 28, bold=True)
-    box(d, (346, 332, 1100, 776), radius=14)
-    text(d, (376, 355), "示例需求：会话超时后重新认证", 30, bold=True)
-    text(d, (376, 414), "目标", 25, BLUE, True)
-    text(d, (376, 455), "超过 30 分钟未活动时，提供重新认证入口。", 25)
-    text(d, (376, 516), "本次修改范围", 25, BLUE, True)
-    text(d, (376, 557), "src/auth.ts     src/session.ts", 24, MUTED)
-    text(d, (376, 618), "验收标准", 25, BLUE, True)
-    text(d, (376, 659), "会话超时 → 接口返回 401 → 引导重新认证", 25)
-    text(d, (376, 721), "先核对目标、文件清单和验收条件，再批准。", 23, MUTED)
-    # Gate first, stage settings second, as in the actual client.
-    badge(d, (1142, 265), "3")
-    text(d, (1197, 269), "出口门禁", 28, bold=True)
-    box(d, (1142, 332, 1524, 571), radius=14)
-    text(d, (1164, 352), "需求文档已提交，等待你确认", 23, MUTED)
-    box(d, (1164, 403, 1502, 461), fill=BLUE, outline=BLUE, radius=12)
-    text(d, (1190, 415), "批准并冻结 scope", 28, WHITE, True)
-    box(d, (1164, 481, 1502, 536), radius=12)
-    text(d, (1271, 493), "修改需求", 26)
-    box(d, (1142, 595, 1524, 776), radius=14)
-    text(d, (1164, 615), "阶段设置", 27, bold=True)
-    text(d, (1164, 662), "开发规则 · 评审角度", 25, MUTED)
-    text(d, (1164, 703), "测试方向 · 档位", 25, MUTED)
-    # Parallel captions keep the image readable at README width.
-    for i, (title, detail) in enumerate([
-        ("看进度", "阶段按顺序推进，不能点击跳转"),
-        ("读产物", "先看内容，再判断是否满足需求"),
-        ("做决定", "确认、退回或跳过当前门禁")
-    ]):
-        x = 64 + i * 504
-        badge(d, (x, 864), str(i + 1))
-        text(d, (x + 57, 865), title, 30, bold=True)
-        text(d, (x, 923), detail, 25, MUTED)
-    text(d, (64, 995), "按钮显示“准备中”？回到对话，让 Agent 继续当前阶段并提交产物。", 26, MUTED)
-    save(im, "workbench.png")
-
-
 if __name__ == "__main__":
     workflow()
-    workbench()

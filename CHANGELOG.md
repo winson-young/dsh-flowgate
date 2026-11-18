@@ -2,6 +2,57 @@
 
 ## Unreleased
 
+- **新增左侧栏「流程工作台」，从空名单起步**：此前只能进到某个会话里看那条流程，跨项目的情况得挨个会话翻。
+  现在左侧图标列多一个入口，第一次打开是**空的**——面板不替你把磁盘上的项目翻一遍，只认你自己加过的那些。
+  两个添加入口：**「添加目录…」** 调起宿主目录选择器（`ctx.uiWorkspace.pickDirectory()`），选中的目录若还不是工作区就用
+  `workspaces.create({ path })` 自动登记（宿主侧幂等，重复选同一目录不会重复登记）；**「添加工作区」** 列出宿主里已有但还没加进名单的，点一个即可。
+  添加的那一刻顺手把这个工作区的任务与规则读出来：**已添加：导入 3 条任务、2 条规则（含自定义 1 条）**。
+  规则与任务仍留在各自工作区的 `.dsh-flowgate/`，面板只读来展示，**不复制、不改写**。
+  名单是用户级的（不属于任何工作区），存 `<DSH_FLOWGATE_HOME | ~/.dsh-flowgate>/hub.json`，只记 `path` 与 `addedAt`；
+  「移除」只从名单拿掉，不删任何流程或配置。
+  新增三条路由：`POST /api/flowgate/hub/members`（读名单 + 每个成员的摘要）、`POST /hub/add`（校验绝对路径与存在性后登记）、
+  `POST /hub/remove`；原有的 `POST /api/flowgate/hub`（body `{ paths: [dir] }`，按绝对路径去重、非法条目丢弃）改为详情态单目录使用。
+  面板仍是**全局面板**，不绑定会话，但每条流程都带着 `sessionId`（来自磁盘快照），所以门禁确认、退回修复、改规则、追加范围这些按会话投递的动作
+  面板自己就能发；要看对话本身时点 **「打开会话」**，调 `ctx.uiWorkspace.openSession(sessionId)` 跳过去。
+  上一版曾在文档里断言「宿主没有跨插件打开会话的公共 API、`UiWorkspaceService` 是内部局部常量」，那是错的：
+  `UiWorkspaceService` 构造函数里 `super(ctx, 'uiWorkspace')`，是公开的 cordis 服务，相关文档已更正。
+  服务全部用 `ctx.get` 软取，不写进 `exports.inject`：本插件可能先于 `ui-workspace` 激活；缺 `workspaces` 时「添加工作区」没有候选（只剩「添加目录…」可用），
+  缺 `uiWorkspace` 时选目录不弹、打开会话提示从左侧栏进入，插件其余部分照常工作。`workspaces.list` 改为在 `main` 的 inject factory
+  首次运行时取（面板挂载时），避免 apply 阶段拿到空值。
+
+  `test/client.test.mjs` 的面板测试按新交互重写（18 项）：空名单时工作台为空且不把宿主工作区摊出来、两个添加入口、
+  「添加工作区」只列还没加过的、选中后登记进名单、添加后顺手导入任务与规则、详情列出任务并说明规则跟工作区走、
+  展开详情、「打开会话」带上正确 sessionId、面板内写需求并启动、换不到会话时不发请求、选目录先登记成工作区再进名单、
+  取消不登记、移除只改名单、名单读取失败有提示。
+  `test/integration.test.mjs` 增加 3 项 hub 用例（拒绝非法路径、按工作区返回摘要、重复路径去重），路由断言改为 6 条。
+
+- **入口收敛到左侧栏，会话区不再重复**：会话视图的「本次流程」标签与输入框上方的常驻状态条都已删除，`apply` 现在只注册
+  `sidebar.panellist`（图标）与 `main`（面板本体）两个插槽。流程的全部操作（看产物、确认门禁、退回修复、改规则、开始新流程）搬进
+  面板详情内嵌的同一个工作台组件——会话视图那个 `WorkbenchView` 改名为 `FlowDetail` 并去掉标题头与侧栏折叠，通过
+  `exports.components.FlowDetail` 导出供单测直接渲染（面板里由 `HubPanel` 内嵌，不再有独立插槽）。
+  宿主侧栏只有 264–420px，`.fg-hub-flow` 把原来三列（阶段导航 / 产物 / 门禁设置）压成单列：阶段导航横排、阶段名缩到 11px、
+  门禁与设置依次向下，进度条加边框独立成块。同时删掉 `.fg-dock`、`.fg-welcome` 两组样式与对应的 dock 测试块。
+  面板不属于任何会话，但**第一条流程也能在面板里开**：详情态把 `StartPanel` 的 `sessionId` 换成 `resolveSession`，
+  点开始时才走 `hubActions.sessionForWorkspace(path)`——按 `path` 从 `workspaces.list` 找到 `workspaceId`，
+  再用 `ctx.uiWorkspace.connectWorkspace(workspaceId)` 复用或新建该工作区的会话，拿到 `sessionId` 才发 `start`。
+  换不到会话时只在面板里显示原因，不发请求；`connectWorkspace` 不做界面导航，用户留在面板里。
+  测试：`test/client.test.mjs` 模块契约改为「只注册两个插槽」并新增「两个旧入口都不再注册」，删除滚动归属与 dock 两块共 6 项，
+  全局把 `WorkbenchView` 换成 `FlowDetail`；面板详情断言改为「点任务展开详情，详情里就是完整工作台」（含闸门与阶段设置），
+  并新增 5 项覆盖面板内启动：能写需求、先换会话再 `start`、`brief` 原文透传、成功后提示看列表、换不到会话时不发请求。
+
+- **开发规则可跟工作区走**：此前每次新流程都回到内置五条，用户按项目定制的规则（例如「日志用结构化字段」）
+  每条流程都要手动重勾一遍。现在设置面板新增「保存为工作区默认」/「清除工作区默认」，把当前生效的规则写进
+  `<工作区>/.dsh-flowgate/config.json`；之后同工作区的新流程自动继承，顺序是内置默认 → 工作区默认 → 本次流程临时调整。
+  `view` 新增 `ruleSource`（`flow` / `workspace` / `default`）与 `workspaceRules`（文件路径、是否已配置、保存的 id 与自定义条数），
+  设置面板据此标出来源，避免用户误以为勾选已经持久化。保存后本次流程改为跟随默认，来源标签与行为一致。
+  工作区配置只存规则（`rules.ids` + `rules.custom`），**不存 `writeGrants`、scope 或门禁决策**——这些是一次性授权与流程内状态，
+  跨流程复用等于让授权永久有效；`config.json` 可提交，`flows/` 与 `flows.jsonl` 仍是本机运行记录。
+  同时修掉两处与规则继承冲突的地方：`preset` 动作此前把 `overrides` 重置成 `{angles, directions}`，切档会静默丢掉用户勾选的规则
+  （`upgrade` 早已保留，两处现在一致）；`toggleRule` / `addRule` 此前以 `DEFAULT_RULE_IDS` 为起点，改为以当前生效的一套为起点，
+  否则在工作区默认之上取消一条规则会退回内置默认，把工作区里关掉的规则又打开。
+  `test/host.test.mjs` 增加 9 项覆盖：来源默认值、只改本次不落盘、切档保留勾选、保存后 `config.json` 内容、配置里没有写权限、
+  新宿主实例继承、自定义规则随工作区存下、新流程带出自定义规则、清除后回到内置默认。
+
 - **适配新版子代理协议**：使用 `startActivation` / `getProvider('spawn')`、预留 `childId` 与 `delivery: 'caller'`，
   在执行前登记会话归属；移除对旧 `start` / `list` 和非协议字段 `toolFilter` 的依赖。兼容声明仅覆盖已核对源码的 DSH `0.2.2-rc.3`。
 - **子代理只读由最终工具守卫执行**：通过 `tools.guard` 拒绝写工具和未知变更工具；默认 shell 仅允许精确的 `pwd`，Git 默认拒绝，

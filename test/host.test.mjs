@@ -1421,4 +1421,97 @@ rmSync(cwd, { recursive: true, force: true })
     assert.match(text, /四个阶段已经全部结束/)
   })
 }
+
+// ---------------------------------------------------------------------------
+// A：开发规则跟工作区走（工作区默认 < 本次流程临时调整 < 内置默认）
+// ---------------------------------------------------------------------------
+
+{
+  const wsCwd = mkdtempSync(join(tmpdir(), 'flowgate-ws-'))
+  const configFile = join(wsCwd, '.dsh-flowgate', 'config.json')
+  const stateOf = (target, sid) => target.request('/api/flowgate/state?sessionId=' + sid)
+  const act = (target, sid, action, payload) => target.request('/api/flowgate/action', { sessionId: sid, action, payload })
+
+  const firstSid = 'sess-ws-first'
+  const first = makeHost(wsCwd, firstSid)
+  await first.tool('flowgate_start', { title: '工作区默认规则', preset: 'fast' })
+  const fresh = await stateOf(first, firstSid)
+  check('A 没有 config.json 时规则来源是内置默认', () => {
+    assert.equal(fresh.body.ruleSource, 'default')
+    assert.equal(fresh.body.workspaceRules.configured, false)
+    assert.equal(existsSync(configFile), false)
+  })
+
+  const toggled = await act(first, firstSid, 'toggleRule', { id: 'no-debug-leftovers', enabled: false })
+  check('A 勾选只改本次流程，不写工作区配置', () => {
+    assert.equal(toggled.status, 200)
+    assert.equal(toggled.body.ruleSource, 'flow')
+    assert.ok(!toggled.body.ruleIds.includes('no-debug-leftovers'))
+    assert.equal(existsSync(configFile), false)
+  })
+
+  const switched = await act(first, firstSid, 'preset', { preset: 'strict' })
+  check('A 切档位保留本次流程的规则勾选', () => {
+    assert.equal(switched.status, 200)
+    assert.equal(switched.body.ruleSource, 'flow')
+    assert.ok(!switched.body.ruleIds.includes('no-debug-leftovers'))
+  })
+
+  const saved = await act(first, firstSid, 'saveRuleDefaults', {})
+  check('A 保存为工作区默认后写入 config.json 并转为跟随默认', () => {
+    assert.equal(saved.status, 200)
+    assert.equal(saved.body.ruleSource, 'workspace')
+    assert.equal(saved.body.workspaceRules.configured, true)
+    assert.ok(existsSync(configFile), 'config.json 没有落盘')
+    const config = JSON.parse(readFileSync(configFile, 'utf8'))
+    assert.deepEqual(config.rules.ids, saved.body.ruleIds)
+    assert.equal(config.rules.ids.includes('no-debug-leftovers'), false)
+  })
+  check('A 工作区配置里没有写权限之类的流程内授权', () => {
+    const raw = readFileSync(configFile, 'utf8')
+    assert.equal(raw.includes('writeGrants'), false)
+    assert.equal(raw.includes('needWrite'), false)
+  })
+
+  // 换一个宿主实例：确认规则是从盘上的 config.json 继承来的，不是内存缓存。
+  const secondSid = 'sess-ws-second'
+  const second = makeHost(wsCwd, secondSid)
+  await second.tool('flowgate_start', { title: '继承工作区默认', preset: 'fast' })
+  const inherited = await stateOf(second, secondSid)
+  check('A 同工作区的新流程继承工作区默认规则', () => {
+    assert.equal(inherited.body.ruleSource, 'workspace')
+    assert.deepEqual(inherited.body.ruleIds, saved.body.ruleIds)
+    assert.ok(!inherited.body.ruleIds.includes('no-debug-leftovers'))
+  })
+
+  await act(second, secondSid, 'addRule', { name: '日志用结构化字段', points: ['不拼字符串'] })
+  const savedCustom = await act(second, secondSid, 'saveRuleDefaults', {})
+  const customRule = savedCustom.body.ruleCatalog.find((rule) => rule.name === '日志用结构化字段')
+  check('A 自定义规则能存进工作区默认', () => {
+    assert.ok(customRule, '自定义规则没有生成 id')
+    const config = JSON.parse(readFileSync(configFile, 'utf8'))
+    assert.ok(config.rules.custom.some((rule) => rule.id === customRule.id))
+    assert.deepEqual(config.rules.custom.find((rule) => rule.id === customRule.id).points, ['不拼字符串'])
+  })
+
+  const thirdSid = 'sess-ws-third'
+  const third = makeHost(wsCwd, thirdSid)
+  await third.tool('flowgate_start', { title: '继承自定义规则', preset: 'fast' })
+  const thirdState = await stateOf(third, thirdSid)
+  check('A 新流程的规则目录带出工作区自定义规则', () => {
+    assert.ok(thirdState.body.ruleCatalog.some((rule) => rule.id === customRule.id))
+    assert.ok(thirdState.body.ruleIds.includes(customRule.id))
+    assert.equal(thirdState.body.rules.length, 5)
+  })
+
+  const cleared = await act(third, thirdSid, 'clearRuleDefaults', {})
+  check('A 清除工作区默认后回到内置默认规则', () => {
+    assert.equal(cleared.status, 200)
+    assert.equal(existsSync(configFile), false)
+    assert.equal(cleared.body.ruleSource, 'default')
+    assert.equal(cleared.body.rules.length, 5)
+  })
+
+  rmSync(wsCwd, { recursive: true, force: true })
+}
 console.log('\n全部通过：' + passed.length + ' 项')

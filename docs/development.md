@@ -57,6 +57,8 @@ S2 同时拒绝被识别为变更性的 shell 命令，如 `rm`、`mv`、`sed -i
 | 有阻断发现，但没有落在 scope 外的 CRITICAL / MAJOR | 回到 S2 修复 |
 | 有 CRITICAL / MAJOR 落在 scope 外 | 回到 S1，先更新范围并重新批准 |
 
+工作区默认规则记录在 `.dsh-flowgate/config.json`，与流程快照分开；规则继承顺序见[开发规则](#开发规则)。
+
 回退会重置目标阶段及后续门禁，并清除测试写授权；已有代码保留，不会恢复 Git 状态。回到 S1 另清除当前有效范围和需求文档，需要重新提交并批准。升档重置评审角度和测试方向，保留开发规则选择。
 
 当前版本的 S3「回到需求分析调整 scope」按钮实际会退到 S2。需要调整范围时，先退到 S2，再从 S2 回到 S1。
@@ -68,6 +70,67 @@ S2 同时拒绝被识别为变更性的 shell 命令，如 `rm`、`mv`、`sed -i
 S2 以卡片展示规则清单；`flowgate_status` 返回同一份清单。S3 的正确性和风格评审会将启用规则写入子代理任务，作为检查项。除修改范围守卫外，这些规则依靠检查与评审执行，不代表每一条都有独立的自动阻断机制。
 
 可以在「阶段设置 → 开发规则」中勾选或追加规则，内置规则不可删除。
+
+### 规则跟工作区走
+
+勾选与追加默认只是**本次流程**的临时调整，写在流程快照里，流程结束后就没了。想让同一个工作区的每条流程都从同一套规则起步，在设置里点「保存为工作区默认」，规则会写进：
+
+```text
+<工作区>/.dsh-flowgate/config.json
+```
+
+生效顺序是三层，后者覆盖前者：
+
+| 层 | 存在哪里 | 何时失效 |
+| :--- | :--- | :--- |
+| 内置默认 | 插件代码 | 不会 |
+| 工作区默认 | `.dsh-flowgate/config.json` | 点「清除工作区默认」 |
+| 本次流程临时调整 | `flows/<flowId>.json` 的 `overrides.rules` | 流程结束 |
+
+工作区默认只存规则（启用清单 + 自定义规则），**不存写权限、不存 scope、不存门禁决策**：这些都是一次性授权或流程内状态，跨流程复用等于让授权永久有效。`config.json` 只含 `version` / `updatedAt` / `rules`，可以提交进版本库；`flows/`、`flows.jsonl`、`scope.json` 是运行记录，应当忽略。
+
+界面会明确标出当前来源（内置默认 / 工作区默认 / 本次流程临时调整），保存后本次流程也改为跟随默认，不会出现「标签说跟随默认、实际还是旧勾选」的不一致。切换档位只重置评审角度与测试方向，不动规则选择。
+
+## 左侧栏面板（先选工作区）
+
+插件在左侧栏注册了两个插槽：`sidebar.panellist` 放一个图标入口，`main` 放对应面板，两者的 id 都必须是 `flowgate-hub`（侧栏条目 id 与 `main` 的 key 同名才会打开面板，这是宿主的导航约定）。
+
+面板是**全局面板**，不绑定会话，因此拿不到 `sessionId`。它维护的是一份**用户自己添加的成员名单**，不是宿主工作区全集——没加过任何东西时面板是空的。名单存在用户级目录，不在任何工作区里：
+
+```text
+<DSH_FLOWGATE_HOME | ~/.dsh-flowgate>/hub.json
+  { version, updatedAt, members: [{ path, addedAt }] }
+```
+
+只存绝对路径与添加时间。任务与规则仍留在各自工作区的 `.dsh-flowgate/`，添加时按需读出展示，**不复制、不改写**——那个工作区里改了规则，面板下次读就跟着变。面板有三态：
+
+- **空名单**：只给 **「添加目录…」** 与 **「添加工作区」** 两个入口，不发任何读盘请求。
+- **成员列表**：`POST /api/flowgate/hub/members` 读名单，逐项渲染每个成员的摘要（进行中 / 待确认计数、目录是否还在）。点一个进入详情。
+- **详情**：`POST /api/flowgate/hub`，body `{ paths: [dir] }`。宿主对路径去重后 `loadFlowsFromDisk` 读快照，返回流程摘要（标题、档位、阶段、是否在等门禁、百分比）与规则概况；非绝对路径与非法条目直接丢弃，不报错。头部可「工作区列表」返回、或「移除」把它从名单里拿掉（不动磁盘）。
+
+点开某条流程后内嵌 `FlowDetail`（`lib/client.js` 里那个完整工作台，同时从 `exports.components.FlowDetail` 导出供单测直接渲染）：它在面板里用 `useEntry(sessionId)` 按 1.5 秒轮询取实时状态，门禁确认、退回修复、改规则、追加范围都在面板内完成。宿主侧栏只有 264–420px，`.fg-hub-flow` 把会话页的三列布局压成单列（阶段导航横排、门禁与设置依次向下）。
+
+**面板里也能开第一条流程**：面板没有 `sessionId`，所以详情态的「开始一次新流程」把 `StartPanel` 的 `sessionId` 换成 `resolveSession`——点「开始需求分析」时才向宿主换会话，链路由 `hubActions.sessionForWorkspace(path)` 提供：
+
+1. 从 `ctx.get('workspaces').list.getSnapshot().items` 里按 `path` 找到 `workspaceId`；
+2. `ctx.uiWorkspace.connectWorkspace(workspaceId)` 复用该工作区已连接的会话，没有就新建一个 blank 会话，返回其 `sessionId`；
+3. 用这个 `sessionId` 发 `POST /api/flowgate/action` 的 `start`，成功后 `onStarted` 递增 tick，面板重新读盘就能看到新流程。
+
+任一步失败（目录已不是宿主的 workspace、宿主缺 `uiWorkspace`）都在面板里就地显示原因，**不发 `start`**——宁可不启动，也不要落到别的目录上。换会话不会把用户从面板拽走：`connectWorkspace` 不在 UI 上做导航。
+
+**三个写名单的路由**（都在 `routes()` 里，与 `/hub` 一样要 `sessionId` 之外的独立语义，故单独分出）：
+
+| 路由 | body | 行为 |
+| :--- | :--- | :--- |
+| `POST /api/flowgate/hub/members` | — | 返回 `{ members, file }`，每项是 `hubMemberSummary`：`path` / `name` / `addedAt` / `missing` / `flowCount` / `activeCount` / `waitingCount` / `flows` / `rules`。 |
+| `POST /api/flowgate/hub/add` | `{ path }` | 路径必须是存在的绝对路径（否则 400 `需要一个绝对目录路径` / `这个目录不在这台机器上：<path>`）；已登记则不重复写。返回 `{ member, created, imported }`，`imported` 是这次「顺手导入」的数量（`flows` / `rules` / `customRules`）。 |
+| `POST /api/flowgate/hub/remove` | `{ path }` | 只从名单移除，返回 `{ removed, path }`。不删任何流程或配置。 |
+
+**目录自动登记**：在面板里点 **「添加目录…」** 走 `ctx.uiWorkspace.pickDirectory()`（原生对话框或应用内浏览，取决于装了哪个 directory-picker 实现），取消返回 `null` 就什么都不做；选中后先 `ctx.get('workspaces').create({ path })` 把它登记成工作区（宿主侧幂等，重复选同一目录不会重复登记），再 `POST /hub/add` 加进名单。`create` 失败时把 `WorkspaceCreateError` 的 message 显示在面板里，不加入名单。
+
+**门禁是会话级的工具调用，但不必回会话去点**：门禁本质是一个会话级工具调用在等待（`GateHub` 按 `sessionId` 索引），`/api/flowgate/action` 也要求 `sessionId`。面板本身不绑定会话，但详情里每条流程都带着 `sessionId`（来自磁盘上的流程快照），所以面板能自己发 `/action`：确认、退回、改规则、追加范围都在面板里做完，数据和原来会话视图里那套是同一份。只有要看对话本身时才点 **「打开会话」**，调 `ctx.uiWorkspace.openSession(sessionId)`。`UiWorkspaceService` 是公开的 cordis 服务（构造函数里 `super(ctx, 'uiWorkspace')`），可以直接用。
+
+服务一律 `ctx.get(name)` 软取，不写进 `exports.inject`：本插件可能先于 `ui-workspace` 激活，且缺服务时插件其余部分必须照常工作。缺 `workspaces` 时「添加工作区」没有候选（只剩「添加目录…」可用）、登记会报错；缺 `uiWorkspace` 时目录选择器不弹（返回 `null`）、「打开会话」提示从左侧栏进入。`workspaces.list` 传给面板的时机也推迟到 `main` 的 inject factory 首次运行（面板挂载时），避免在插件 apply 阶段拿到 `undefined`。
 
 ## 工具索引
 
@@ -110,13 +173,21 @@ S2 以卡片展示规则清单；`flowgate_status` 返回同一份清单。S3 �
 
 ### 维护说明插图
 
-首页使用本地 PNG，源脚本为 [render_images.py](render_images.py)。安装 Python 3 和 Pillow 后，在项目根运行 `python docs/render_images.py` 可重新生成两张图；默认使用 Windows 微软雅黑，其他系统可用 `FLOWGATE_DOC_FONT` 和 `FLOWGATE_DOC_FONT_BOLD` 指定中文字体路径。插图是操作示意，更新时需与当前界面核对。
+README 的四张界面图使用真实插件组件与示例数据，通过 [预览页](ui-preview.html) 和 [截图脚本](capture-ui.mjs) 生成；无需启动 DSH。安装开发依赖后，用 Node 22 或更新版本运行截图脚本（需要内置 WebSocket）：
+
+1. 启动独立 Chrome 调试实例，传入 `--headless=new --remote-debugging-port=9229 --allow-file-access-from-files --user-data-dir=<独立临时目录>`，不要使用日常浏览器的用户目录。
+2. 在项目根运行 `node docs/capture-ui.mjs`。调试地址可通过 `FLOWGATE_CDP` 覆盖。
+3. 脚本重拍首页、工作区、拍板和评审详情，并检查 390 / 768 / 1280 像素下的明暗主题。仍应人工核对截图内容和真实 DSH 中的显示。
+
+流程示意图由 [render_images.py](render_images.py) 单独生成。安装 Python 3 和 Pillow 后运行 `python docs/render_images.py`；默认使用 Windows 微软雅黑，其他系统可用 `FLOWGATE_DOC_FONT` 和 `FLOWGATE_DOC_FONT_BOLD` 指定字体。该脚本不会覆盖界面截图。
 
 ### 界面主题与布局
 
 界面颜色来自 DSH 的 `--dsw-alias-*` 主题变量，跟随明暗主题。正文用 `label-primary` 等文字变量，背景用 `bg-base` / `bg-layer-1`，主按钮用 `brand-primary`，状态用 `state-*`。客户端测试会检查颜色字面量和未知变量名。
 
 工作台根节点声明 `data-conversation-composer-overlay`，由自身容器滚动；底部使用 `--dsh-composer-height` 为输入框留白。修改布局时保留这一契约，避免切换标签后滚动位置异常或内容被遮挡。
+
+左侧栏面板没有浮层输入框，由 `.fg-hub > .fg-main` 覆盖为常规内边距，不沿用会话页那段留白。
 
 ## 测试
 

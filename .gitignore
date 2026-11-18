@@ -1,6 +1,8 @@
 node_modules/
 .pnpm-store/
 .tmp-*
-.dsh-flowgate/
+# 工作区默认规则可以提交，其余是本机运行记录。
+.dsh-flowgate/*
+!.dsh-flowgate/config.json
 *.log
 .acl-reports/
