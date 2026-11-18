@@ -205,7 +205,7 @@ function flowPage(body) {
   const flows = flowsByPath.get(body.path) ?? member?.flows ?? []
   const page = body.page || 1
   const pageSize = body.pageSize || 10
-  return { flows: flows.slice((page - 1) * pageSize, page * pageSize), total: flows.length, page, pageSize, totalPages: Math.max(1, Math.ceil(flows.length / pageSize)) }
+  return { flows: flows.slice((page - 1) * pageSize, page * pageSize), currentFlow: flows.find((flow) => !flow.finished && !flow.cancelled) || null, total: flows.length, page, pageSize, totalPages: Math.max(1, Math.ceil(flows.length / pageSize)) }
 }
 function workspaceRules(path) {
   const catalog = baseView('S2').ruleCatalog
@@ -1619,7 +1619,7 @@ const alphaMember = {
   name: 'alpha',
   addedAt: '2026-11-18T08:00:00Z',
   missing: false,
-  activeCount: 2,
+  activeCount: 1,
   waitingCount: 1,
   flowCount: 2,
   updatedAt: '2026-11-18T08:00:00Z',
@@ -1628,6 +1628,11 @@ const alphaMember = {
     { id: 'f1', sessionId: 'sess-alpha-1', title: '会话过期检测', brief: '细节…', preset: 'fast', stage: 'S2', stageLabel: '开发', finished: false, cancelled: false, waiting: true, waitingKind: 'gate', skippedCount: 0, percent: 45, createdAt: '…', updatedAt: '…' },
     { id: 'f2', sessionId: 'sess-alpha-2', title: '导出报表', brief: '', preset: 'strict', stage: 'S4', stageLabel: '测试', finished: true, cancelled: false, waiting: false, waitingKind: null, skippedCount: 1, percent: 100, createdAt: '…', updatedAt: '…' },
   ],
+}
+
+const idleAlphaMember = {
+  ...alphaMember, activeCount: 0, waitingCount: 0,
+  flows: alphaMember.flows.map((flow) => ({ ...flow, finished: true, waiting: false, waitingKind: null })),
 }
 
 const resetHub = (members = []) => {
@@ -1692,7 +1697,7 @@ const resetHub = (members = []) => {
     assert.ok(text.includes('会话过期检测'))
     assert.ok(text.includes('导出报表'))
     assert.ok(text.includes('等你确认'))
-    assert.ok(text.includes('进行中 2 条'))
+    assert.ok(text.includes('进行中 1 条'))
     assert.ok(text.includes('其中 1 条在等你确认'))
   })
   await check('规则摘要常驻，配置路径仅放在 title 中', () => {
@@ -1705,14 +1710,18 @@ const resetHub = (members = []) => {
     assert.ok(flat(card).includes('不留调试残留'))
     assert.ok(findTags(card, 'div').some((node) => node.props.title === '规则配置：.dsh-flowgate/config.json'))
   })
-  await check('已有流程时新建入口默认折叠，summary 保留入口', () => {
-    const start = findTags(renderer.toJSON(), 'details').find((node) => node.props.className?.includes('fg-start-section'))
-    assert.ok(start, '新建流程必须使用可展开的 details')
-    assert.equal(start.props.open, false)
-    assert.equal(flat(findTags(start, 'summary')[0]), '开始新流程')
+  await check('有当前流程时主区提供继续入口，不展示新建表单，记录默认收起', () => {
+    const primary = nodeByClass(renderer.toJSON(), 'fg-workspace-primary')
+    assert.ok(flat(primary).includes('会话过期检测'))
+    assert.ok(flat(primary).includes('S2 · 开发'))
+    assert.ok(hasButton(primary, '继续流程'))
+    assert.equal(findTags(renderer.toJSON(), 'textarea').length, 0)
+    assert.equal(nodeByClass(renderer.toJSON(), 'fg-workspace-card fg-flow-history').props.open, false)
+    const text = flat(renderer.toJSON())
+    assert.ok(text.indexOf('继续流程') < text.indexOf('流程记录'))
   })
 
-  await click(buttonByText(renderer.toJSON(), '会话过期检测'))
+  await click(buttonByText(renderer.toJSON(), '继续流程'))
   const detail = flat(renderer.toJSON())
   await check('点任务展开详情，详情里就是完整工作台', () => {
     assert.ok(detail.includes('会话过期检测'), '详情标题用任务名')
@@ -1738,8 +1747,8 @@ const resetHub = (members = []) => {
 }
 
 {
-  // 面板里直接开一条流程：面板不属于任何会话，所以要先向宿主换一个属于这个工作区的会话。
-  resetHub([alphaMember])
+  // 已有完成记录也直接展开新建表单，启动时才向宿主换取会话。
+  resetHub([idleAlphaMember])
   posted = []
   const asked = []
   const renderer = await render(HubPanel, {
@@ -1777,7 +1786,7 @@ const resetHub = (members = []) => {
 
 {
   // 拿不到会话时不能假装成功：错误就地显示，一个请求都不发。
-  resetHub([alphaMember])
+  resetHub([idleAlphaMember])
   posted = []
   const renderer = await render(HubPanel, {
     useHubWorkspaces: useWorkspacesOf([]),
@@ -1815,10 +1824,11 @@ const resetHub = (members = []) => {
     assert.deepEqual(created, ['D:/repo/beta'])
     assert.deepEqual(addCalls[0], { path: 'D:/repo/beta' })
   })
-  await check('工作区尚无流程时新建入口默认展开', () => {
-    const start = findTags(renderer.toJSON(), 'details').find((node) => node.props.className?.includes('fg-start-section'))
+  await check('工作区尚无流程时新建表单直接位于主区域', () => {
+    const primary = nodeByClass(renderer.toJSON(), 'fg-workspace-primary')
+    const start = findTags(primary, 'section').find((node) => node.props.className?.includes('fg-start-section'))
     assert.ok(start)
-    assert.equal(start.props.open, true)
+    assert.equal(findTags(start, 'details').length, 0)
     assert.ok(findTags(start, 'textarea').some((node) => node.props.required))
     assert.ok(hasButton(start, '开始需求分析'))
   })
@@ -2001,7 +2011,7 @@ await check('工作区规则保存失败保留草稿可重试，自定义编辑�
 })
 
 function numberedFlows(prefix, count) {
-  return Array.from({ length: count }, (_, index) => ({ ...alphaMember.flows[0], id: prefix + '-' + (index + 1), sessionId: prefix + '-session-' + (index + 1), title: prefix + '任务' + String(index + 1).padStart(2, '0') }))
+  return Array.from({ length: count }, (_, index) => ({ ...alphaMember.flows[1], id: prefix + '-' + (index + 1), sessionId: prefix + '-session-' + (index + 1), title: prefix + '任务' + String(index + 1).padStart(2, '0') }))
 }
 
 await check('流程列表通过新接口每页显示十条，翻页清详情，返回后进入其他工作区重置第一页', async () => {
@@ -2113,6 +2123,175 @@ await check('刷新时目录先消失且分页响应迟到，恢复目录后仍�
     flowHandler = null
     await act(async () => { renderer.unmount() })
   }
+})
+
+await check('仅有完成或放弃记录时主区直接新建，历史详情不另开新建表单', async () => {
+  for (const cancelled of [false, true]) {
+    const member = { ...idleAlphaMember, flows: idleAlphaMember.flows.map((flow) => ({ ...flow, cancelled })) }
+    resetHub([member])
+    currentView = baseView('S4', { finished: true, cancelled })
+    const renderer = await renderHub()
+    try {
+      await click(buttonByText(renderer.toJSON(), 'alpha'))
+      const tree = renderer.toJSON()
+      assert.ok(hasButton(nodeByClass(tree, 'fg-workspace-primary'), '开始需求分析'))
+      assert.ok(flat(tree).indexOf('开始新流程') < flat(tree).indexOf('流程记录'))
+      assert.equal(nodeByClass(tree, 'fg-workspace-card fg-flow-history').props.open, false)
+      await click(buttonByText(tree, '导出报表'))
+      assert.equal(findTags(renderer.toJSON(), 'textarea').length, 1, '历史详情不能新增第二个启动表单')
+    } finally { await act(async () => { renderer.unmount() }) }
+  }
+})
+
+await check('当前流程在历史末页仍有主继续入口，翻页和打开结束详情均不暴露新建', async () => {
+  resetHub([alphaMember])
+  const archived = numberedFlows('历史', 22)
+  flowsByPath.set(alphaMember.path, archived.concat([alphaMember.flows[0]]))
+  currentView = baseView('S4', { finished: true })
+  const renderer = await renderHub()
+  try {
+    await click(buttonByText(renderer.toJSON(), 'alpha'))
+    assert.ok(!hasButton(nodeByClass(renderer.toJSON(), 'fg-workspace-card fg-flow-history'), '会话过期检测'))
+    assert.ok(flat(nodeByClass(renderer.toJSON(), 'fg-workspace-primary')).includes('会话过期检测'))
+    await click(buttonByText(renderer.toJSON(), '历史任务01'))
+    assert.equal(findTags(renderer.toJSON(), 'textarea').length, 0)
+    await click(buttonByText(renderer.toJSON(), '下一页'))
+    assert.ok(hasButton(nodeByClass(renderer.toJSON(), 'fg-workspace-primary'), '继续流程'))
+    assert.equal(findTags(renderer.toJSON(), 'textarea').length, 0)
+    currentView = baseView('S2')
+    await click(buttonByText(renderer.toJSON(), '继续流程'))
+    assert.ok(flat(renderer.toJSON()).includes('出口门禁'))
+    assert.ok(flat(renderer.toJSON()).indexOf('出口门禁') < flat(renderer.toJSON()).indexOf('流程记录'))
+    assert.equal(findTags(renderer.toJSON(), 'textarea').length, 0)
+  } finally { await act(async () => { renderer.unmount() }) }
+})
+
+await check('当前流程完成或放弃后刷新恢复主新建表单', async () => {
+  for (const cancelled of [false, true]) {
+    resetHub([alphaMember])
+    const renderer = await renderHub()
+    try {
+      await click(buttonByText(renderer.toJSON(), 'alpha'))
+      assert.ok(hasButton(renderer.toJSON(), '继续流程'))
+      const ended = alphaMember.flows.map((flow) => ({ ...flow, finished: true, cancelled, waiting: false }))
+      flowsByPath.set(alphaMember.path, ended)
+      currentMembers = [{ ...alphaMember, activeCount: 0, waitingCount: 0 }]
+      await click(buttonByText(renderer.toJSON(), '刷新'))
+      assert.ok(!hasButton(renderer.toJSON(), '继续流程'))
+      assert.ok(hasButton(nodeByClass(renderer.toJSON(), 'fg-workspace-primary'), '开始需求分析'))
+    } finally { await act(async () => { renderer.unmount() }) }
+  }
+})
+
+await check('切换工作区等待流程数据时隐藏旧表单和旧继续入口，迟到数据不覆盖', async () => {
+  const beta = emptyMember('beta')
+  resetHub([idleAlphaMember, beta])
+  let release
+  const delayed = new Promise((resolve) => { release = resolve })
+  flowHandler = (body) => body.path === beta.path ? delayed : response(flowPage(body))
+  const renderer = await renderHub()
+  try {
+    await click(buttonByText(renderer.toJSON(), 'alpha'))
+    assert.equal(findTags(renderer.toJSON(), 'textarea').length, 1)
+    await click(buttonByText(renderer.toJSON(), '工作区列表'))
+    await click(buttonByText(renderer.toJSON(), 'beta'))
+    assert.ok(flat(renderer.toJSON()).includes('正在读取当前流程'))
+    assert.equal(findTags(renderer.toJSON(), 'textarea').length, 0)
+    await click(buttonByText(renderer.toJSON(), '工作区列表'))
+    await click(buttonByText(renderer.toJSON(), 'alpha'))
+    await act(async () => { release(response({ ...flowPage({ path: beta.path }), currentFlow: { ...alphaMember.flows[0], title: '迟到的当前流程' } })) })
+    await settle()
+    assert.ok(!flat(renderer.toJSON()).includes('迟到的当前流程'))
+    assert.ok(hasButton(renderer.toJSON(), '开始需求分析'))
+  } finally {
+    release(response(flowPage({ path: beta.path })))
+    flowHandler = null
+    await act(async () => { renderer.unmount() })
+  }
+})
+
+await check('流程读取失败或旧宿主缺少当前流程摘要时禁止新建，并可就地重试', async () => {
+  for (const failure of [response({ error: '读取流程失败' }, 500), response({ flows: [], total: 0 })]) {
+    resetHub([emptyMember('retry')])
+    flowHandler = () => failure
+    posted = []
+    const renderer = await renderHub()
+    try {
+      await click(buttonByText(renderer.toJSON(), 'retry'))
+      const primary = nodeByClass(renderer.toJSON(), 'fg-workspace-primary')
+      assert.ok(flat(primary).includes('读取流程失败') || flat(primary).includes('流程数据不完整'))
+      assert.equal(findTags(renderer.toJSON(), 'textarea').length, 0)
+      assert.equal(posted.length, 0)
+      flowHandler = null
+      await click(buttonByText(primary, '重试'))
+      assert.ok(hasButton(renderer.toJSON(), '开始需求分析'))
+    } finally { flowHandler = null; await act(async () => { renderer.unmount() }) }
+  }
+})
+
+await check('没有宿主会话服务时启动显示原因且不发送 start', async () => {
+  resetHub([emptyMember('no-session')])
+  posted = []
+  const renderer = await renderHub()
+  try {
+    await click(buttonByText(renderer.toJSON(), 'no-session'))
+    await changeValue(findTags(renderer.toJSON(), 'textarea')[0], '测试缺少会话服务')
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    assert.ok(flat(renderer.toJSON()).includes('宿主没有可用的会话'))
+    assert.equal(posted.filter((item) => item.action === 'start').length, 0)
+  } finally { await act(async () => { renderer.unmount() }) }
+})
+
+await check('新建需求草稿跨规则保存、历史分页和刷新保留，工作区间互不串用', async () => {
+  const alpha = { ...emptyMember('alpha'), flowCount: 23 }
+  const beta = emptyMember('beta')
+  resetHub([alpha, beta])
+  flowsByPath.set(alpha.path, numberedFlows('已结束', 23))
+  posted = []
+  const sessions = []
+  const renderer = await renderHub({ sessionForWorkspace: async (path) => { sessions.push(path); return 'draft-start' } })
+  const brief = '先完整保留这份长需求\n保存规则、翻页和刷新后仍可以继续编辑。'
+  const assertDraft = () => {
+    const tree = renderer.toJSON()
+    assert.equal(findTags(tree, 'textarea')[0].props.value, brief)
+    assert.equal(inputByPlaceholder(tree, '默认使用需求第一行').props.value, '入口草稿')
+    assert.equal(buttonByText(tree, '大需求严格执行').props['aria-pressed'], true)
+  }
+  try {
+    await click(buttonByText(renderer.toJSON(), 'alpha'))
+    await changeValue(findTags(renderer.toJSON(), 'textarea')[0], brief)
+    await changeValue(inputByPlaceholder(renderer.toJSON(), '默认使用需求第一行'), '入口草稿')
+    await click(buttonByText(renderer.toJSON(), '大需求严格执行'))
+    await click(buttonByText(renderer.toJSON(), '编辑规则'))
+    await click(buttonByText(ruleDialog(renderer), '保存规则'))
+    assertDraft()
+    await click(buttonByText(renderer.toJSON(), '下一页'))
+    assertDraft()
+    await click(buttonByText(renderer.toJSON(), '刷新'))
+    assertDraft()
+    await click(buttonByText(renderer.toJSON(), '工作区列表'))
+    await click(buttonByText(renderer.toJSON(), 'beta'))
+    assert.equal(findTags(renderer.toJSON(), 'textarea')[0].props.value, '')
+    await changeValue(findTags(renderer.toJSON(), 'textarea')[0], '乙工作区自己的草稿')
+    await click(buttonByText(renderer.toJSON(), '工作区列表'))
+    await click(buttonByText(renderer.toJSON(), 'alpha'))
+    assertDraft()
+    flowHandler = () => response({ error: '临时读取失败' }, 500)
+    await click(buttonByText(renderer.toJSON(), '刷新'))
+    assert.equal(findTags(renderer.toJSON(), 'textarea').length, 0)
+    assert.equal(posted.length, 0)
+    assert.equal(sessions.length, 0)
+    flowHandler = null
+    await click(buttonByText(renderer.toJSON(), '重试'))
+    assertDraft()
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    assert.deepEqual(sessions, [alpha.path])
+    assert.deepEqual(posted.find((item) => item.action === 'start').payload, { title: '入口草稿', brief, preset: 'strict' })
+    assert.equal(findTags(renderer.toJSON(), 'textarea')[0].props.value, '', '成功启动才清空本工作区草稿')
+    await click(buttonByText(renderer.toJSON(), '工作区列表'))
+    await click(buttonByText(renderer.toJSON(), 'beta'))
+    assert.equal(findTags(renderer.toJSON(), 'textarea')[0].props.value, '乙工作区自己的草稿')
+  } finally { flowHandler = null; await act(async () => { renderer.unmount() }) }
 })
 
 // ---------------------------------------------------------------------------

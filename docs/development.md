@@ -106,13 +106,17 @@ S2 以卡片展示规则清单；`flowgate_status` 返回同一份清单。S3 �
 
 - **空名单**：读取用户级名单后，显示 **「添加目录…」** 与 **「添加工作区」** 两个入口。
 - **成员列表**：`POST /api/flowgate/hub/members` 只返回工作区摘要（流程总数、进行中 / 待确认计数、规则概况与目录状态），不返回全量 `flows`。
-- **详情**：上方独立可折叠的「流程记录」卡片按更新时间倒序，每页 10 条，通过 `/hub/flows` 请求当前页；「工作区规则」独立读取与保存。头部可返回工作区列表或移除名单条目，移除不删磁盘记录。
+- **详情**：工作区概览主列优先显示开始或继续流程的入口。没有进行中流程时，「开始新流程」是直接展开的 `section`；有进行中流程时，主列仅显示当前标题、阶段和「继续流程」按钮。「工作区规则」位于 `aside`，窄屏依次排列；「流程记录」在概览与所选流程详情之后，以默认收起的 `details` 展示，仍按更新时间倒序、每页 10 条请求。头部可返回工作区列表或移除名单条目，移除不删磁盘记录。
 
 分页减少响应中的流程数量，不代表没有磁盘扫描；服务端仍需读取或刷新磁盘摘要以统计和排序。兼容接口 `POST /api/flowgate/hub`（`{ paths: [dir] }`）保留流程与规则概况。
 
 点开某条流程后内嵌 `FlowDetail`（`lib/client.js` 里那个完整工作台，同时从 `exports.components.FlowDetail` 导出供单测直接渲染）：它在面板里用 `useEntry(sessionId)` 按 1.5 秒轮询取实时状态，门禁确认、退回修复、改规则、追加范围都在面板内完成。宿主侧栏只有 264–420px，`.fg-hub-flow` 把会话页的三列布局压成单列（阶段导航横排、门禁与设置依次向下）。
 
-**面板里也能开第一条流程**：面板没有 `sessionId`，所以详情态的「开始一次新流程」把 `StartPanel` 的 `sessionId` 换成 `resolveSession`——点「开始需求分析」时才向宿主换会话，链路由 `hubActions.sessionForWorkspace(path)` 提供：
+**面板里也能开第一条流程**：面板没有 `sessionId`，所以工作区主区域的「开始新流程」把 `StartPanel` 的 `sessionId` 换成 `resolveSession`——点「开始需求分析」时才向宿主换会话，链路由 `hubActions.sessionForWorkspace(path)` 提供。入口由 `/hub/flows` 的 `currentFlow` 决定，不从当前历史页推断：完成或放弃后返回 `null`，即恢复新流程表单。内嵌 `FlowDetail` 禁用重新开始入口，避免历史详情出现第二张新需求表单。
+
+新需求草稿在当前工作台面板内按目录保留需求描述、标题和执行档位；保存规则、历史翻页、数据刷新或返回列表后仍可继续编辑，成功启动时只清空对应目录的草稿。宿主重启后，详情接口会按会话目录恢复进行中流程，无需先调用状态工具。流程目录、文件签名或快照读取发生权限等 I/O 错误时返回失败，客户端保留重试入口并隐藏新建表单；已确认损坏的 JSON 仍按原约定跳过。
+
+启动链路：
 
 1. 从 `ctx.get('workspaces').list.getSnapshot().items` 里按 `path` 找到 `workspaceId`；
 2. `ctx.uiWorkspace.connectWorkspace(workspaceId)` 复用该工作区已连接的会话，没有就新建一个 blank 会话，返回其 `sessionId`；
@@ -125,7 +129,7 @@ S2 以卡片展示规则清单；`flowgate_status` 返回同一份清单。S3 �
 | 路由 | body | 行为 |
 | :--- | :--- | :--- |
 | `POST /api/flowgate/hub/members` | — | 返回 `{ members, file }`，成员含路径、名称、目录状态、流程计数、更新时间与规则概况，不含 `flows`。 |
-| `POST /api/flowgate/hub/flows` | `{ path, page, pageSize }` | 返回 `{ flows, total, page, pageSize, totalPages }`；默认每页 10 条，上限 50，按更新时间倒序，越界页归到最后一页。 |
+| `POST /api/flowgate/hub/flows` | `{ path, page, pageSize }` | 返回 `{ flows, currentFlow, total, page, pageSize, totalPages }`；`currentFlow` 从全量摘要按当前排序返回第一条满足 `!finished && !cancelled` 的流程摘要，没有则为 `null`，独立于当前历史页；默认每页 10 条，上限 50，按更新时间倒序，越界页归到最后一页。 |
 | `POST /api/flowgate/hub/rules` | `{ path }` 或 `{ path, rules }` | 省略 `rules` 时读取；传 `{ ids, custom }` 时保存工作区默认，传 `null` 时恢复内置默认；返回 `{ rules }`。 |
 | `POST /api/flowgate/hub/add` | `{ path }` | 路径必须是现存的绝对目录（否则 400 `需要一个绝对目录路径` / `工作区必须是现存目录：<path>`）；已登记则不重复写。返回 `{ member, created, imported }`，`imported` 是这次「顺手导入」的数量（`flows` / `rules` / `customRules`）。 |
 | `POST /api/flowgate/hub/remove` | `{ path }` | 只从名单移除，返回 `{ removed, path }`。不删任何流程或配置。 |
@@ -188,15 +192,22 @@ S2 以卡片展示规则清单；`flowgate_status` 返回同一份清单。S3 �
 | [宿主端](../lib/index.js) | 完全重启 DSH 进程，清除模块导入缓存 |
 | 包中的客户端声明或导出 | 重启 DSH，重新加载 bundle 元数据 |
 
-当前 desktop profile 已通过 `link:D:/Projects/dsh-flowgate` 指向本项目。仅修改宿主 JavaScript 无需重新安装，但必须完全退出并重启 DSH 才加载新模块，浏览器刷新不会生效。本次子代理修复无需客户端改动；本会话不执行重启，重启后的实机验证另行补记。不要仅凭源码或单测已更新就认定当前运行的 DSH 已加载新代码。
+desktop profile 使用 `link:D:/Projects/dsh-flowgate` 时会直接指向本项目。仅修改宿主 JavaScript 无需重新安装，但必须完全退出并重启 DSH 才加载新模块；之后刷新原有 GUI 地址，客户端产物也需按上表重建。只刷新浏览器不会更新宿主模块。不要仅凭源码、预览或单测已更新就认定当前运行的 DSH 已加载新代码。
 
 ### 维护说明插图
 
-README 的五张界面图使用真实插件组件与示例数据，通过 [预览页](ui-preview.html) 和 [截图脚本](capture-ui.mjs) 生成；无需启动 DSH。安装开发依赖后，用 Node 22 或更新版本运行截图脚本（需要内置 WebSocket）：
+README 的界面图使用真实插件组件与示例数据；[预览页](ui-preview.html) 以 `file:` 加载组件，不代表真实 DSH 已部署或加载新代码。[截图脚本](capture-ui.mjs) 只更新 [工作区截图](images/workspace.png)，其他界面仅验证，不覆盖已有图片。使用现有开发依赖与 Node 22 或更新版本（需要内置 WebSocket）：
 
-1. 启动独立 Chrome 调试实例，传入 `--headless=new --remote-debugging-port=9229 --allow-file-access-from-files --user-data-dir=<独立临时目录>`，不要使用日常浏览器的用户目录。
-2. 在项目根运行 `node docs/capture-ui.mjs`。调试地址可通过 `FLOWGATE_CDP` 覆盖。
-3. 脚本重拍首页、含分页卡片的工作区、工作区规则弹窗、拍板和评审详情，并检查 390 / 768 / 1280 像素下的明暗主题。仍应人工核对截图内容和真实 DSH 中的显示。
+1. 连接已有 Chrome CDP，或启动独立调试实例，传入 `--headless=new --remote-debugging-port=9229 --allow-file-access-from-files --user-data-dir=<独立临时目录>`，不要使用日常浏览器的用户目录。
+2. 在项目根运行 `node docs/capture-ui.mjs`；只验证、不改图片时运行 `node docs/capture-ui.mjs --verify-only`。调试地址可通过 `FLOWGATE_CDP` 覆盖。脚本新建独立标签，完成后关闭，保留原有标签与页面。
+3. 脚本在 390 / 768 / 1280 像素、明暗主题下检查空闲但有已结束历史、进行中、完成后与放弃后的布局，同时验证历史展开/收起、每页 10 条分页，以及键盘启动、继续和历史操作。预览可用 `?stage=workspace&state=idle|active|finished|cancelled&theme=light|dark` 切换；进行中样例位于历史第三页，用于检查主入口独立于分页。
+4. 人工核对生成的工作区图；真实 DSH 仍需按宿主方式构建并刷新其原有 GUI 地址，再单独验证。
+
+**回归验证**：源码语法检查及宿主、子代理、集成、客户端、安装五套测试全部通过。新增覆盖无工具预热的宿主重启恢复、目录扫描/文件签名/快照读取错误的连续重试与恢复，以及规则保存、分页、刷新、目录切换后的需求草稿保留和成功启动清理。
+
+**主入口改造验证记录**：使用 Node 24.21.0、Chrome 157.0.8103.51，78 个场景、138 次布局快照、296 项检查全部通过，无脚本异常、横向溢出或布局检查失败。覆盖 1280 / 768 / 390 像素与明暗主题，包含空闲但有已结束历史、进行中、完成后、放弃后，以及其他既有页面；验证了键盘启动与继续、历史 Enter/Space 开合、每页 10 条分页、历史详情无重启表单、完成或放弃后恢复主表单。仅更新 [工作区截图](images/workspace.png)，原有浏览器标签与页面保持不变。
+
+以上结果来自 `file:` 预览加载源码组件与模拟接口，不证明真实 DSH 已加载改动。对 [原有 GUI](http://127.0.0.1:52902) 的只读检查返回 `dsh web authentication required`；独立浏览器会话没有原会话认证信息，因此真实 GUI 的部署加载、运行宿主的新接口与实际门禁交互未覆盖，需另行验证。
 
 流程示意图由 [render_images.py](render_images.py) 单独生成。安装 Python 3 和 Pillow 后运行 `python docs/render_images.py`；默认使用 Windows 微软雅黑，其他系统可用 `FLOWGATE_DOC_FONT` 和 `FLOWGATE_DOC_FONT_BOLD` 指定字体。该脚本不会覆盖界面截图。
 

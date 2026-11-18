@@ -1108,9 +1108,11 @@ rmSync(cwd, { recursive: true, force: true })
   await tick()
   // 新实例 = 宿主重启：内存等待器全没了，只剩磁盘上的流程快照。
   const second = makeHost(cwd, 'sess-reboot')
-  await second.tool('flowgate_status', {})
+  const listed = await second.request('/api/flowgate/hub', { paths: [cwd] })
+  assert.ok(listed.body.workspaces[0].flows.some((flow) => flow.sessionId === 'sess-reboot' && !flow.finished))
+  // 不调用任何工具预热：工作台应能从磁盘摘要直接进入完整详情。
   const restored = await second.request('/api/flowgate/state?sessionId=sess-reboot')
-  check('宿主重启后仍能看到待批准的需求文档', () => {
+  check('宿主重启后直接打开工作台可恢复待批准文档，无需先调用工具', () => {
     assert.equal(restored.body.active, true)
     assert.equal(restored.body.stage, 'S1')
     assert.equal(restored.body.finished, false)
@@ -1567,13 +1569,14 @@ rmSync(cwd, { recursive: true, force: true })
       assert.equal(last.body.flows.length, 5)
       assert.equal(capped.body.pageSize, 50)
       assert.equal(first.body.flows[0].brief.length, 200)
+      assert.equal(first.body.currentFlow, null, '只有已结束记录时没有当前流程')
       assert.equal(members.body.members[0].flowCount, 25)
       assert.equal(Object.hasOwn(members.body.members[0], 'flows'), false)
       assert.equal(snapshotReads, 25, '翻页/成员刷新不可重新读取完整快照')
     })
     const emptyPage = await post('flows', { path: empty, page: 99 })
     check('Hub 空集固定第一页且总页数为1', () => {
-      assert.deepEqual(emptyPage.body, { flows: [], total: 0, page: 1, pageSize: 10, totalPages: 1 })
+      assert.deepEqual(emptyPage.body, { flows: [], currentFlow: null, total: 0, page: 1, pageSize: 10, totalPages: 1 })
     })
     for (const body of [{ page: 0 }, { page: -1 }, { page: 1.5 }, { page: '2' }, { page: null }, { page: Number.MAX_SAFE_INTEGER + 1 }, { pageSize: 0 }, { pageSize: '10' }, { pageSize: null }]) {
       assert.equal((await post('flows', { path: ws, ...body })).status, 400)
@@ -1668,10 +1671,14 @@ rmSync(cwd, { recursive: true, force: true })
     const state = await cx.request('/api/flowgate/state?sessionId=hub-new-flow')
     const beforeMemoryRead = snapshotReads
     const livePage = await post('flows', { path: ws, pageSize: 50 })
+    const liveLastPage = await post('flows', { path: ws, page: 3 })
     check('Hub 保存刷新服务缓存，新流程继承规则并立即更新流程计数', () => {
       assert.deepEqual(state.body.ruleIds, ['scope-only', custom.id])
       assert.equal(state.body.ruleSource, 'workspace')
       assert.equal(livePage.body.total, 26)
+      assert.equal(livePage.body.currentFlow.id, state.body.id)
+      assert.equal(liveLastPage.body.currentFlow.id, state.body.id, '当前流程不随历史分页变化')
+      assert.ok(!liveLastPage.body.flows.some((flow) => flow.id === state.body.id))
       assert.ok(livePage.body.flows.some((flow) => flow.id === state.body.id && !flow.finished))
       assert.equal(snapshotReads, beforeMemoryRead, 'persist 已更新摘要，无需重新解析快照')
     })
@@ -1686,6 +1693,7 @@ rmSync(cwd, { recursive: true, force: true })
     await cx.request('/api/flowgate/action', { sessionId: 'hub-new-flow', action: 'cancel', payload: {} })
     const cancelled = await post('members', {})
     assert.equal(cancelled.body.members[0].activeCount, 0)
+    assert.equal((await post('flows', { path: ws })).body.currentFlow, null, '放弃后恢复空闲主入口')
     check('Hub 内存状态优先，取消后摘要计数立即刷新', () => {})
 
     writeFileSync(configFile, JSON.stringify({ version: 1, rules: { ids: ['match-style', 'unknown', 'match-style'], custom: [] } }))
@@ -1709,6 +1717,69 @@ rmSync(cwd, { recursive: true, force: true })
     check('Hub 已移除成员或已消失目录拒绝读取和写入', () => {})
   } finally {
     Object.assign(fs, originals)
+    syncBuiltinESMExports()
+    if (previousHome === undefined) delete process.env.DSH_FLOWGATE_HOME
+    else process.env.DSH_FLOWGATE_HOME = previousHome
+    rmSync(root, { recursive: true, force: true })
+  }
+}
+// 读取失败不能被当成空闲；恢复权限后同一个服务实例必须可以重试。
+{
+  const root = mkdtempSync(join(tmpdir(), 'flowgate-hub-read-failure-'))
+  const ws = join(root, 'workspace')
+  mkdirSync(ws)
+  const previousHome = process.env.DSH_FLOWGATE_HOME
+  process.env.DSH_FLOWGATE_HOME = join(root, 'home')
+  const original = { readdirSync: fs.readdirSync, statSync: fs.statSync, readFileSync: fs.readFileSync }
+  try {
+    const first = makeHost(ws, 'read-existing')
+    await first.tool('flowgate_start', { title: '不能被漏掉的流程', preset: 'fast' })
+    const state = (await first.request('/api/flowgate/state?sessionId=read-existing')).body
+    await first.request('/api/flowgate/hub/add', { path: ws })
+    const flowsDir = join(ws, '.dsh-flowgate', 'flows')
+    const snapshot = join(flowsDir, state.id + '.json')
+    for (const [kind, method, target, code] of [
+      ['目录扫描', 'readdirSync', flowsDir, 'EACCES'],
+      ['文件签名', 'statSync', snapshot, 'EPERM'],
+      ['快照读取', 'readFileSync', snapshot, 'EACCES'],
+    ]) {
+      // 快照改动使每个场景都需要重新读取，不能被前一场景的摘要缓存命中。
+      const flow = JSON.parse(original.readFileSync(snapshot, 'utf8'))
+      flow.title += '。'
+      writeFileSync(snapshot, JSON.stringify(flow))
+      fs[method] = function (file, ...args) {
+        if (String(file) === target) throw Object.assign(new Error(kind + '失败 ' + code), { code })
+        return original[method].call(this, file, ...args)
+      }
+      syncBuiltinESMExports()
+      const restarted = makeHost(ws, 'read-new')
+      for (let retry = 0; retry < 2; retry++) {
+        const page = await restarted.request('/api/flowgate/hub/flows', { path: ws })
+        assert.equal(page.status, 500)
+        assert.match(page.body.error, new RegExp(code))
+        if (method !== 'statSync') {
+          const start = await restarted.request('/api/flowgate/action', {
+            sessionId: 'read-new', action: 'start', payload: { title: '不能误启动', brief: '读取失败时不能创建流程', preset: 'fast' },
+          })
+          assert.equal(start.status, 409)
+          assert.match(start.body.error, new RegExp(code))
+        }
+      }
+      Object.assign(fs, original)
+      syncBuiltinESMExports()
+      const page = await restarted.request('/api/flowgate/hub/flows', { path: ws })
+      const restored = await restarted.request('/api/flowgate/state?sessionId=read-existing')
+      check('Hub ' + kind + '失败显式报错，连续重试安全且恢复后能继续原流程', () => {
+        assert.equal(page.status, 200)
+        assert.equal(page.body.currentFlow.id, state.id)
+        assert.equal(restored.status, 200)
+        assert.equal(restored.body.active, true)
+        assert.equal(restored.body.id, state.id)
+        assert.equal(page.body.total, 1)
+      })
+    }
+  } finally {
+    Object.assign(fs, original)
     syncBuiltinESMExports()
     if (previousHome === undefined) delete process.env.DSH_FLOWGATE_HOME
     else process.env.DSH_FLOWGATE_HOME = previousHome
