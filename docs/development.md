@@ -157,11 +157,26 @@ S2 以卡片展示规则清单；`flowgate_status` 返回同一份清单。S3 �
 
 ### 宿主子代理协议
 
-当前仅按 DSH `0.2.2-rc.3` 官方源码核对契约，兼容声明收窄到该精确版本。使用 `subagents.startActivation` 与 `getProvider('spawn')`，不再支持旧的 `start` / `list`。启动前预留 `childId` 并登记会话归属和只读限制，使用 `delivery: 'caller'`；返回值为 `{ childId, name, messageId, result, dispose }`。新版协议没有 `toolFilter` 字段，不能依靠它剥离写工具。
+已按 DSH `0.2.2-rc.5` 官方源码核对契约，`startActivation` / `getProvider` / `prepareContinuable` / `delivery` / `dispose` 的签名与 rc.3 一致。使用 `subagents.startActivation` 与 `getProvider('spawn')`，不再支持旧的 `start` / `list`。启动前预留 `childId` 并登记会话归属和只读限制，使用 `delivery: 'caller'`；返回值为 `{ childId, name, messageId, result, dispose }`。新版协议没有 `toolFilter` 字段，不能依靠它剥离写工具。
 
 能力探测区分服务缺失、接口不匹配、`spawn` provider 缺失、不支持预留 `childId`、`tools.guard` 最终守卫缺失；任一条件不满足时，`canSpawn` 为 `false`，启动入口报告具体原因并且不启动子代理。执行失败或报告无效同样保留原因，评审降级为 `advisory` / `MINOR`，测试记为 `uncovered`。`by: 'subagents'` 仅表示调用路径，不能证明子代理执行或报告成功。
 
 启动信号只控制 activation 发布前的取消；已发布的 activation 在取消、超时或放弃时必须调用 `dispose` 停止并释放。取消后不再启动后续角度或方向，也不写入迟到的聚合结果。确认 `dispose` 成功后才解除子会话守卫；启动无回执或释放失败时，错误包含子会话 ID，并保留只读隔离、撤销写授权。宿主的启动 reject 可能发生在消息已经投递之后，不能当作未执行的证明。用户自行启动的其他任务仍需自行停止。
+
+### DSH 版本兼容声明
+
+`engines.dsh` 是宿主唯一读取的准入字段：宿主 preflight 一旦发现它存在，就**只**按它判定，`peerDependencies` 被忽略；判定方式是 `semver.satisfies(运行时版本, 范围, { includePrerelease: true })`。
+
+因此 `engines.dsh` 必须写成**范围**，不能写精确版本。写成 `0.2.2-rc.3` 的后果不是「提示版本不符」，而是宿主在启动时把这一行标成 `disabled`，只在 stderr 留一句 `disabling profile plugin ...`：插件界面和工具全部消失，看起来像插件坏了。
+
+当前声明为 `>=0.2.2-rc.3 <0.3.0-0`，要点两条：
+
+- 下界必须带 prerelease（`>=0.2.2-rc.3`）。写成 `>=0.2.2` 会拒绝 rc.3、rc.5 这些预发布版本。
+- 上界必须写 `<0.3.0-0`。写成 `<0.3.0` 仍会放行 `0.3.0-rc.1` 这类预发布版本。
+
+`dsh.compatibility.*` 只是商城口径，宿主不读，但必须与 `engines.dsh` 保持一致，否则商城显示与实际准入会打架。`dshReleases` 逐版本记录已核对源码的宿主版本。
+
+`test/install.test.mjs` 内置一份最小 semver 判定，把「`engines.dsh` 是范围」「范围接受 0.2.2 全系、拒绝 0.1.x 与 0.3.0」「商城口径与之一致」钉成断言。以后升级 DSH 时：核对新版本契约 → 在 `dshReleases` 补一条 → 确认断言里的版本清单仍然成立。
 
 ## 修改代码后如何生效
 

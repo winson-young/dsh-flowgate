@@ -6,6 +6,20 @@
 
 历史记录中的 `by: 'subagents'` 仅表明调用了子代理聚合入口；聚合报告通过、`blocking: 0` 或流程走完，均不能证明真实子代理成功执行并返回有效报告。下文原有结论保留，其证据范围受此限定。
 
+## DSH 0.2.2-rc.5 兼容核对（2026-11-18）
+
+| 核对项 | 结果 | 依据 |
+| :--- | :--- | :--- |
+| 宿主准入（导致「插件不兼容」的直接原因） | 已修复 | 原 `engines.dsh` 是精确版本 `0.2.2-rc.3`，宿主升到 rc.5 后 preflight 判定不满足，把插件行标成 `disabled`，界面与工具全部消失。改为范围 `>=0.2.2-rc.3 <0.3.0-0` |
+| `subagents` 协议 | 未变 | rc.5 源码中 `startActivation` / `getProvider` / `SubagentActivationSpec`（含 `delivery`、预留 `childId`）/ `SubagentActivation` / `prepareContinuable` 签名与 rc.3 一致 |
+| 工具侧契约 | 未变 | `tools.register`、`tools.guard`、`tools/pre-execute`（`PreToolDecision`）均在 rc.5 存在 |
+| 会话与唤醒 | 未变 | `agents` 服务的 `get(id)`、`agent.followup(message)` 仍在 |
+| 客户端契约 | 未变 | `dsh.client` 只认 `platform` / `inject` / `external` / `immediately`；`sidebar.panellist`、`main` 插槽与 `uiWorkspace`（`pickDirectory` / `openSession` / `connectWorkspace`）、`workspaces.create({ path })` 均在 rc.5 存在 |
+| 自动化验证 | `pnpm test` 全通过 | 宿主 128、子代理 46、集成 28、客户端 118、安装 17；其中安装就绪度新增 4 项把兼容范围钉成断言 |
+| 重启后实机验证 | 未执行 | 需要完全退出并重启 DSH 后才载入新清单；本轮在运行中的宿主里无法完成 |
+
+准入判定用与宿主相同的规则复刻在 [`test/install.test.mjs`](../test/install.test.mjs)：宿主只看 `engines.dsh`（存在时忽略 `peerDependencies`），并按 `semver.satisfies(..., { includePrerelease: true })` 判定。
+
 ## 新版子代理修复验证（2026-11-18，DSH 0.2.2-rc.3）
 
 | 验证层次 | 当前状态 | 范围与限制 |
@@ -15,7 +29,7 @@
 | 语法与补丁检查 | `pnpm run check`、`git diff --check` 通过 | 对宿主和客户端入口执行语法检查；本轮未修改客户端 |
 | 重启后的实机验证 | 未执行 | 仍需核实真实 activation 执行、有效报告、最终守卫拒写和取消清理；历史聚合结果不能代替本轮证据 |
 
-兼容元数据仅声明上述已核对的精确版本，保留 Node `>=20` 要求。默认只读 shell 仅接受精确的 `pwd`；Git、`script_path`、解释器和包测试脚本默认拒绝，变更性 shell 仅在 S4 对应方向的 `needsWrite` 与用户 `writeGrants` 同时满足时放行，代码写工具仍拒绝。
+兼容元数据当时声明的是上述已核对的精确版本；此后已改为范围 `>=0.2.2-rc.3 <0.3.0-0`（见[开发与维护](development.md#dsh-版本兼容声明)），因为精确版本会让宿主在每次小版本升级时静默禁用插件。Node `>=20` 要求不变。默认只读 shell 仅接受精确的 `pwd`；Git、`script_path`、解释器和包测试脚本默认拒绝，变更性 shell 仅在 S4 对应方向的 `needsWrite` 与用户 `writeGrants` 同时满足时放行，代码写工具仍拒绝。
 
 当前 desktop profile 使用 `link:D:/Projects/dsh-flowgate`。本轮仅改宿主 JavaScript 时无需重新安装，也无需客户端改动；完全退出并重启 DSH 后才加载新模块，浏览器刷新无效。本会话不重启，实机结果待实际验证后补记。
 

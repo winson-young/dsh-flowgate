@@ -28,6 +28,66 @@ async function check(name, fn) {
 
 console.log('flowgate 安装就绪度检查（profile: ' + PROFILE + '）')
 
+// ---------------------------------------------------------------------------
+// 最小 semver 判定：宿主用 semver.satisfies(version, range, { includePrerelease: true })
+// 决定插件能否加载，这里只实现插件声明会用到的那部分，用来把兼容声明钉进测试。
+// ---------------------------------------------------------------------------
+
+function parseVersion(text) {
+  const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(String(text).trim())
+  if (!m) throw new Error('无法解析版本号：' + text)
+  return { nums: [Number(m[1]), Number(m[2]), Number(m[3])], pre: m[4] ? m[4].split('.') : [] }
+}
+
+function comparePre(a, b) {
+  // 没有 prerelease 的版本高于任何同号 prerelease 版本。
+  if (!a.length && !b.length) return 0
+  if (!a.length) return 1
+  if (!b.length) return -1
+  for (let i = 0; i < Math.max(a.length, b.length); i += 1) {
+    const x = a[i]
+    const y = b[i]
+    if (x === undefined) return -1
+    if (y === undefined) return 1
+    const nx = /^\d+$/.test(x)
+    const ny = /^\d+$/.test(y)
+    if (nx && ny) {
+      const delta = Number(x) - Number(y)
+      if (delta !== 0) return delta < 0 ? -1 : 1
+    } else if (nx !== ny) {
+      return nx ? -1 : 1
+    } else if (x !== y) {
+      return x < y ? -1 : 1
+    }
+  }
+  return 0
+}
+
+function compareVersion(a, b) {
+  const va = parseVersion(a)
+  const vb = parseVersion(b)
+  for (let i = 0; i < 3; i += 1) {
+    if (va.nums[i] !== vb.nums[i]) return va.nums[i] < vb.nums[i] ? -1 : 1
+  }
+  return comparePre(va.pre, vb.pre)
+}
+
+function satisfiesRange(version, range) {
+  const clauses = String(range).trim().split(/\s+/).filter(Boolean)
+  if (!clauses.length) throw new Error('空的版本范围')
+  return clauses.every((clause) => {
+    const m = /^(>=|<=|>|<|=)?\s*(.+)$/.exec(clause)
+    if (!m) throw new Error('无法解析的范围片段：' + clause)
+    const op = m[1] ?? '='
+    const cmp = compareVersion(version, m[2])
+    if (op === '>=') return cmp >= 0
+    if (op === '<=') return cmp <= 0
+    if (op === '>') return cmp > 0
+    if (op === '<') return cmp < 0
+    return cmp === 0
+  })
+}
+
 const profileJsonPath = join(PROFILE, 'package.json')
 let profile = null
 
@@ -73,6 +133,36 @@ await check('parseDshClient：dsh.client 是对象且 platform/inject 合法', (
 
 await check('platform 是 web（否则宿主直接跳过该客户端行）', () => {
   assert.equal(pkg?.dsh?.client?.platform, 'web')
+})
+
+await check('engines.dsh 声明版本范围而不是精确版本', () => {
+  const range = pkg?.engines?.dsh
+  assert.equal(typeof range, 'string', '缺少 engines.dsh：宿主会回落到 peerDependencies 判定')
+  // 精确版本会让宿主每次小版本升级都静默禁用插件，这里必须一直是范围。
+  assert.match(range, /[<>]/, 'engines.dsh 必须是范围（例如 >=0.2.2-rc.3 <0.3.0-0），不能写死精确版本：' + range)
+})
+
+await check('engines.dsh 的范围覆盖 0.2.2 全系、拦住 0.3.0 与更老的 0.1.x', () => {
+  const range = pkg?.engines?.dsh
+  for (const version of ['0.2.2-rc.3', '0.2.2-rc.5', '0.2.2', '0.2.3', '0.2.99']) {
+    assert.ok(satisfiesRange(version, range), range + ' 应当接受 ' + version)
+  }
+  for (const version of ['0.1.5', '0.2.2-rc.2', '0.3.0-0', '0.3.0', '0.3.1']) {
+    assert.ok(!satisfiesRange(version, range), range + ' 不应当接受 ' + version)
+  }
+})
+
+await check('商城口径 dsh.compatibility.dsh 与 engines.dsh 一致', () => {
+  assert.equal(pkg?.dsh?.compatibility?.dsh, pkg?.engines?.dsh)
+})
+
+await check('dshReleases 记录的版本都落在声明范围内', () => {
+  const range = pkg?.engines?.dsh
+  const releases = pkg?.dsh?.compatibility?.dshReleases ?? {}
+  assert.ok(Object.keys(releases).length > 0, 'dshReleases 不能为空')
+  for (const version of Object.keys(releases)) {
+    assert.ok(satisfiesRange(version, range), 'dshReleases 里的 ' + version + ' 不在 ' + range + ' 内')
+  }
 })
 
 let clientPath = null

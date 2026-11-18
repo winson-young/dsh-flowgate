@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **兼容 DSH 0.2.2-rc.5：`engines.dsh` 改成版本范围**：原来写死精确版本 `0.2.2-rc.3`，宿主升到 rc.5 后准入判定不满足，preflight 把插件行标成 `disabled`，只在 stderr 留一句 `disabling profile plugin ...`——界面与工具全部消失，看起来像插件坏了。现在声明 `>=0.2.2-rc.3 <0.3.0-0`：接受 0.2.2 全系（含 rc.3、rc.5 与后续 0.2.x），挡住 0.1.x 与 0.3.0。下界保留 prerelease、上界写成 `-0` 都是必须的，否则会分别拒绝 rc 版本、放行 0.3.0-rc。
+  `dsh.compatibility.dsh` 同步为同一范围，`dshReleases` 补记 rc.5。已按 rc.5 官方源码逐个核对用到的契约：`subagents.startActivation` / `getProvider` / `prepareContinuable` / `delivery`、`tools.guard`、`tools/pre-execute`、`agents.get` 与 `agent.followup`、`sidebar.panellist` 与 `main` 插槽、`uiWorkspace`（`pickDirectory` / `openSession` / `connectWorkspace`）、`workspaces.create({ path })` —— 签名与 rc.3 一致，无需改调用方式。
+  `lib/index.js` 的子代理能力探测不再把宿主版本号写进报错，改为指出缺少哪个接口。`test/install.test.mjs` 内置一份最小 semver 判定，与宿主的 `semver.satisfies(..., { includePrerelease: true })` 同规则，把「必须是范围」「覆盖 0.2.2 全系」「挡住 0.1.x 与 0.3.0」「商城口径与引擎声明一致」钉成 4 项断言，防止以后又改回精确版本。
+
 - **新增左侧栏「流程工作台」，从空名单起步**：此前只能进到某个会话里看那条流程，跨项目的情况得挨个会话翻。
   现在左侧图标列多一个入口，第一次打开是**空的**——面板不替你把磁盘上的项目翻一遍，只认你自己加过的那些。
   两个添加入口：**「添加目录…」** 调起宿主目录选择器（`ctx.uiWorkspace.pickDirectory()`），选中的目录若还不是工作区就用
@@ -54,7 +58,7 @@
   新宿主实例继承、自定义规则随工作区存下、新流程带出自定义规则、清除后回到内置默认。
 
 - **适配新版子代理协议**：使用 `startActivation` / `getProvider('spawn')`、预留 `childId` 与 `delivery: 'caller'`，
-  在执行前登记会话归属；移除对旧 `start` / `list` 和非协议字段 `toolFilter` 的依赖。兼容声明仅覆盖已核对源码的 DSH `0.2.2-rc.3`。
+  在执行前登记会话归属；移除对旧 `start` / `list` 和非协议字段 `toolFilter` 的依赖。当时兼容声明收窄到已核对源码的 DSH `0.2.2-rc.3`，现已改为版本范围（见上方 rc.5 条目）。
 - **子代理只读由最终工具守卫执行**：通过 `tools.guard` 拒绝写工具和未知变更工具；默认 shell 仅允许精确的 `pwd`，Git 默认拒绝，
   `script_path`、解释器及包测试脚本无法证明只读时拒绝。S4 仅在方向 `needsWrite` 与用户 `writeGrants` 同时满足时允许变更性 shell，代码写工具仍拒绝。
 - **取消释放已发布的 activation**：取消、超时和放弃时调用 `dispose`，停止后续角度 / 方向并拒收迟到聚合；启动无回执或清理失败时保留只读隔离、撤销写授权并报告子会话 ID。
@@ -136,7 +140,7 @@
 - **空态换成需求描述输入框**：不再是「只能填一个标题」。填写的原文作为 `brief` 随启动提交，
   宿主用它派生标题（第一行、去 markdown 前缀与句末标点、超 40 字截断），`flowgate_status` 摘要里带上原文，
   Agent 在 S1 直接读需求提问而不用用户复述；`flowgate_start` 增加可选 `brief` 参数。
-- 188 项测试：宿主状态机（80）、假宿主集成（23）、客户端真渲染点击（72）、安装就绪度（13）。
+- 337 项测试：宿主状态机（128）、子代理协议（46）、假宿主集成（28）、客户端真渲染点击（118）、安装就绪度（17）。
 - 实机验证 D4 的另一半：评审发现落在冻结 scope 外时点升档，实测回退到 S1（`upgrade-scope-overflow`）、
   scope 解冻（`scope.data: null`），重新批准时把越界文件补进 scope 后才继续开发。
 
