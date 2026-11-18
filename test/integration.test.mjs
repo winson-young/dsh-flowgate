@@ -15,18 +15,20 @@ function makeHost() {
   const tools = new Map()
   const routes = new Map()
   const listeners = new Map()
-  // 只读过滤用的工具可见性：与 flowgate 自己注册的工具分开，避免污染 host.tools 的断言。
-  const visible = new Set([
-    'write', 'edit', 'str_replace_editor', 'subagent', 'subagent_fork', 'workflow', 'send_message', 'web_search',
-  ])
+  const guards = []
   // 假子代理：捕获 spawn 请求，立即返回一份结构化报告。
   const spawns = []
   const subagents = {
-    list: () => ['spawn'],
-    async start(provider, request) {
-      spawns.push({ provider, request })
+    getProvider(name) { return name === 'spawn' ? { prepareContinuable() {} } : undefined },
+    async startActivation(request) {
+      const entry = { provider: request.provider, request, released: false }
+      spawns.push(entry)
+      const write = execFor(request.childId, 'ops_write_file', { path: 'src/auth/session.ts' })
+      assert.ok(guards.some((guard) => guard(write)), '启动返回前真实 childId 已受最终守卫保护')
       return {
-        id: 'child-' + spawns.length,
+        childId: request.childId,
+        name: 'child-' + spawns.length,
+        messageId: 'message-' + spawns.length,
         result: Promise.resolve({
           stopReason: 'completed',
           output: [{
@@ -38,11 +40,14 @@ function makeHost() {
             }),
           }],
         }),
-        dispose: async () => {},
+        dispose: async () => {
+          assert.ok(guards.some((guard) => guard(write)), '释放过程中仍保留最终守卫')
+          entry.released = true
+        },
       }
     },
   }
-  const host = { tools, routes, listeners, spawns }
+  const host = { tools, routes, listeners, spawns, guards }
   const ctx = {
     inject(_deps, cb) { cb(ctx) },
     effect(fn) { const d = fn(); return typeof d === 'function' ? d : () => {} },
@@ -68,8 +73,8 @@ function makeHost() {
     },
     tools: {
       register(def) { tools.set(def.name, def); return () => {} },
-      // spawnReadonlyChild 用 tools.get 与 READONLY_DENY 取交集。
-      get(name) { return tools.get(name) ?? (visible.has(name) ? { name } : undefined) },
+      get(name) { return tools.get(name) },
+      guard(check) { guards.push(check); return () => { guards.splice(guards.indexOf(check), 1) } },
     },
     connection: { fetch: { register(spec) { routes.set(spec.path, spec); return () => {} } } },
     workingDirectory: { ensure: async () => CWD },
@@ -180,7 +185,8 @@ await check('AC-4 子代理会话的写工具被工具层拒绝', async () => {
     }
     const shell = await guard('bash', { command: 'rm -rf src' }, 'sess-review')
     assert.equal(shell.kind, 'deny')
-    const readShell = await guard('bash', { command: 'git diff' }, 'sess-review')
+    assert.equal((await guard('bash', { command: 'git diff' }, 'sess-review')).kind, 'deny')
+    const readShell = await guard('bash', { command: 'pwd' }, 'sess-review')
     assert.equal(readShell.kind, 'allow')
     const read = await guard('read', { file_path: 'src/auth/session.ts' }, 'sess-review')
     assert.equal(read.kind, 'allow')
@@ -189,13 +195,13 @@ await check('AC-4 子代理会话的写工具被工具层拒绝', async () => {
   }
 })
 
-// D2：用户显式授权的测试方向可以跑变更性 shell，但代码写工具仍然拒绝。
-await check('D2 已授权的测试子代理可跑变更性 shell，写工具仍拒绝', async () => {
+// D2：手工布尔标志不能替代实际 S4 的方向授权。完整授权路径另由子代理回归测试覆盖。
+await check('D2 非 S4 的手工写权限标志仍拒绝变更性 shell', async () => {
   const service = mod.currentService()
   service.registerChild(SESSION, 'sess-test', { allowShellWrite: true })
   try {
     const shell = await guard('bash', { command: 'pnpm migrate && pnpm migrate:rollback' }, 'sess-test')
-    assert.equal(shell.kind, 'allow', '授权后的变更性 shell 应放行')
+    assert.equal(shell.kind, 'deny', '只有实际 S4 的已授权方向才能放行变更性 shell')
     const write = await guard('write', { path: 'src/auth/session.ts' }, 'sess-test')
     assert.equal(write.kind, 'deny', '写权限例外不覆盖代码写工具')
   } finally {
@@ -390,11 +396,13 @@ await check('flowgate_review_run 为每个角度 spawn 只读子代理并带上�
   const reviewSpawn = host.spawns.find((item) => String(item.request.label).includes('正确性'))
   assert.ok(reviewSpawn, '应有正确性角度的子代理')
   assert.equal(reviewSpawn.provider, 'spawn')
-  // PRD 4.3.1：只读靠 toolFilter.deny 在工具层封死，不是提示词建议。
-  assert.deepEqual(
-    reviewSpawn.request.toolFilter.deny.slice().sort(),
-    ['edit', 'send_message', 'str_replace_editor', 'subagent', 'subagent_fork', 'web_search', 'workflow', 'write'],
-  )
+  assert.equal(reviewSpawn.request.delivery, 'caller')
+  assert.ok(reviewSpawn.request.childId, '必须预留真实 childId')
+  assert.equal(reviewSpawn.request.toolFilter, undefined, '新协议不发送旧 toolFilter')
+  assert.equal(reviewSpawn.request.parent.session.header.id, S)
+  assert.ok(host.spawns.every((item) => item.released), '每次 activation 都应释放')
+  assert.equal(mod.currentService().childOwner.size, 0, '停止成功后解绑只读会话')
+  assert.equal(view.review.angles[0].findings[0].file, 'src/auth/session.ts', '必须实际采用子代理报告')
   // PRD 4.5：正确性角度会逐条核对用户定义的开发规则。
   const prompt = reviewSpawn.request.prompt[0].text
   assert.match(prompt, /用户定义的开发规则/)

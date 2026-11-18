@@ -4,6 +4,21 @@
 
 以下记录迁自原使用说明，保留当时的环境与结果，不代表本次文档修改重新执行了这些测试。表中的 AC / D 编号沿用当时验收项编号。当前操作方法以[使用指南](../README.md)为准，测试命令见[开发与维护](development.md#测试)。
 
+历史记录中的 `by: 'subagents'` 仅表明调用了子代理聚合入口；聚合报告通过、`blocking: 0` 或流程走完，均不能证明真实子代理成功执行并返回有效报告。下文原有结论保留，其证据范围受此限定。
+
+## 新版子代理修复验证（2026-11-18，DSH 0.2.2-rc.3）
+
+| 验证层次 | 当前状态 | 范围与限制 |
+| :--- | :--- | :--- |
+| 官方源码契约核对 | 已核对 DSH `0.2.2-rc.3` | `startActivation`、`getProvider('spawn')`、预留 `childId`、`delivery: 'caller'`、`{ childId, name, messageId, result, dispose }`；旧 `start` / `list` 与 `toolFilter` 不属于新版契约 |
+| 自动化与测试替身验证 | `pnpm test` 通过，275 项通过，另 1 个环境跳过项 | host 105、subagents 46、integration 23、client 88、install 13；新增用例核验执行前只读登记、最终工具守卫、S4 写授权、取消清理、降级与报告有效性。原有 child_process 采集变更摘要用例因环境禁止 spawn git 跳过，不计作通过 |
+| 语法与补丁检查 | `pnpm run check`、`git diff --check` 通过 | 对宿主和客户端入口执行语法检查；本轮未修改客户端 |
+| 重启后的实机验证 | 未执行 | 仍需核实真实 activation 执行、有效报告、最终守卫拒写和取消清理；历史聚合结果不能代替本轮证据 |
+
+兼容元数据仅声明上述已核对的精确版本，保留 Node `>=20` 要求。默认只读 shell 仅接受精确的 `pwd`；Git、`script_path`、解释器和包测试脚本默认拒绝，变更性 shell 仅在 S4 对应方向的 `needsWrite` 与用户 `writeGrants` 同时满足时放行，代码写工具仍拒绝。
+
+当前 desktop profile 使用 `link:D:/Projects/dsh-flowgate`。本轮仅改宿主 JavaScript 时无需重新安装，也无需客户端改动；完全退出并重启 DSH 后才加载新模块，浏览器刷新无效。本会话不重启，实机结果待实际验证后补记。
+
 ## 实机验证记录（2026-11-17，桌面端 0.2.2-rc.3）
 
 五条流程在真实桌面端跑通，每条都是「用户点按钮 → 宿主状态机推进」，Agent 只在中间调工具：

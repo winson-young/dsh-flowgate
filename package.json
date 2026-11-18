@@ -29,11 +29,12 @@
   "license": "MIT",
   "engines": {
     "node": ">=20",
-    "dsh": ">=0.2.1-rc.5 <0.3.0-0"
+    "dsh": "0.2.2-rc.3"
   },
   "scripts": {
-    "test": "node test/host.test.mjs && node test/integration.test.mjs && node test/client.test.mjs && node test/install.test.mjs",
+    "test": "node test/host.test.mjs && node test/subagents.test.mjs && node test/integration.test.mjs && node test/client.test.mjs && node test/install.test.mjs",
     "test:host": "node test/host.test.mjs",
+    "test:subagents": "node test/subagents.test.mjs",
     "test:client": "node test/client.test.mjs",
     "test:integration": "node test/integration.test.mjs",
     "test:install": "node test/install.test.mjs",
@@ -48,10 +49,9 @@
       "inject": []
     },
     "compatibility": {
-      "dsh": ">=0.2.1-rc.5 <0.3.0-0",
+      "dsh": "0.2.2-rc.3",
       "dshReleases": {
-        "0.2.1-rc.5": "compatible",
-        "0.2.2-rc.1": "compatible"
+        "0.2.2-rc.3": "compatible"
       }
     }
   },

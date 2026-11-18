@@ -35,7 +35,7 @@ S1 批准或跳过文档批准后，宿主冻结 scope。S2 对已识别的文�
 
 S2 同时拒绝被识别为变更性的 shell 命令，如 `rm`、`mv`、`sed -i`、`git checkout` 和重定向写文件，避免通过 shell 绕过文件清单。只读命令可执行。守卫按已知工具名称、参数及命令分类工作，覆盖范围以[宿主实现](../lib/index.js)为准，不能代替文件系统沙箱。
 
-评审子代理在启动时剥离写工具，宿主守卫还会检查其会话归属；默认测试子代理同样只读。它们可读取文件、查看 diff 和执行只读 shell。需要修复代码时，回退到 S2 由开发阶段处理。
+评审与默认测试子代理在执行前按预留的 `childId` 登记到父流程，并由 `tools.guard` 最终工具守卫强制只读。写入 / 编辑工具及未知的变更工具默认拒绝；未经写授权的 shell 仅允许精确的 `pwd`；Git 可能刷新索引或执行仓库配置的外部程序，因此也拒绝。`script_path`、解释器和包测试脚本默认拒绝。读取通过结构化工具完成，`run_code` 仅接受一个工具调用与严格 JSON 参数，不能执行任意 JavaScript。需要修复代码时，回退到 S2 由开发阶段处理；这层守卫仍需配合宿主文件系统沙箱。
 
 ### 测试方向的写权限例外
 
@@ -45,7 +45,7 @@ S2 同时拒绝被识别为变更性的 shell 命令，如 `rm`、`mv`、`sed -i
 2. 进入 S4 后，在「阶段设置」对该方向显式勾选「授权执行变更性命令」。
 3. 宿主记录 `writeGrants`，每次启动该方向的测试子代理时读取授权。
 
-授权覆盖变更性 shell，不会放开子代理的代码写入 / 编辑工具。授权不会在一次执行后自动消耗；取消勾选、流程回退或放弃时清除。
+只有 S4 中同时满足该方向 `needsWrite` 与用户 `writeGrants` 授权时，才允许该方向子代理执行变更性 shell；代码写入 / 编辑工具仍拒绝。授权不会在一次执行后自动消耗；取消勾选、流程回退、放弃或本次调用取消时立即失效。启动或释放失败、无法确认子代理已停止时，保留只读隔离并撤销该子会话的变更命令权限。
 
 ## 升档与回退
 
@@ -86,7 +86,15 @@ S2 以卡片展示规则清单；`flowgate_status` 返回同一份清单。S3 �
 | `flowgate_test` | 当前 Agent 提交结构化测试报告 |
 | `flowgate_cancel` | 放弃流程、解冻 scope、记录事件并通知当前等待门禁 |
 
-`*_run` 入口需要宿主提供 `subagents` 服务；否则使用直接提交报告的工具。等待门禁的调用会挂起，直到用户在工作台确认、退回、跳过或放弃。
+`*_run` 入口要求宿主具备下述协议与守卫能力；条件不满足时返回带原因的降级结果，也可由当前 Agent 使用直接提交报告的工具。等待门禁的调用会挂起，直到用户在工作台确认、退回、跳过或放弃。
+
+### 宿主子代理协议
+
+当前仅按 DSH `0.2.2-rc.3` 官方源码核对契约，兼容声明收窄到该精确版本。使用 `subagents.startActivation` 与 `getProvider('spawn')`，不再支持旧的 `start` / `list`。启动前预留 `childId` 并登记会话归属和只读限制，使用 `delivery: 'caller'`；返回值为 `{ childId, name, messageId, result, dispose }`。新版协议没有 `toolFilter` 字段，不能依靠它剥离写工具。
+
+能力探测区分服务缺失、接口不匹配、`spawn` provider 缺失、不支持预留 `childId`、`tools.guard` 最终守卫缺失；任一条件不满足时，`canSpawn` 为 `false`，启动入口报告具体原因并且不启动子代理。执行失败或报告无效同样保留原因，评审降级为 `advisory` / `MINOR`，测试记为 `uncovered`。`by: 'subagents'` 仅表示调用路径，不能证明子代理执行或报告成功。
+
+启动信号只控制 activation 发布前的取消；已发布的 activation 在取消、超时或放弃时必须调用 `dispose` 停止并释放。取消后不再启动后续角度或方向，也不写入迟到的聚合结果。确认 `dispose` 成功后才解除子会话守卫；启动无回执或释放失败时，错误包含子会话 ID，并保留只读隔离、撤销写授权。宿主的启动 reject 可能发生在消息已经投递之后，不能当作未执行的证明。用户自行启动的其他任务仍需自行停止。
 
 ## 修改代码后如何生效
 
@@ -98,7 +106,7 @@ S2 以卡片展示规则清单；`flowgate_status` 返回同一份清单。S3 �
 | [宿主端](../lib/index.js) | 完全重启 DSH 进程，清除模块导入缓存 |
 | 包中的客户端声明或导出 | 重启 DSH，重新加载 bundle 元数据 |
 
-不要仅凭源码或单测已更新就认定当前运行的 DSH 已加载新代码。
+当前 desktop profile 已通过 `link:D:/Projects/dsh-flowgate` 指向本项目。仅修改宿主 JavaScript 无需重新安装，但必须完全退出并重启 DSH 才加载新模块，浏览器刷新不会生效。本次子代理修复无需客户端改动；本会话不执行重启，重启后的实机验证另行补记。不要仅凭源码或单测已更新就认定当前运行的 DSH 已加载新代码。
 
 ### 维护说明插图
 
@@ -117,14 +125,15 @@ S2 以卡片展示规则清单；`flowgate_status` 返回同一份清单。S3 �
 ```bash
 pnpm install --frozen-lockfile
 npm run check             # 宿主与客户端语法检查
-npm test                  # 以下四套测试顺序执行
+npm test                  # 以下五套测试顺序执行
 npm run test:host          # 状态机、scope 守卫、规则与门禁流转
+npm run test:subagents     # 新版 activation、最终守卫、取消与降级的测试替身
 npm run test:integration   # 假宿主运行真实 apply()，检查工具、路由与挂起唤醒
 npm run test:client        # React 渲染与按钮行为、布局契约、主题变量
 npm run test:install       # profile 清单、软链、bundle 与导出契约
 ```
 
-前三套测试不需启动 DSH。`test:install` 依赖本地安装环境，默认检查 `~/.dsh/profiles/desktop`。检查其他 profile 时，先设置环境变量 `FLOWGATE_PROFILE_DIR` 为其绝对路径，再运行该命令。自动化通过后仍需在真实 DSH 中确认入口、门禁按钮、回退和窄屏布局。
+前四套测试不需启动 DSH；子代理测试使用测试替身，不能证明真实宿主执行成功。`test:install` 依赖本地安装环境，默认检查 `~/.dsh/profiles/desktop`。检查其他 profile 时，先设置环境变量 `FLOWGATE_PROFILE_DIR` 为其绝对路径，再运行该命令。自动化通过后仍需在真实 DSH 中确认入口、门禁按钮、回退和窄屏布局。
 
 ## 排障
 
