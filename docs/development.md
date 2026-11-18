@@ -69,11 +69,11 @@ S2 同时拒绝被识别为变更性的 shell 命令，如 `rm`、`mv`、`sed -i
 
 S2 以卡片展示规则清单；`flowgate_status` 返回同一份清单。S3 的正确性和风格评审会将启用规则写入子代理任务，作为检查项。除修改范围守卫外，这些规则依靠检查与评审执行，不代表每一条都有独立的自动阻断机制。
 
-可以在「阶段设置 → 开发规则」中勾选或追加规则，内置规则不可删除。
+工作区页的「工作区规则 → 编辑规则」可勾选内置规则，添加、编辑或移除自定义规则，无需需求或会话；内置规则不可删除。弹窗中的修改与「恢复内置默认」均在点击「保存规则」后落盘，取消不保存。流程内仍可通过「阶段设置 → 开发规则」单独调整。
 
 ### 规则跟工作区走
 
-勾选与追加默认只是**本次流程**的临时调整，写在流程快照里，流程结束后就没了。想让同一个工作区的每条流程都从同一套规则起步，在设置里点「保存为工作区默认」，规则会写进：
+工作区页保存的默认规则写入下列文件。流程内单独调整则保存在流程快照中；选择「保存为工作区默认」后，该流程也恢复跟随默认。未单独设置规则的流程（包括已有流程）会使用当前工作区默认：
 
 ```text
 <工作区>/.dsh-flowgate/config.json
@@ -84,8 +84,8 @@ S2 以卡片展示规则清单；`flowgate_status` 返回同一份清单。S3 �
 | 层 | 存在哪里 | 何时失效 |
 | :--- | :--- | :--- |
 | 内置默认 | 插件代码 | 不会 |
-| 工作区默认 | `.dsh-flowgate/config.json` | 点「清除工作区默认」 |
-| 本次流程临时调整 | `flows/<flowId>.json` 的 `overrides.rules` | 流程结束 |
+| 工作区默认 | `.dsh-flowgate/config.json` | 保存恢复后的内置默认，或在流程设置中清除默认 |
+| 本次流程临时调整 | `flows/<flowId>.json` 的 `overrides.rules` | 保存为工作区默认后恢复跟随；不用于其他流程 |
 
 工作区默认只存规则（启用清单 + 自定义规则），**不存写权限、不存 scope、不存门禁决策**：这些都是一次性授权或流程内状态，跨流程复用等于让授权永久有效。`config.json` 只含 `version` / `updatedAt` / `rules`，可以提交进版本库；`flows/`、`flows.jsonl`、`scope.json` 是运行记录，应当忽略。
 
@@ -104,9 +104,11 @@ S2 以卡片展示规则清单；`flowgate_status` 返回同一份清单。S3 �
 
 只存绝对路径与添加时间。任务与规则仍留在各自工作区的 `.dsh-flowgate/`，添加时按需读出展示，**不复制、不改写**——那个工作区里改了规则，面板下次读就跟着变。面板有三态：
 
-- **空名单**：只给 **「添加目录…」** 与 **「添加工作区」** 两个入口，不发任何读盘请求。
-- **成员列表**：`POST /api/flowgate/hub/members` 读名单，逐项渲染每个成员的摘要（进行中 / 待确认计数、目录是否还在）。点一个进入详情。
-- **详情**：`POST /api/flowgate/hub`，body `{ paths: [dir] }`。宿主对路径去重后 `loadFlowsFromDisk` 读快照，返回流程摘要（标题、档位、阶段、是否在等门禁、百分比）与规则概况；非绝对路径与非法条目直接丢弃，不报错。头部可「工作区列表」返回、或「移除」把它从名单里拿掉（不动磁盘）。
+- **空名单**：读取用户级名单后，显示 **「添加目录…」** 与 **「添加工作区」** 两个入口。
+- **成员列表**：`POST /api/flowgate/hub/members` 只返回工作区摘要（流程总数、进行中 / 待确认计数、规则概况与目录状态），不返回全量 `flows`。
+- **详情**：上方独立可折叠的「流程记录」卡片按更新时间倒序，每页 10 条，通过 `/hub/flows` 请求当前页；「工作区规则」独立读取与保存。头部可返回工作区列表或移除名单条目，移除不删磁盘记录。
+
+分页减少响应中的流程数量，不代表没有磁盘扫描；服务端仍需读取或刷新磁盘摘要以统计和排序。兼容接口 `POST /api/flowgate/hub`（`{ paths: [dir] }`）保留流程与规则概况。
 
 点开某条流程后内嵌 `FlowDetail`（`lib/client.js` 里那个完整工作台，同时从 `exports.components.FlowDetail` 导出供单测直接渲染）：它在面板里用 `useEntry(sessionId)` 按 1.5 秒轮询取实时状态，门禁确认、退回修复、改规则、追加范围都在面板内完成。宿主侧栏只有 264–420px，`.fg-hub-flow` 把会话页的三列布局压成单列（阶段导航横排、门禁与设置依次向下）。
 
@@ -118,12 +120,14 @@ S2 以卡片展示规则清单；`flowgate_status` 返回同一份清单。S3 �
 
 任一步失败（目录已不是宿主的 workspace、宿主缺 `uiWorkspace`）都在面板里就地显示原因，**不发 `start`**——宁可不启动，也不要落到别的目录上。换会话不会把用户从面板拽走：`connectWorkspace` 不在 UI 上做导航。
 
-**三个写名单的路由**（都在 `routes()` 里，与 `/hub` 一样要 `sessionId` 之外的独立语义，故单独分出）：
+**工作区接口**（均在 `routes()` 中，不要求 `sessionId`）：
 
 | 路由 | body | 行为 |
 | :--- | :--- | :--- |
-| `POST /api/flowgate/hub/members` | — | 返回 `{ members, file }`，每项是 `hubMemberSummary`：`path` / `name` / `addedAt` / `missing` / `flowCount` / `activeCount` / `waitingCount` / `flows` / `rules`。 |
-| `POST /api/flowgate/hub/add` | `{ path }` | 路径必须是存在的绝对路径（否则 400 `需要一个绝对目录路径` / `这个目录不在这台机器上：<path>`）；已登记则不重复写。返回 `{ member, created, imported }`，`imported` 是这次「顺手导入」的数量（`flows` / `rules` / `customRules`）。 |
+| `POST /api/flowgate/hub/members` | — | 返回 `{ members, file }`，成员含路径、名称、目录状态、流程计数、更新时间与规则概况，不含 `flows`。 |
+| `POST /api/flowgate/hub/flows` | `{ path, page, pageSize }` | 返回 `{ flows, total, page, pageSize, totalPages }`；默认每页 10 条，上限 50，按更新时间倒序，越界页归到最后一页。 |
+| `POST /api/flowgate/hub/rules` | `{ path }` 或 `{ path, rules }` | 省略 `rules` 时读取；传 `{ ids, custom }` 时保存工作区默认，传 `null` 时恢复内置默认；返回 `{ rules }`。 |
+| `POST /api/flowgate/hub/add` | `{ path }` | 路径必须是现存的绝对目录（否则 400 `需要一个绝对目录路径` / `工作区必须是现存目录：<path>`）；已登记则不重复写。返回 `{ member, created, imported }`，`imported` 是这次「顺手导入」的数量（`flows` / `rules` / `customRules`）。 |
 | `POST /api/flowgate/hub/remove` | `{ path }` | 只从名单移除，返回 `{ removed, path }`。不删任何流程或配置。 |
 
 **目录自动登记**：在面板里点 **「添加目录…」** 走 `ctx.uiWorkspace.pickDirectory()`（原生对话框或应用内浏览，取决于装了哪个 directory-picker 实现），取消返回 `null` 就什么都不做；选中后先 `ctx.get('workspaces').create({ path })` 把它登记成工作区（宿主侧幂等，重复选同一目录不会重复登记），再 `POST /hub/add` 加进名单。`create` 失败时把 `WorkspaceCreateError` 的 message 显示在面板里，不加入名单。
@@ -173,11 +177,11 @@ S2 以卡片展示规则清单；`flowgate_status` 返回同一份清单。S3 �
 
 ### 维护说明插图
 
-README 的四张界面图使用真实插件组件与示例数据，通过 [预览页](ui-preview.html) 和 [截图脚本](capture-ui.mjs) 生成；无需启动 DSH。安装开发依赖后，用 Node 22 或更新版本运行截图脚本（需要内置 WebSocket）：
+README 的五张界面图使用真实插件组件与示例数据，通过 [预览页](ui-preview.html) 和 [截图脚本](capture-ui.mjs) 生成；无需启动 DSH。安装开发依赖后，用 Node 22 或更新版本运行截图脚本（需要内置 WebSocket）：
 
 1. 启动独立 Chrome 调试实例，传入 `--headless=new --remote-debugging-port=9229 --allow-file-access-from-files --user-data-dir=<独立临时目录>`，不要使用日常浏览器的用户目录。
 2. 在项目根运行 `node docs/capture-ui.mjs`。调试地址可通过 `FLOWGATE_CDP` 覆盖。
-3. 脚本重拍首页、工作区、拍板和评审详情，并检查 390 / 768 / 1280 像素下的明暗主题。仍应人工核对截图内容和真实 DSH 中的显示。
+3. 脚本重拍首页、含分页卡片的工作区、工作区规则弹窗、拍板和评审详情，并检查 390 / 768 / 1280 像素下的明暗主题。仍应人工核对截图内容和真实 DSH 中的显示。
 
 流程示意图由 [render_images.py](render_images.py) 单独生成。安装 Python 3 和 Pillow 后运行 `python docs/render_images.py`；默认使用 Windows 微软雅黑，其他系统可用 `FLOWGATE_DOC_FONT` 和 `FLOWGATE_DOC_FONT_BOLD` 指定字体。该脚本不会覆盖界面截图。
 

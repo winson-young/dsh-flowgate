@@ -192,11 +192,51 @@ let addResult = null
 const listCalls = []
 const addCalls = []
 const removeCalls = []
+const flowCalls = []
+const ruleCalls = []
+const flowsByPath = new Map()
+const rulesByPath = new Map()
+let flowHandler = null
+let ruleHandler = null
+const response = (data, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => data })
+const withoutFlows = ({ flows: _flows, ...member }) => member
+function flowPage(body) {
+  const member = currentMembers.find((item) => item.path === body.path) || (addResult?.path === body.path ? addResult : null)
+  const flows = flowsByPath.get(body.path) ?? member?.flows ?? []
+  const page = body.page || 1
+  const pageSize = body.pageSize || 10
+  return { flows: flows.slice((page - 1) * pageSize, page * pageSize), total: flows.length, page, pageSize, totalPages: Math.max(1, Math.ceil(flows.length / pageSize)) }
+}
+function workspaceRules(path) {
+  const catalog = baseView('S2').ruleCatalog
+  return rulesByPath.get(path) ?? { configured: false, ids: catalog.map((rule) => rule.id), custom: [], customCount: 0, catalog }
+}
 globalThis.fetch = async (url, init) => {
   const target = String(url)
   if (target.includes('/hub/members')) {
     listCalls.push(1)
-    return { ok: true, status: 200, json: async () => ({ members: currentMembers, file: '~/.dsh-flowgate/hub.json' }) }
+    return { ok: true, status: 200, json: async () => ({ members: currentMembers.map(withoutFlows), file: '~/.dsh-flowgate/hub.json' }) }
+  }
+  if (target.includes('/hub/flows')) {
+    const body = JSON.parse(init.body)
+    assert.equal(init.method, 'POST')
+    flowCalls.push(body)
+    return flowHandler ? flowHandler(body) : response(flowPage(body))
+  }
+  if (target.includes('/hub/rules')) {
+    const body = JSON.parse(init.body)
+    assert.equal(init.method, 'POST')
+    ruleCalls.push(body)
+    if (ruleHandler) return ruleHandler(body)
+    if (Object.hasOwn(body, 'rules')) {
+      const previous = workspaceRules(body.path)
+      const next = body.rules === null
+        ? { configured: false, ids: baseView('S2').ruleCatalog.map((rule) => rule.id), custom: [], customCount: 0, catalog: baseView('S2').ruleCatalog }
+        : { ...previous, ...body.rules, configured: true, customCount: body.rules.custom.length, catalog: baseView('S2').ruleCatalog.concat(body.rules.custom) }
+      rulesByPath.set(body.path, next)
+      currentMembers = currentMembers.map((member) => member.path === body.path ? { ...member, rules: next } : member)
+    }
+    return response({ rules: workspaceRules(body.path) })
   }
   if (target.includes('/hub/add')) {
     const body = JSON.parse(init.body)
@@ -215,7 +255,7 @@ globalThis.fetch = async (url, init) => {
       ok: true,
       status: 200,
       json: async () => ({
-        member,
+        member: withoutFlows(member),
         created: true,
         imported: {
           flows: member.flowCount,
@@ -251,7 +291,7 @@ async function render(Component, props, withSession = true) {
 
 async function click(node) {
   await act(async () => {
-    node.props.onClick()
+    node.props.onClick({ currentTarget: { focus() {} } })
     await new Promise((resolve) => setTimeout(resolve, 40))
   })
 }
@@ -1596,6 +1636,12 @@ const resetHub = (members = []) => {
   listCalls.length = 0
   addCalls.length = 0
   removeCalls.length = 0
+  flowCalls.length = 0
+  ruleCalls.length = 0
+  flowsByPath.clear()
+  rulesByPath.clear()
+  flowHandler = null
+  ruleHandler = null
 }
 
 {
@@ -1622,6 +1668,8 @@ const resetHub = (members = []) => {
   // 添加工作区：候选只来自宿主里还没加进名单的那些。
   resetHub([])
   addResult = alphaMember
+  const importedCustom = { id: 'imported-custom', name: '导入的自定义规则', points: ['确认导入内容'] }
+  rulesByPath.set(alphaMember.path, { ...alphaMember.rules, custom: [importedCustom], catalog: baseView('S2').ruleCatalog.concat([importedCustom]) })
   const renderer = await render(HubPanel, {
     useHubWorkspaces: useWorkspacesOf([{ workspaceId: 'w1', path: 'D:/repo/alpha', title: 'alpha' }]),
     hubActions: hubActionsWith(),
@@ -1648,9 +1696,14 @@ const resetHub = (members = []) => {
     assert.ok(text.includes('其中 1 条在等你确认'))
   })
   await check('规则摘要常驻，配置路径仅放在 title 中', () => {
-    assert.ok(text.includes('工作区默认 · 2 条规则，其中自定义 1 条'), text)
+    assert.ok(text.includes('工作区默认 · 2 条启用'), text)
     assert.ok(!text.includes('.dsh-flowgate/config.json'), '配置路径不应挤占常驻内容')
-    assert.equal(nodeByClass(renderer.toJSON(), 'fg-ws-rules').props.title, '规则配置：.dsh-flowgate/config.json')
+    const card = nodeByClass(renderer.toJSON(), 'fg-hub-section fg-workspace-card fg-workspace-rules')
+    assert.ok(card)
+    assert.ok(hasButton(card, '编辑规则'))
+    assert.ok(flat(card).includes('只改 scope 内的文件'))
+    assert.ok(flat(card).includes('不留调试残留'))
+    assert.ok(findTags(card, 'div').some((node) => node.props.title === '规则配置：.dsh-flowgate/config.json'))
   })
   await check('已有流程时新建入口默认折叠，summary 保留入口', () => {
     const start = findTags(renderer.toJSON(), 'details').find((node) => node.props.className?.includes('fg-start-section'))
@@ -1820,6 +1873,247 @@ const resetHub = (members = []) => {
     assert.match(text, /读盘失败/)
   })
 }
+
+// ---------------------------------------------------------------------------
+// 工作区规则草稿与流程分页
+// ---------------------------------------------------------------------------
+
+const emptyMember = (name) => ({
+  path: 'D:/repo/' + name, name, missing: false, flowCount: 0, activeCount: 0, waitingCount: 0,
+  rules: { configured: false, ids: null, customCount: 0 },
+})
+const ruleWrites = () => ruleCalls.filter((body) => Object.hasOwn(body, 'rules'))
+const ruleDialog = (renderer) => nodeByRole(renderer.toJSON(), 'dialog')
+function buttonByAria(tree, label) {
+  const found = buttons(tree).find((node) => node.props['aria-label'] === label)
+  assert.ok(found, '找不到按钮：' + label)
+  return found
+}
+function ruleCheckbox(tree, name) {
+  const label = findTags(tree, 'label').find((node) => flat(node).includes(name) && checkboxNodes(node).length)
+  assert.ok(label, '找不到规则勾选框：' + name)
+  return checkboxNodes(label)[0]
+}
+async function toggleRule(renderer, name, checked) {
+  const box = ruleCheckbox(ruleDialog(renderer), name)
+  await act(async () => { box.props.onChange({ target: { checked } }) })
+  assert.equal(ruleCheckbox(ruleDialog(renderer), name).props.checked, checked)
+}
+async function addDraftRule(renderer, name, points = '检查第一项\n检查第二项') {
+  await click(buttonByText(ruleDialog(renderer), '添加规则'))
+  assert.equal(buttonByText(ruleDialog(renderer), '加入列表').props.disabled, true)
+  await changeValue(inputByPlaceholder(ruleDialog(renderer), '规则名称'), name)
+  const area = findTags(ruleDialog(renderer), 'textarea').find((node) => node.props.placeholder === '检查要点，每行一条')
+  assert.ok(area, '规则检查要点使用多行表单')
+  await changeValue(area, points)
+  await click(buttonByText(ruleDialog(renderer), '加入列表'))
+}
+async function renderHub(actions = {}) {
+  return render(HubPanel, { useHubWorkspaces: useWorkspacesOf([]), hubActions: hubActionsWith(actions) }, false)
+}
+
+await check('无流程工作区可直接配置规则，新增与取消草稿不创建会话或落盘', async () => {
+  resetHub([emptyMember('empty')])
+  posted = []
+  const sessions = []
+  const renderer = await renderHub({ sessionForWorkspace: async (path) => { sessions.push(path); return 'unexpected-session' } })
+  try {
+    await click(buttonByText(renderer.toJSON(), 'empty'))
+    assert.ok(hasButton(renderer.toJSON(), '编辑规则'), '无流程也有常驻规则入口')
+    await click(buttonByText(renderer.toJSON(), '编辑规则'))
+    assert.ok(flat(ruleDialog(renderer)).includes('工作区规则'))
+    assert.ok(flat(ruleDialog(renderer)).includes('未单独设置规则的流程将使用此配置。'))
+    assert.deepEqual(ruleCalls[0], { path: 'D:/repo/empty' })
+    await addDraftRule(renderer, '仅保留在草稿')
+    assert.ok(flat(ruleDialog(renderer)).includes('仅保留在草稿'))
+    assert.equal(inputByPlaceholder(ruleDialog(renderer), '规则名称'), null)
+    await toggleRule(renderer, '只改 scope 内的文件', false)
+    await toggleRule(renderer, '仅保留在草稿', false)
+    await toggleRule(renderer, '仅保留在草稿', true)
+    assert.equal(ruleWrites().length, 0, '加入列表和勾选都不能立即保存')
+    await click(buttonByText(ruleDialog(renderer), '取消'))
+    assert.equal(ruleDialog(renderer), null)
+    await click(buttonByText(renderer.toJSON(), '编辑规则'))
+    assert.ok(!flat(ruleDialog(renderer)).includes('仅保留在草稿'), '取消后重开不保留未保存条目')
+    assert.equal(ruleCheckbox(ruleDialog(renderer), '只改 scope 内的文件').props.checked, true)
+    await addDraftRule(renderer, '关闭也丢弃草稿')
+    await click(buttonByText(ruleDialog(renderer), '关闭'))
+    await click(buttonByText(renderer.toJSON(), '编辑规则'))
+    assert.ok(!flat(ruleDialog(renderer)).includes('关闭也丢弃草稿'))
+    assert.equal(ruleWrites().length, 0)
+    assert.deepEqual(sessions, [])
+    assert.deepEqual(posted, [])
+  } finally { await act(async () => { renderer.unmount() }) }
+})
+
+await check('工作区规则保存失败保留草稿可重试，自定义编辑移除与恢复默认仅保存时生效', async () => {
+  resetHub([emptyMember('rules')])
+  const renderer = await renderHub()
+  try {
+    await click(buttonByText(renderer.toJSON(), 'rules'))
+    await click(buttonByText(renderer.toJSON(), '编辑规则'))
+    await addDraftRule(renderer, '禁止新增依赖', '  逐项核对依赖  \n\n检查锁文件  ')
+    await toggleRule(renderer, '只改 scope 内的文件', false)
+    ruleHandler = (body) => Object.hasOwn(body, 'rules') ? response({ error: '规则保存失败，请重试' }, 500) : response({ rules: workspaceRules(body.path) })
+    await click(buttonByText(ruleDialog(renderer), '保存规则'))
+    assert.ok(flat(ruleDialog(renderer)).includes('规则保存失败，请重试'))
+    assert.ok(flat(ruleDialog(renderer)).includes('禁止新增依赖'))
+    assert.equal(buttonByText(ruleDialog(renderer), '保存规则').props.disabled, false)
+    const failedPayload = ruleWrites()[0]
+    assert.equal(failedPayload.path, 'D:/repo/rules')
+    assert.equal(failedPayload.rules.custom.length, 1)
+    assert.equal(failedPayload.rules.custom[0].name, '禁止新增依赖')
+    assert.deepEqual(failedPayload.rules.custom[0].points, ['逐项核对依赖', '检查锁文件'])
+    assert.ok(!failedPayload.rules.ids.includes('scope-only'))
+    assert.ok(failedPayload.rules.ids.includes(failedPayload.rules.custom[0].id))
+    ruleHandler = null
+    await click(buttonByText(ruleDialog(renderer), '保存规则'))
+    assert.deepEqual(ruleWrites()[1], failedPayload, '重试应保留同一个规则 id 和草稿')
+    assert.equal(ruleDialog(renderer), null)
+    assert.ok(flat(renderer.toJSON()).includes('禁止新增依赖'), '成功后规则卡片刷新摘要')
+    await click(buttonByText(renderer.toJSON(), '编辑规则'))
+    await click(buttonByAria(ruleDialog(renderer), '编辑规则：禁止新增依赖'))
+    assert.equal(inputByPlaceholder(ruleDialog(renderer), '规则名称').props.value, '禁止新增依赖')
+    await changeValue(inputByPlaceholder(ruleDialog(renderer), '规则名称'), '核对新增依赖')
+    await click(buttonByText(ruleDialog(renderer), '更新规则'))
+    assert.ok(flat(ruleDialog(renderer)).includes('核对新增依赖'))
+    await toggleRule(renderer, '核对新增依赖', false)
+    await click(buttonByText(ruleDialog(renderer), '保存规则'))
+    const edited = ruleWrites().at(-1).rules
+    assert.equal(edited.custom[0].id, failedPayload.rules.custom[0].id, '编辑保留 id')
+    assert.equal(edited.custom[0].name, '核对新增依赖')
+    assert.ok(!edited.ids.includes(edited.custom[0].id), '自定义规则可以关闭但保留定义')
+    await click(buttonByText(renderer.toJSON(), '编辑规则'))
+    await click(buttonByAria(ruleDialog(renderer), '移除规则：核对新增依赖'))
+    assert.ok(!flat(ruleDialog(renderer)).includes('核对新增依赖'))
+    assert.equal(ruleWrites().length, 3, '移除只改变本地草稿')
+    await click(buttonByText(ruleDialog(renderer), '取消'))
+    await click(buttonByText(renderer.toJSON(), '编辑规则'))
+    assert.ok(flat(ruleDialog(renderer)).includes('核对新增依赖'), '取消移除后定义仍在')
+    await click(buttonByText(ruleDialog(renderer), '恢复内置默认'))
+    assert.ok(!flat(ruleDialog(renderer)).includes('核对新增依赖'))
+    assert.ok(checkboxNodes(ruleDialog(renderer)).every((box) => box.props.checked))
+    assert.equal(ruleWrites().length, 3, '恢复默认先留在草稿')
+    await click(buttonByText(ruleDialog(renderer), '保存规则'))
+    assert.deepEqual(ruleWrites().at(-1), { path: 'D:/repo/rules', rules: null })
+    assert.equal(ruleDialog(renderer), null)
+  } finally { ruleHandler = null; await act(async () => { renderer.unmount() }) }
+})
+
+function numberedFlows(prefix, count) {
+  return Array.from({ length: count }, (_, index) => ({ ...alphaMember.flows[0], id: prefix + '-' + (index + 1), sessionId: prefix + '-session-' + (index + 1), title: prefix + '任务' + String(index + 1).padStart(2, '0') }))
+}
+
+await check('流程列表通过新接口每页显示十条，翻页清详情，返回后进入其他工作区重置第一页', async () => {
+  const alpha = { ...alphaMember, flowCount: 23, flows: [{ ...alphaMember.flows[0], title: '旧名单流程不能渲染' }] }
+  const beta = { ...emptyMember('beta'), flowCount: 12 }
+  resetHub([alpha, beta])
+  flowsByPath.set(alpha.path, numberedFlows('甲', 23))
+  flowsByPath.set(beta.path, numberedFlows('乙', 12))
+  currentView = baseView('S2')
+  const renderer = await renderHub()
+  try {
+    assert.equal(flowCalls.length, 0, '工作区列表不预取全部流程')
+    await click(buttonByText(renderer.toJSON(), 'alpha'))
+    assert.deepEqual(flowCalls[0], { path: alpha.path, page: 1, pageSize: 10 })
+    assert.equal(buttonByText(renderer.toJSON(), '上一页').props.disabled, true)
+    assert.ok(/第\s*1\s*[/]\s*3\s*页/.test(flat(renderer.toJSON())))
+    assert.equal(buttons(renderer.toJSON()).filter((button) => /甲任务\d+/.test(flat(button))).length, 10)
+    assert.ok(!flat(renderer.toJSON()).includes('甲任务11'))
+    assert.ok(!flat(renderer.toJSON()).includes('旧名单流程不能渲染'))
+    await click(buttonByText(renderer.toJSON(), '甲任务01'))
+    assert.ok(flat(renderer.toJSON()).includes('出口门禁'))
+    await click(buttonByText(renderer.toJSON(), '下一页'))
+    assert.deepEqual(flowCalls.at(-1), { path: alpha.path, page: 2, pageSize: 10 })
+    assert.ok(!flat(renderer.toJSON()).includes('出口门禁'), '换页必须清掉 opened 流程详情')
+    assert.ok(flat(renderer.toJSON()).includes('甲任务11'))
+    assert.ok(!flat(renderer.toJSON()).includes('甲任务01'))
+    await click(buttonByText(renderer.toJSON(), '下一页'))
+    assert.equal(buttons(renderer.toJSON()).filter((button) => /甲任务\d+/.test(flat(button))).length, 3)
+    assert.equal(buttonByText(renderer.toJSON(), '下一页').props.disabled, true)
+    await click(buttonByText(renderer.toJSON(), '上一页'))
+    assert.deepEqual(flowCalls.at(-1), { path: alpha.path, page: 2, pageSize: 10 })
+    await click(buttonByText(renderer.toJSON(), '工作区列表'))
+    await click(buttonByText(renderer.toJSON(), 'beta'))
+    assert.deepEqual(flowCalls.at(-1), { path: beta.path, page: 1, pageSize: 10 })
+    assert.ok(/第\s*1\s*[/]\s*2\s*页/.test(flat(renderer.toJSON())))
+    assert.ok(flat(renderer.toJSON()).includes('乙任务01'))
+    assert.ok(!flat(renderer.toJSON()).includes('甲任务'))
+  } finally { await act(async () => { renderer.unmount() }) }
+})
+
+await check('翻页后旧目录的流程和规则迟到响应不能覆盖新选目录', async () => {
+  const alpha = { ...emptyMember('alpha'), flowCount: 11 }
+  const beta = { ...emptyMember('beta'), flowCount: 1 }
+  resetHub([alpha, beta])
+  flowsByPath.set(alpha.path, numberedFlows('迟到甲', 11))
+  flowsByPath.set(beta.path, numberedFlows('当前乙', 1))
+  let releaseFlows
+  let releaseRules
+  const delayedFlows = new Promise((resolve) => { releaseFlows = resolve })
+  const delayedRules = new Promise((resolve) => { releaseRules = resolve })
+  flowHandler = (body) => body.path === alpha.path && body.page === 2 ? delayedFlows : response(flowPage(body))
+  ruleHandler = (body) => body.path === alpha.path ? delayedRules : response({ rules: workspaceRules(body.path) })
+  const renderer = await renderHub()
+  try {
+    await click(buttonByText(renderer.toJSON(), 'alpha'))
+    await click(buttonByText(renderer.toJSON(), '下一页'))
+    assert.deepEqual(flowCalls.at(-1), { path: alpha.path, page: 2, pageSize: 10 })
+    await click(buttonByText(renderer.toJSON(), '工作区列表'))
+    await click(buttonByText(renderer.toJSON(), 'beta'))
+    assert.ok(flat(renderer.toJSON()).includes('当前乙任务01'))
+    await act(async () => {
+      releaseFlows(response(flowPage({ path: alpha.path, page: 2, pageSize: 10 })))
+      const custom = { id: 'late-rule', name: '迟到甲规则', points: [] }
+      releaseRules(response({ rules: { configured: true, ids: [custom.id], custom: [custom], customCount: 1, catalog: [custom] } }))
+    })
+    await settle()
+    assert.ok(flat(renderer.toJSON()).includes('当前乙任务01'))
+    assert.ok(!flat(renderer.toJSON()).includes('迟到甲任务'), '旧目录第二页不能覆盖新目录第一页')
+    assert.ok(!flat(renderer.toJSON()).includes('迟到甲规则'))
+    await click(buttonByText(renderer.toJSON(), '编辑规则'))
+    assert.ok(!flat(ruleDialog(renderer)).includes('迟到甲规则'))
+    assert.ok(flat(ruleDialog(renderer)).includes('只改 scope 内的文件'))
+  } finally {
+    releaseFlows(response({ flows: [], total: 0, page: 1, pageSize: 10, totalPages: 1 }))
+    releaseRules(response({ rules: workspaceRules(alpha.path) }))
+    flowHandler = null
+    ruleHandler = null
+    await act(async () => { renderer.unmount() })
+  }
+})
+
+await check('刷新时目录先消失且分页响应迟到，恢复目录后仍可刷新', async () => {
+  const member = { ...emptyMember('recover'), flowCount: 1 }
+  resetHub([member])
+  flowsByPath.set(member.path, numberedFlows('恢复后', 1))
+  const renderer = await renderHub()
+  let releaseFlows
+  const delayedFlows = new Promise((resolve) => { releaseFlows = resolve })
+  try {
+    await click(buttonByText(renderer.toJSON(), 'recover'))
+    assert.equal(buttonByText(renderer.toJSON(), '刷新').props.disabled, false)
+    flowHandler = () => delayedFlows
+    currentMembers = [{ ...member, missing: true }]
+    await click(buttonByText(renderer.toJSON(), '刷新'))
+    assert.equal(flowCalls.length, 2, '目录状态返回前分页请求已启动')
+    assert.ok(flat(renderer.toJSON()).includes('目录不可用'))
+    assert.equal(buttonByText(renderer.toJSON(), '刷新').props.disabled, false, '目录不可用时应取消加载状态，允许再次刷新')
+    await act(async () => { releaseFlows(response({ error: '目录已消失' }, 400)) })
+    await settle()
+    assert.equal(buttonByText(renderer.toJSON(), '刷新').props.disabled, false)
+    assert.ok(!flat(renderer.toJSON()).includes('目录已消失'), '已失效请求不能覆盖当前目录状态')
+    flowHandler = null
+    currentMembers = [member]
+    await click(buttonByText(renderer.toJSON(), '刷新'))
+    assert.equal(buttonByText(renderer.toJSON(), '刷新').props.disabled, false)
+    assert.ok(flat(renderer.toJSON()).includes('恢复后任务01'), '恢复目录后能重新读取流程')
+  } finally {
+    releaseFlows(response({ flows: [], total: 0, page: 1, pageSize: 10, totalPages: 1 }))
+    flowHandler = null
+    await act(async () => { renderer.unmount() })
+  }
+})
 
 // ---------------------------------------------------------------------------
 // 收尾

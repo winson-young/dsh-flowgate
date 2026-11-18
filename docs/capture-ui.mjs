@@ -36,7 +36,7 @@ const ready = condition => evaluate('new Promise((resolve,reject)=>{let n=0;func
 try {
   await send('Runtime.enable'); await send('Page.enable')
   const cases = [], screenshots = [], layoutIssues = []
-  for (const width of [1280, 768, 390]) for (const theme of ['light', 'dark']) for (const stage of ['home', 'workspace', 'empty', 'S1', 'S2', 'S3', 'S4', 'doc']) {
+  for (const width of [1280, 768, 390]) for (const theme of ['light', 'dark']) for (const stage of ['home', 'workspace', 'rules', 'empty', 'S1', 'S2', 'S3', 'S4', 'doc']) {
     await send('Emulation.setDeviceMetricsOverride', { width, height: 1000, deviceScaleFactor: 1, mobile: false })
     const url = new URL('./ui-preview.html', import.meta.url); url.searchParams.set('stage', stage); url.searchParams.set('theme', theme)
     const loaded = new Promise((resolve, reject) => {
@@ -45,22 +45,32 @@ try {
     })
     await send('Page.navigate', { url: url.href }); await loaded
     await ready('document.querySelector(".fg-root") && !document.body.textContent.includes("正在连接宿主端")')
-    if (stage === 'workspace') {
+    if (['workspace', 'rules'].includes(stage)) {
       await ready('[...document.querySelectorAll("button")].some(b=>b.textContent.includes("atlas-console"))')
       await evaluate('[...document.querySelectorAll("button")].find(b=>b.textContent.includes("atlas-console")).click()')
-      await ready('document.querySelector(".fg-start-section")')
-      await evaluate('document.querySelector(".fg-start-section").open=true')
-      await ready('document.querySelector("textarea[required]")')
+      await ready('document.querySelectorAll(".fg-flow-row").length===10 && [...document.querySelectorAll("button")].some(b=>b.textContent==="编辑规则"&&!b.disabled)')
+      if(stage==='rules'){
+        await evaluate('[...document.querySelectorAll("button")].find(b=>b.textContent==="编辑规则").click()');
+        await ready('document.querySelector("[role=dialog]")');
+      }
     }
-    if (!['home', 'workspace', 'empty'].includes(stage)) await ready('document.querySelector(".fg-nav")')
-    const info = await evaluate('(()=>({overflow:[...document.querySelectorAll(".fg-root,.fg-content,.fg-head,.fg-card,.fg-opt,.fg-hub-ws,.fg-stage-list,.fg-gate")].filter(el=>el.scrollWidth>el.clientWidth+2).map(el=>({class:el.className,width:el.clientWidth,scroll:el.scrollWidth})),background:getComputedStyle(document.querySelector(".fg-root")).backgroundColor,question:!!document.querySelector(".fg-q")}))()')
+    if (!['home', 'workspace', 'rules', 'empty'].includes(stage)) await ready('document.querySelector(".fg-nav")')
+    const info = await evaluate('(()=>({overflow:[...document.querySelectorAll(".fg-root,.fg-content,.fg-head,.fg-card,.fg-opt,.fg-hub-ws,.fg-stage-list,.fg-gate,.fg-workspace-card,.fg-pagination,.fg-modal,.fg-workspace-rule-row")].filter(el=>el.scrollWidth>el.clientWidth+2).map(el=>({class:el.className,width:el.clientWidth,scroll:el.scrollWidth})),background:getComputedStyle(document.querySelector(".fg-root")).backgroundColor,question:!!document.querySelector(".fg-q")}))()')
     cases.push({ width, theme, stage, ...info })
-    const name = width === 1280 ? stage === 'home' && theme === 'light' ? 'home' : stage === 'workspace' && theme === 'light' ? 'workspace' : stage === 'S1' && theme === 'dark' ? 'decision' : stage === 'S3' && theme === 'light' ? 'workbench' : null : null
+    const name = width === 1280 ? stage === 'home' && theme === 'light' ? 'home' : stage === 'workspace' && theme === 'light' ? 'workspace' : stage === 'rules' && theme === 'light' ? 'rules' : stage === 'S1' && theme === 'dark' ? 'decision' : stage === 'S3' && theme === 'light' ? 'workbench' : null : null
     if (name) {
       const height = name === 'home' ? 400 : name === 'decision' ? 900 : 1000
       const shot = await send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false, clip: { x: 0, y: 0, width, height, scale: 1 } })
       const dest = new URL('./images/' + name + '.png', import.meta.url)
       await writeFile(dest, Buffer.from(shot.data, 'base64')); screenshots.push(fileURLToPath(dest))
+    }
+    if (stage === 'workspace') {
+      for(const [button,page,rows] of [['下一页',2,10],['下一页',3,3],['上一页',2,10]]){
+        await evaluate('[...document.querySelectorAll("button")].find(b=>b.textContent==='+JSON.stringify(button)+').click()');
+        await ready('document.querySelector(".fg-pagination").textContent.includes("第 '+page+' / 3 页") && document.querySelectorAll(".fg-flow-row").length==='+rows);
+      }
+      const collapsed=await evaluate('(()=>{const card=document.querySelector(".fg-flow-history");card.querySelector("summary").click();return !card.open})()');
+      if(!collapsed)layoutIssues.push({width,theme,stage,issue:'history did not collapse'});
     }
     if (width === 1280 && stage === 'S3') {
       const issues = await evaluate(`(()=>{

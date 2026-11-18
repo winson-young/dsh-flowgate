@@ -7,6 +7,8 @@ import { join } from 'node:path'
 const CWD = join(process.cwd(), '.tmp-it')
 rmSync(CWD, { recursive: true, force: true })
 mkdirSync(CWD, { recursive: true })
+const PREVIOUS_HUB_HOME = process.env.DSH_FLOWGATE_HOME
+process.env.DSH_FLOWGATE_HOME = join(CWD, 'hub-home')
 
 const SESSION = 'sess-main'
 const SHELL_OUT = ' M src/auth/session.ts\n---numstat---\n3\t1\tsrc/auth/session.ts\n'
@@ -109,6 +111,11 @@ const getState = async (sessionId = SESSION) => {
   return res.json()
 }
 
+const postHubApi = async (route, body) => {
+  const res = await host.routes.get('/api/flowgate/hub/' + route).fetch({ json: async () => body })
+  return { status: res.status, data: await res.json() }
+}
+
 const post = async (body) => {
   const res = await actionRoute.fetch({ json: async () => body })
   return { status: res.status, data: await res.json() }
@@ -128,7 +135,7 @@ const check = async (name, fn) => {
   console.log('ok   ' + name)
 }
 
-await check('apply 注册 10 个工具与 6 条路由', () => {
+await check('apply 注册 10 个工具与 8 条路由', () => {
   assert.deepEqual([...host.tools.keys()].sort(), [
     'flowgate_ask', 'flowgate_cancel', 'flowgate_doc', 'flowgate_gate', 'flowgate_review',
     'flowgate_review_run', 'flowgate_start', 'flowgate_status', 'flowgate_test', 'flowgate_test_run',
@@ -139,8 +146,10 @@ await check('apply 注册 10 个工具与 6 条路由', () => {
   assert.ok(host.routes.has('/api/flowgate/hub/members'))
   assert.ok(host.routes.has('/api/flowgate/hub/add'))
   assert.ok(host.routes.has('/api/flowgate/hub/remove'))
+  assert.ok(host.routes.has('/api/flowgate/hub/flows'))
+  assert.ok(host.routes.has('/api/flowgate/hub/rules'))
   // state 是 GET，其余都是 POST —— 工作台读名单、添加、移除、按目录拉快照。
-  assert.deepEqual([...host.routes.values()].map((r) => r.methods.join(',')).sort(), ['GET', 'POST', 'POST', 'POST', 'POST', 'POST'])
+  assert.deepEqual([...host.routes.values()].map((r) => r.methods.join(',')).sort(), ['GET', 'POST', 'POST', 'POST', 'POST', 'POST', 'POST', 'POST'])
 })
 
 await check('未启动时 status 给出引导', async () => {
@@ -154,6 +163,23 @@ await check('未启动时 S1 之外的写操作不被守卫拦截（无流程即
   assert.equal(d.kind, 'allow')
 })
 
+await check('Hub 无流程时保存规则，不建立流程或 scope 授权', async () => {
+  const added = await postHubApi('add', { path: CWD })
+  assert.equal(added.status, 200)
+  assert.equal(added.data.member.flowCount, 0)
+  assert.equal(Object.hasOwn(added.data.member, 'flows'), false)
+  const saved = await postHubApi('rules', { path: CWD, rules: {
+    ids: ['scope-only', 'integration-rule'],
+    custom: [{ id: 'integration-rule', name: '集成规则', points: ['输出结构化日志'] }],
+  } })
+  assert.equal(saved.status, 200)
+  assert.deepEqual(saved.data.rules.ids, ['scope-only', 'integration-rule'])
+  assert.equal((await getState()).active, false)
+  const config = JSON.parse(readFileSync(join(CWD, '.dsh-flowgate', 'config.json'), 'utf8'))
+  assert.deepEqual(Object.keys(config).sort(), ['rules', 'updatedAt', 'version'])
+  assert.equal(existsSync(join(CWD, '.dsh-flowgate', 'scope.json')), false)
+})
+
 await check('flowgate_start 启动流程并进入 S1', async () => {
   const value = await call('flowgate_start', { title: '会话过期检测', preset: 'fast' })
   assert.equal(value.stage, 'S1')
@@ -161,6 +187,8 @@ await check('flowgate_start 启动流程并进入 S1', async () => {
   assert.equal(view.active, true)
   assert.equal(view.stage, 'S1')
   assert.equal(view.preset, 'fast')
+  assert.equal(view.ruleSource, 'workspace')
+  assert.deepEqual(view.ruleIds, ['scope-only', 'integration-rule'])
 })
 
 await check('S1 阶段的写操作被拒绝', async () => {
@@ -456,5 +484,24 @@ await check('hub 带上重复路径时不重复计入', async () => {
   assert.equal(res.data.workspaces.length, 1)
 })
 
+await check('Hub 成员摘要与分页计数一致，分页包含完成及活跃流程', async () => {
+  const members = await postHubApi('members', {})
+  const page = await postHubApi('flows', { path: CWD, pageSize: 50 })
+  assert.equal(members.status, 200)
+  assert.equal(page.status, 200)
+  const member = members.data.members.find((item) => item.path === CWD)
+  assert.equal(Object.hasOwn(member, 'flows'), false)
+  assert.equal(member.flowCount, page.data.total)
+  assert.equal(member.activeCount, page.data.flows.filter((flow) => !flow.finished && !flow.cancelled).length)
+  assert.ok(page.data.flows.some((flow) => flow.sessionId === SESSION && flow.finished))
+  assert.ok(page.data.flows.some((flow) => !flow.finished))
+  const cleared = await postHubApi('rules', { path: CWD, rules: null })
+  assert.equal(cleared.status, 200)
+  assert.equal(cleared.data.rules.configured, false)
+  assert.equal(cleared.data.rules.ids.length, 5)
+})
+
+if (PREVIOUS_HUB_HOME === undefined) delete process.env.DSH_FLOWGATE_HOME
+else process.env.DSH_FLOWGATE_HOME = PREVIOUS_HUB_HOME
 rmSync(CWD, { recursive: true, force: true })
 console.log('\n全部通过：' + passed + ' 项')

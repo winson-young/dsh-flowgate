@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
+import fs, { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
 import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -1513,5 +1514,205 @@ rmSync(cwd, { recursive: true, force: true })
   })
 
   rmSync(wsCwd, { recursive: true, force: true })
+}
+// Hub 不依赖 session：空工作区先设规则，再启动流程继承。
+{
+  const root = mkdtempSync(join(tmpdir(), 'flowgate-hub-api-'))
+  const ws = join(root, 'workspace')
+  const empty = join(root, 'empty')
+  const unlisted = join(root, 'unlisted')
+  for (const dir of [ws, empty, unlisted]) mkdirSync(dir)
+  const previousHome = process.env.DSH_FLOWGATE_HOME
+  process.env.DSH_FLOWGATE_HOME = join(root, 'home')
+  const cx = makeHost(ws, 'hub-new-flow')
+  const post = (route, body) => cx.request('/api/flowgate/hub/' + route, body)
+  const configFile = join(ws, '.dsh-flowgate', 'config.json')
+  const flowsDir = join(ws, '.dsh-flowgate', 'flows')
+  mkdirSync(flowsDir, { recursive: true })
+  const fixture = (n) => ({
+    id: 'f_' + String(n).padStart(2, '0'), sessionId: 'archived-' + n, cwd: ws,
+    title: '历史流程 ' + n, brief: '需求'.repeat(300), stage: 'S4', preset: 'fast', finished: true,
+    createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
+    stages: Object.fromEntries(['S1', 'S2', 'S3', 'S4'].map((id) => [id, { status: 'done', gate: 'pass' }])),
+  })
+  for (let n = 0; n < 25; n++) writeFileSync(join(flowsDir, fixture(n).id + '.json'), JSON.stringify(fixture(n)))
+  const originals = { readFileSync: fs.readFileSync, writeFileSync: fs.writeFileSync, unlinkSync: fs.unlinkSync }
+  let snapshotReads = 0
+  fs.readFileSync = function (file, ...args) {
+    if (String(file).startsWith(flowsDir)) snapshotReads++
+    return originals.readFileSync.call(this, file, ...args)
+  }
+  syncBuiltinESMExports()
+  try {
+    const added = await post('add', { path: ws })
+    const emptyAdded = await post('add', { path: empty })
+    check('Hub 添加成员仅返回摘要，冷扫描每份快照只读一次', () => {
+      assert.equal(added.status, 200)
+      assert.equal(added.body.member.flowCount, 25)
+      assert.equal(Object.hasOwn(added.body.member, 'flows'), false)
+      assert.equal(emptyAdded.body.member.flowCount, 0)
+      assert.equal(snapshotReads, 25)
+    })
+    const first = await post('flows', { path: ws })
+    const second = await post('flows', { path: ws, page: 2, pageSize: 10 })
+    const last = await post('flows', { path: ws, page: 999, pageSize: 10 })
+    const capped = await post('flows', { path: ws, pageSize: 500 })
+    const members = await post('members', {})
+    check('Hub 分页默认10条、稳定排序、末页归一与最大50条', () => {
+      assert.equal(first.status, 200)
+      assert.deepEqual([first.body.total, first.body.page, first.body.pageSize, first.body.totalPages], [25, 1, 10, 3])
+      assert.deepEqual(first.body.flows.map((flow) => flow.id), Array.from({ length: 10 }, (_, n) => fixture(n).id))
+      assert.equal(second.body.flows[0].id, 'f_10')
+      assert.equal(last.body.page, 3)
+      assert.equal(last.body.flows.length, 5)
+      assert.equal(capped.body.pageSize, 50)
+      assert.equal(first.body.flows[0].brief.length, 200)
+      assert.equal(members.body.members[0].flowCount, 25)
+      assert.equal(Object.hasOwn(members.body.members[0], 'flows'), false)
+      assert.equal(snapshotReads, 25, '翻页/成员刷新不可重新读取完整快照')
+    })
+    const emptyPage = await post('flows', { path: empty, page: 99 })
+    check('Hub 空集固定第一页且总页数为1', () => {
+      assert.deepEqual(emptyPage.body, { flows: [], total: 0, page: 1, pageSize: 10, totalPages: 1 })
+    })
+    for (const body of [{ page: 0 }, { page: -1 }, { page: 1.5 }, { page: '2' }, { page: null }, { page: Number.MAX_SAFE_INTEGER + 1 }, { pageSize: 0 }, { pageSize: '10' }, { pageSize: null }]) {
+      assert.equal((await post('flows', { path: ws, ...body })).status, 400)
+    }
+    const plainFile = join(root, 'plain-file')
+    writeFileSync(plainFile, 'text')
+    for (const path of ['relative/path', plainFile, unlisted, join(root, 'missing')]) {
+      assert.equal((await post('flows', { path })).status, 400)
+      assert.equal((await post('rules', { path, rules: null })).status, 400)
+    }
+    assert.equal((await post('add', { path: plainFile })).status, 400)
+    for (const route of ['flows', 'rules']) {
+      assert.equal((await post(route, null)).status, 400)
+      assert.equal((await post(route, [])).status, 400)
+      const spec = cx.routes.find((item) => item.path.endsWith('/hub/' + route))
+      const response = await spec.fetch(new Request('http://host/api/flowgate/hub/' + route, { method: 'POST', body: '{' }))
+      assert.equal(response.status, 400)
+    }
+    check('Hub 拒绝非法页码、未登记/相对/文件路径与非法请求体', () => {})
+
+    const changed = { ...fixture(24), updatedAt: '2099-01-01T00:00:00.000Z', title: '外部更新' }
+    writeFileSync(join(flowsDir, 'f_24.json'), JSON.stringify(changed))
+    const changedPage = await post('flows', { path: ws })
+    check('Hub 外部更改仅重读该快照并更新排序', () => {
+      assert.equal(changedPage.body.flows[0].title, '外部更新')
+      assert.equal(snapshotReads, 26)
+    })
+    writeFileSync(join(flowsDir, 'f_25.json'), JSON.stringify(fixture(25)))
+    assert.equal((await post('flows', { path: ws })).body.total, 26)
+    rmSync(join(flowsDir, 'f_00.json'))
+    assert.equal((await post('members', {})).body.members[0].flowCount, 25)
+    writeFileSync(join(flowsDir, 'f_01.json'), '{bad')
+    assert.equal((await post('flows', { path: ws })).body.total, 24)
+    const afterCorruptRead = snapshotReads
+    await post('flows', { path: ws, page: 2 })
+    assert.equal(snapshotReads, afterCorruptRead, '损坏快照不应每页重读')
+    writeFileSync(join(flowsDir, 'f_01.json'), JSON.stringify(fixture(1)))
+    assert.equal((await post('flows', { path: ws })).body.total, 25)
+    check('Hub 外部新增、删除、损坏与修复快照及时更新计数', () => {})
+
+    const defaults = await post('rules', { path: ws })
+    const custom = { id: 'project-logs', name: '结构化日志', points: ['输出结构化字段'] }
+    const saved = await post('rules', { path: ws, rules: { ids: ['scope-only', custom.id], custom: [custom] }, scope: { files: ['unsafe'] }, writeGrants: ['all'] })
+    check('Hub 无流程即可读写工作区规则，响应包含有效ID和目录', () => {
+      assert.equal(defaults.body.rules.configured, false)
+      assert.equal(defaults.body.rules.ids.length, 5)
+      assert.equal(saved.status, 200)
+      assert.equal(saved.body.rules.configured, true)
+      assert.equal(saved.body.rules.customCount, 1)
+      assert.deepEqual(saved.body.rules.ids, ['scope-only', custom.id])
+      assert.deepEqual(saved.body.rules.custom, [custom])
+      assert.equal(saved.body.rules.catalog.length, 6)
+      const config = JSON.parse(readFileSync(configFile, 'utf8'))
+      assert.deepEqual(Object.keys(config).sort(), ['rules', 'updatedAt', 'version'])
+      assert.deepEqual(config.rules.custom, [custom])
+    })
+    const invalid = [
+      {}, [], false, { ids: [], custom: null }, { ids: ['unknown'], custom: [] },
+      { ids: ['scope-only', 'scope-only'], custom: [] },
+      { ids: [], custom: [custom, custom] },
+      { ids: [], custom: [{ ...custom, id: 'scope-only' }] },
+      { ids: [], custom: [{ ...custom, name: '  ' }] },
+      { ids: [], custom: [{ ...custom, points: [1] }] },
+    ]
+    for (const rules of invalid) assert.equal((await post('rules', { path: ws, rules })).status, 400)
+    assert.deepEqual((await post('rules', { path: ws })).body, saved.body)
+    check('Hub 拒绝重复/未知/冲突规则ID、空名称和非法字段类型', () => {})
+
+    fs.writeFileSync = function (file, ...args) {
+      if (String(file).startsWith(configFile)) throw Object.assign(new Error('写入失败 EACCES'), { code: 'EACCES' })
+      return originals.writeFileSync.call(this, file, ...args)
+    }
+    syncBuiltinESMExports()
+    const failedSave = await post('rules', { path: ws, rules: { ids: [], custom: [] } })
+    fs.writeFileSync = originals.writeFileSync
+    fs.unlinkSync = function (file, ...args) {
+      if (String(file) === configFile) throw Object.assign(new Error('删除失败 EACCES'), { code: 'EACCES' })
+      return originals.unlinkSync.call(this, file, ...args)
+    }
+    syncBuiltinESMExports()
+    const failedClear = await post('rules', { path: ws, rules: null })
+    fs.unlinkSync = originals.unlinkSync
+    syncBuiltinESMExports()
+    check('Hub 保存或清除失败显式返回500且缓存保留原规则', () => {
+      assert.equal(failedSave.status, 500)
+      assert.match(failedSave.body.error, /EACCES/)
+      assert.equal(failedClear.status, 500)
+      assert.match(failedClear.body.error, /EACCES/)
+    })
+    assert.deepEqual((await post('rules', { path: ws })).body, saved.body)
+    await cx.tool('flowgate_start', { title: '从 Hub 规则启动', preset: 'fast' })
+    const state = await cx.request('/api/flowgate/state?sessionId=hub-new-flow')
+    const beforeMemoryRead = snapshotReads
+    const livePage = await post('flows', { path: ws, pageSize: 50 })
+    check('Hub 保存刷新服务缓存，新流程继承规则并立即更新流程计数', () => {
+      assert.deepEqual(state.body.ruleIds, ['scope-only', custom.id])
+      assert.equal(state.body.ruleSource, 'workspace')
+      assert.equal(livePage.body.total, 26)
+      assert.ok(livePage.body.flows.some((flow) => flow.id === state.body.id && !flow.finished))
+      assert.equal(snapshotReads, beforeMemoryRead, 'persist 已更新摘要，无需重新解析快照')
+    })
+    const diskFile = join(flowsDir, state.body.id + '.json')
+    const stale = JSON.parse(readFileSync(diskFile, 'utf8'))
+    stale.title = '外部陈旧状态'
+    stale.finished = true
+    writeFileSync(diskFile, JSON.stringify(stale))
+    const memoryPage = await post('flows', { path: ws, pageSize: 50 })
+    assert.equal(memoryPage.body.flows.find((flow) => flow.id === state.body.id).title, '从 Hub 规则启动')
+    assert.equal((await post('members', {})).body.members[0].activeCount, 1)
+    await cx.request('/api/flowgate/action', { sessionId: 'hub-new-flow', action: 'cancel', payload: {} })
+    const cancelled = await post('members', {})
+    assert.equal(cancelled.body.members[0].activeCount, 0)
+    check('Hub 内存状态优先，取消后摘要计数立即刷新', () => {})
+
+    writeFileSync(configFile, JSON.stringify({ version: 1, rules: { ids: ['match-style', 'unknown', 'match-style'], custom: [] } }))
+    const external = await post('rules', { path: ws })
+    assert.deepEqual(external.body.rules.ids, ['match-style'])
+    assert.deepEqual((await cx.request('/api/flowgate/state?sessionId=hub-new-flow')).body.ruleIds, ['match-style', 'unknown', 'match-style'])
+    const cleared = await post('rules', { path: ws, rules: null })
+    check('Hub 外部规则更新刷新缓存，null 恢复内置默认且不创建流程', () => {
+      assert.equal(external.body.rules.configured, true)
+      assert.equal(cleared.status, 200)
+      assert.equal(cleared.body.rules.configured, false)
+      assert.equal(cleared.body.rules.ids.length, 5)
+      assert.equal(existsSync(configFile), false)
+    })
+    await post('remove', { path: ws })
+    assert.equal((await post('rules', { path: ws, rules: null })).status, 400)
+    rmSync(empty, { recursive: true })
+    assert.equal((await post('flows', { path: empty })).status, 400)
+    assert.equal((await post('rules', { path: empty })).status, 400)
+    assert.equal((await post('members', {})).body.members[0].missing, true)
+    check('Hub 已移除成员或已消失目录拒绝读取和写入', () => {})
+  } finally {
+    Object.assign(fs, originals)
+    syncBuiltinESMExports()
+    if (previousHome === undefined) delete process.env.DSH_FLOWGATE_HOME
+    else process.env.DSH_FLOWGATE_HOME = previousHome
+    rmSync(root, { recursive: true, force: true })
+  }
 }
 console.log('\n全部通过：' + passed.length + ' 项')
