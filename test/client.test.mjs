@@ -207,6 +207,8 @@ let flowHandler = null
 let ruleHandler = null
 let prepareHandler = null
 const prepareCalls = []
+// 整理请求必须挂上可中止的 signal：超时和「换不到会话」都要能收掉在飞的请求。
+const prepareSignals = []
 const response = (data, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => data })
 const withoutFlows = ({ flows: _flows, ...member }) => member
 function flowPage(body) {
@@ -253,7 +255,8 @@ globalThis.fetch = async (url, init) => {
   if (target.includes('/hub/prepare')) {
     const body = JSON.parse(init.body)
     prepareCalls.push(body)
-    return prepareHandler ? prepareHandler(body) : response({ title: body.brief.split(/\r?\n/).find((line) => line.trim())?.trim() || '', summary: body.brief.trim(), status: 'fallback' })
+    prepareSignals.push(init.signal || null)
+    return prepareHandler ? prepareHandler(body, init) : response({ title: body.brief.split(/\r?\n/).find((line) => line.trim())?.trim() || '', summary: body.brief.trim(), status: 'fallback' })
   }
   if (target.includes('/hub/rules')) {
     const body = JSON.parse(init.body)
@@ -1944,6 +1947,7 @@ const resetHub = (members = []) => {
   ruleHandler = null
   prepareHandler = null
   prepareCalls.length = 0
+  prepareSignals.length = 0
 }
 
 {
@@ -2656,8 +2660,7 @@ await check('新建需求草稿跨规则保存、历史分页和刷新保留，�
   const assertDraft = () => {
     const tree = renderer.toJSON()
     assert.equal(findTags(tree, 'textarea')[0].props.value, brief)
-    // 标题与整理稿自动生成，只读展示，不再有对应输入框。
-    assert.equal(nodeByClass(tree, 'fg-start-title').children.join(''), '先完整保留这份长需求')
+    // 表单只留需求原文：标题与整理稿点击启动时才生成，界面上既不展示也没有输入框。
     assert.ok(!findTags(tree, 'input').some((node) => node.props['aria-label'] === '任务标题'), '不再要求填写标题')
     assert.ok(!findTags(tree, 'textarea').some((node) => node.props['aria-label'] === '需求整理稿'), '不再要求填写整理稿')
     assert.equal(buttonByText(tree, '大需求严格执行').props['aria-pressed'], true)
@@ -2702,40 +2705,11 @@ await check('新建需求草稿跨规则保存、历史分页和刷新保留，�
 // 四阶段统一草稿、内容对照与自动整理的行为契约
 // ---------------------------------------------------------------------------
 
-function generatedSummary(tree) {
-  const node = [...findTags(tree, 'p')].find((item) => item.props['aria-label'] === '自动生成的整理稿')
-  assert.ok(node, '找不到自动生成的整理稿')
-  return node.children.join('')
-}
 function fieldByAria(tree, label) {
   const field = [...findTags(tree, 'textarea'), ...findTags(tree, 'input')].find((node) => node.props['aria-label'] === label)
   assert.ok(field, '找不到输入：' + label)
   return field
 }
-async function withPrepareClock(run) {
-  const originalSet = globalThis.setTimeout
-  const originalClear = globalThis.clearTimeout
-  const timers = new Map()
-  const tokens = new Set()
-  globalThis.setTimeout = (callback, delay, ...args) => {
-    if (delay !== 800) return originalSet(callback, delay, ...args)
-    const token = {}
-    tokens.add(token); timers.set(token, () => callback(...args))
-    return token
-  }
-  globalThis.clearTimeout = (token) => tokens.has(token) ? timers.delete(token) : originalClear(token)
-  try {
-    await run({ pending: () => timers.size, flush: async () => {
-      await act(async () => {
-        const callbacks = [...timers.values()]
-        timers.clear()
-        for (const callback of callbacks) void callback()
-        await new Promise((resolve) => originalSet(resolve, 0))
-      })
-    } })
-  } finally { globalThis.setTimeout = originalSet; globalThis.clearTimeout = originalClear }
-}
-
 await check('四阶段草稿切换保留，取消和Esc丢弃全部未保存改动', async () => {
   resetHub([emptyMember('all-stages')]); posted = []
   const renderer = await renderHub()
@@ -2889,84 +2863,134 @@ await check('跟随默认只清当前阶段的本次覆盖，不保存工作区�
   } finally { await act(async () => { renderer.unmount() }) }
 })
 
-await check('需求先派生基础标题和排版，800ms去抖只整理最新原文且不创建会话', async () => withPrepareClock(async (clock) => {
-  resetHub([emptyMember('prepare-debounce')]); posted = []
+await check('输入需求原文时不发整理请求，点击启动才一次性生成标题与整理稿', async () => {
+  resetHub([emptyMember('prepare-on-start')]); posted = []
+  prepareHandler = () => response({ title: '模型标题', summary: '模型整理稿', status: 'ready' })
   const sessions = []
-  const renderer = await renderHub({ sessionForWorkspace: async (path) => { sessions.push(path); return 'unused' } })
+  const renderer = await renderHub({ sessionForWorkspace: async (path) => { sessions.push(path); return 'started-session' } })
   try {
-    await click(buttonByText(renderer.toJSON(), 'prepare-debounce'))
+    await click(buttonByText(renderer.toJSON(), 'prepare-on-start'))
     const raw = '  ## 规划需求。\r\n  - 保持缩进\r\n\r\n\r\n第三段  '
     await changeValue(fieldByAria(renderer.toJSON(), '需求原文'), raw)
-    assert.equal(nodeByClass(renderer.toJSON(), 'fg-start-title').children.join(''), '规划需求')
-    assert.equal(generatedSummary(renderer.toJSON()), '## 规划需求。\n  - 保持缩进\n\n第三段')
+    // 输入期间不请求整理，也不在表单里展示标题、预览、重新生成按钮或状态行。
     assert.equal(prepareCalls.length, 0)
-    await changeValue(fieldByAria(renderer.toJSON(), '需求原文'), '第二份需求\n补充')
-    assert.equal(clock.pending(), 1)
-    await clock.flush()
-    assert.deepEqual(prepareCalls, [{ path: 'D:/repo/prepare-debounce', brief: '第二份需求\n补充' }])
+    assert.equal(fieldByAria(renderer.toJSON(), '需求原文').props.value, raw)
     assert.deepEqual(sessions, []); assert.deepEqual(posted, [])
-  } finally { await act(async () => { renderer.unmount() }) }
-}))
-
-await check('整理响应乱序不覆盖新稿，重新生成让在途响应失效并刷新两个字段', async () => withPrepareClock(async (clock) => {
-  resetHub([emptyMember('prepare-race')])
-  const replies = []
-  prepareHandler = (body) => new Promise((resolve) => replies.push({ ...body, resolve }))
-  const renderer = await renderHub()
-  try {
-    await click(buttonByText(renderer.toJSON(), 'prepare-race'))
-    await changeValue(fieldByAria(renderer.toJSON(), '需求原文'), '第一版')
-    await clock.flush()
-    await changeValue(fieldByAria(renderer.toJSON(), '需求原文'), '第二版')
-    await clock.flush()
-    assert.equal(replies.length, 2)
-    await act(async () => { replies[1].resolve(response({ title: '新标题', summary: '新整理稿', status: 'ready' })) })
-    await act(async () => { replies[0].resolve(response({ title: '旧标题', summary: '旧整理稿', status: 'ready' })) })
-    // 迟到的旧响应不能盖住新稿。
-    assert.equal(nodeByClass(renderer.toJSON(), 'fg-start-title').children.join(''), '新标题')
-    assert.equal(generatedSummary(renderer.toJSON()), '新整理稿')
-    // 两个字段都是只读展示，界面没有可手改的入口。
-    assert.ok(!findTags(renderer.toJSON(), 'input').some((node) => node.props['aria-label'] === '任务标题'))
-    assert.ok(!findTags(renderer.toJSON(), 'textarea').some((node) => node.props['aria-label'] === '需求整理稿'))
-    await changeValue(fieldByAria(renderer.toJSON(), '需求原文'), '第三版')
-    await clock.flush()
-    assert.equal(replies.length, 3)
-    // 重新生成：先回落到本地派生结果，并让在途的第三次响应失效。
-    await click(buttonByText(renderer.toJSON(), '重新生成标题与整理稿'))
-    assert.equal(nodeByClass(renderer.toJSON(), 'fg-start-title').children.join(''), '第三版')
-    assert.equal(generatedSummary(renderer.toJSON()), '第三版')
-    await clock.flush()
-    assert.equal(replies.length, 4)
-    await act(async () => { replies[3].resolve(response({ title: '第三版自动标题', summary: '第三版整理', status: 'ready' })) })
-    await act(async () => { replies[2].resolve(response({ title: '失效的标题', summary: '失效的整理稿', status: 'ready' })) })
-    assert.equal(nodeByClass(renderer.toJSON(), 'fg-start-title').children.join(''), '第三版自动标题')
-    assert.equal(generatedSummary(renderer.toJSON()), '第三版整理')
+    assert.ok(!flat(renderer.toJSON()).includes('标题与整理稿'))
+    assert.ok(!flat(renderer.toJSON()).includes('重新生成'))
+    assert.ok(!flat(renderer.toJSON()).includes('已自动生成'))
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    // 点击时才带上完整原文请求一次整理，结果直接进 start payload。
+    assert.deepEqual(prepareCalls, [{ path: 'D:/repo/prepare-on-start', brief: raw }])
+    assert.ok(prepareSignals[0] && typeof prepareSignals[0].addEventListener === 'function', '整理请求必须挂上可中止的 signal')
+    assert.deepEqual(sessions, ['D:/repo/prepare-on-start'])
+    const start = posted.filter((item) => item.action === 'start')
+    assert.equal(start.length, 1)
+    assert.deepEqual(start[0].payload, { title: '模型标题', preset: 'fast', brief: raw, summary: '模型整理稿' })
+    // 下一个界面（工作区里的当前流程卡片）展示的就是这次提交的标题与整理稿：锚定卡片内的节点，不做全文包含匹配。
+    flowsByPath.set('D:/repo/prepare-on-start', [{ id: 'flow-prepare', title: '模型标题', brief: raw, summary: '模型整理稿', stage: 'S1', stageLabel: '需求分析', finished: false, cancelled: false }])
+    await click(buttonByText(renderer.toJSON(), '刷新'))
+    const current = nodeByClass(renderer.toJSON(), 'fg-hub-section fg-workspace-card fg-current-flow')
+    assert.ok(current, '工作区要渲染当前流程卡片')
+    assert.deepEqual(findTags(current, 'h3').map((node) => texts(node).join('')), ['模型标题'])
+    const summaryNodes = findTags(current, 'p').filter((node) => String(node.props.className).includes('fg-requirement-text'))
+    assert.equal(texts(summaryNodes[0]).join(''), '模型整理稿', '卡片里的整理稿节点要是这次生成的那份')
   } finally { prepareHandler = null; await act(async () => { renderer.unmount() }) }
-}))
+})
 
-await check('切换工作区后迟到整理不串稿，返回原目录保留本地草稿', async () => withPrepareClock(async (clock) => {
+await check('整理超时被中止后照常启动，不提示错误也不卡按钮', async () => {
+  resetHub([emptyMember('prepare-timeout')]); posted = []
+  const aborted = []
+  // 宿主一直不回：只有客户端自己的期限能收掉这次请求。
+  let missingSignal = false
+  prepareHandler = (body, init) => new Promise((resolve, reject) => {
+    const signal = init && init.signal
+    // 生产代码一旦不再传 signal，这里如实记下，最后由明确的断言失败收场，而不是抛 TypeError。
+    if (!signal || typeof signal.addEventListener !== 'function') { missingSignal = true; return }
+    signal.addEventListener('abort', () => { aborted.push(1); reject(Object.assign(new Error('aborted'), { name: 'AbortError' })) })
+  })
+  const sessions = []
+  const renderer = await renderHub({ sessionForWorkspace: async (path) => { sessions.push(path); return 'timeout-session' } })
+  const realSetTimeout = globalThis.setTimeout
+  const realWarn = console.warn
+  // 期限值取自生产常量：只把生产代码自己那一次期限压成立即到点，其它定时器一律原样放行。
+  const prepareTimeoutMs = plugin.constants.prepareTimeoutMs
+  const timerDelays = []
+  const warns = []
+  globalThis.setTimeout = (fn, ms, ...args) => {
+    timerDelays.push(ms)
+    return realSetTimeout(fn, ms === prepareTimeoutMs ? 0 : ms, ...args)
+  }
+  console.warn = (...args) => { warns.push(args.join(' ')) }
+  const raw = '超时原文标题\n\n  保留缩进'
+  try {
+    await click(buttonByText(renderer.toJSON(), 'prepare-timeout'))
+    await changeValue(fieldByAria(renderer.toJSON(), '需求原文'), raw)
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    await act(async () => { await new Promise((resolve) => realSetTimeout(resolve, 20)) })
+    assert.equal(missingSignal, false, '整理请求必须带可中止的 signal')
+    assert.ok(timerDelays.includes(prepareTimeoutMs), '整理请求必须按生产常量设一次期限')
+    assert.deepEqual(aborted, [1], '超时后必须 abort 在飞的整理请求')
+    assert.equal(prepareSignals[0].aborted, true)
+    // 启动已经发出（草稿随之清空、按钮回到空需求的禁用态），关键是没有停在「正在启动…」。
+    assert.ok(!flat(renderer.toJSON()).includes('正在启动…'), '按钮不能卡在启动中')
+    assert.ok(!flat(renderer.toJSON()).includes('自动生成暂不可用'))
+    const start = posted.filter((item) => item.action === 'start')
+    assert.equal(start.length, 1)
+    assert.deepEqual(start[0].payload, { title: '超时原文标题', preset: 'fast', brief: raw, summary: raw })
+    assert.deepEqual(sessions, ['D:/repo/prepare-timeout'])
+    assert.deepEqual(warns, ['[dsh-flowgate] 自动生成标题与整理稿回落到原文派生：timeout'], '降级原因要留在诊断日志里')
+  } finally { globalThis.setTimeout = realSetTimeout; console.warn = realWarn; prepareHandler = null; await act(async () => { renderer.unmount() }) }
+})
+
+await check('换不到会话时立即收掉在飞的整理请求，且不当作降级记日志', async () => {
+  resetHub([emptyMember('prepare-cancel')]); posted = []
+  const aborted = []
+  let missingSignal = false
+  prepareHandler = (body, init) => new Promise((resolve, reject) => {
+    const signal = init && init.signal
+    if (!signal || typeof signal.addEventListener !== 'function') { missingSignal = true; return }
+    signal.addEventListener('abort', () => { aborted.push(1); reject(Object.assign(new Error('aborted'), { name: 'AbortError' })) })
+  })
+  const renderer = await renderHub({ sessionForWorkspace: async () => { throw new Error('工作区目录已不存在') } })
+  const realSetTimeout = globalThis.setTimeout
+  const realWarn = console.warn
+  const warns = []
+  console.warn = (...args) => { warns.push(args.join(' ')) }
+  try {
+    await click(buttonByText(renderer.toJSON(), 'prepare-cancel'))
+    await changeValue(fieldByAria(renderer.toJSON(), '需求原文'), '换不到会话的原文')
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    await act(async () => { await new Promise((resolve) => realSetTimeout(resolve, 20)) })
+    assert.equal(missingSignal, false, '整理请求必须带可中止的 signal')
+    // 会话解析抛错也走同一条收网路径：请求被 abort，而不是继续在飞白耗一次模型。
+    assert.deepEqual(aborted, [1], '解析会话抛错也必须收掉在飞的整理请求')
+    assert.equal(posted.filter((item) => item.action === 'start').length, 0)
+    assert.ok(flat(renderer.toJSON()).includes('工作区目录已不存在'), '换不到会话要把原因显示出来')
+    assert.ok(!flat(renderer.toJSON()).includes('正在启动…'), '按钮不能卡在启动中')
+    assert.deepEqual(warns, [], '调用方主动取消不是降级，不该写诊断日志')
+  } finally { globalThis.setTimeout = realSetTimeout; console.warn = realWarn; prepareHandler = null; await act(async () => { renderer.unmount() }) }
+})
+
+await check('切换工作区各自保留启动草稿，返回原目录仍在且不发整理请求', async () => {
   resetHub([emptyMember('prepare-alpha'), emptyMember('prepare-beta')])
-  let reply
-  prepareHandler = () => new Promise((resolve) => { reply = resolve })
   const renderer = await renderHub()
   try {
     await click(buttonByText(renderer.toJSON(), 'prepare-alpha'))
     await changeValue(fieldByAria(renderer.toJSON(), '需求原文'), '甲目录原文')
-    await clock.flush()
+    assert.equal(prepareCalls.length, 0)
     await click(buttonByText(renderer.toJSON(), '工作区列表'))
     await click(buttonByText(renderer.toJSON(), 'prepare-beta'))
+    assert.equal(fieldByAria(renderer.toJSON(), '需求原文').props.value, '')
     await changeValue(fieldByAria(renderer.toJSON(), '需求原文'), '乙目录原文')
-    await act(async () => { reply(response({ title: '迟到甲标题', summary: '迟到甲整理', status: 'ready' })) })
-    assert.equal(nodeByClass(renderer.toJSON(), 'fg-start-title').children.join(''), '乙目录原文')
-    assert.equal(generatedSummary(renderer.toJSON()), '乙目录原文')
     await click(buttonByText(renderer.toJSON(), '工作区列表'))
     await click(buttonByText(renderer.toJSON(), 'prepare-alpha'))
-    assert.equal(nodeByClass(renderer.toJSON(), 'fg-start-title').children.join(''), '甲目录原文')
     assert.equal(fieldByAria(renderer.toJSON(), '需求原文').props.value, '甲目录原文')
-  } finally { prepareHandler = null; await act(async () => { renderer.unmount() }) }
-}))
+    assert.equal(prepareCalls.length, 0)
+  } finally { await act(async () => { renderer.unmount() }) }
+})
 
-await check('超20000字符保留完整输入并拒绝整理和启动', async () => withPrepareClock(async (clock) => {
+await check('超20000字符保留完整输入并拒绝整理和启动', async () => {
   resetHub([emptyMember('prepare-limit')]); posted = []
   const sessions = []
   const renderer = await renderHub({ sessionForWorkspace: async (path) => { sessions.push(path); return 'unused' } })
@@ -2977,15 +3001,17 @@ await check('超20000字符保留完整输入并拒绝整理和启动', async ()
     assert.equal(fieldByAria(renderer.toJSON(), '需求原文').props.value, raw)
     assert.ok(flat(renderer.toJSON()).includes('原文未被截断'))
     assert.equal(buttonByText(renderer.toJSON(), '开始需求分析').props.disabled, true)
-    await clock.flush()
     await click(buttonByText(renderer.toJSON(), '开始需求分析'))
     assert.deepEqual(prepareCalls, []); assert.deepEqual(sessions, []); assert.deepEqual(posted, [])
   } finally { await act(async () => { renderer.unmount() }) }
-}))
+})
 
-await check('整理失败可直接启动，重复启动幂等且payload带上自动派生的标题与整理稿', async () => withPrepareClock(async (clock) => {
+await check('整理失败静默回落到本地标题与整理稿，重复点击只启动一次', async () => {
   resetHub([emptyMember('prepare-fallback')]); posted = []
   prepareHandler = () => response({ error: '模型暂不可用' }, 503)
+  const realWarn = console.warn
+  const warns = []
+  console.warn = (...args) => { warns.push(args.join(' ')) }
   const sessions = []
   let resolveSession
   const renderer = await renderHub({ sessionForWorkspace: (path) => { sessions.push(path); return new Promise((resolve) => { resolveSession = resolve }) } })
@@ -2993,18 +3019,22 @@ await check('整理失败可直接启动，重复启动幂等且payload带上自
     await click(buttonByText(renderer.toJSON(), 'prepare-fallback'))
     const raw = '  原文标题\r\n\r\n\r\n  保留原文缩进  '
     await changeValue(fieldByAria(renderer.toJSON(), '需求原文'), raw)
-    await clock.flush()
-    assert.ok(flat(renderer.toJSON()).includes('自动生成暂不可用'))
+    // 失败不提示错误、不在表单里回显生成结果，原文原样保留。
     assert.equal(fieldByAria(renderer.toJSON(), '需求原文').props.value, raw)
+    assert.ok(!flat(renderer.toJSON()).includes('自动生成暂不可用'))
+    assert.ok(!flat(renderer.toJSON()).includes('本地整理'))
     const button = buttonByText(renderer.toJSON(), '开始需求分析')
     await act(async () => { button.props.onClick(); button.props.onClick() })
     assert.deepEqual(sessions, ['D:/repo/prepare-fallback'])
+    assert.deepEqual(prepareCalls, [{ path: 'D:/repo/prepare-fallback', brief: raw }])
     await act(async () => { resolveSession('prepared-session') })
     const start = posted.filter((item) => item.action === 'start')
     assert.equal(start.length, 1)
     assert.deepEqual(start[0].payload, { title: '原文标题', preset: 'fast', brief: raw, summary: '原文标题\n\n  保留原文缩进' })
-  } finally { prepareHandler = null; await act(async () => { renderer.unmount() }) }
-}))
+    // 宿主返回错误与真超时是两种原因，日志要能区分，不能都写成 timeout。
+    assert.deepEqual(warns, ['[dsh-flowgate] 自动生成标题与整理稿回落到原文派生：unavailable'], '宿主不可用不能被记成超时')
+  } finally { console.warn = realWarn; prepareHandler = null; await act(async () => { renderer.unmount() }) }
+})
 
 await check('进行中以整理稿展示并可展开原文，详情取最新view而非打开时快照', async () => {
   const flow = { ...alphaMember.flows[0], sessionId: 'sess-latest-requirement', brief: '快照旧原文', summary: '快照旧整理稿' }

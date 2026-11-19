@@ -122,33 +122,16 @@ const saveScreenshot = async name => {
 }
 const startWithKeyboard = async theme => {
   const raw = '.fg-start-section textarea[aria-label="需求原文"]'
-  const title = '.fg-start-title'
-  const summary = '.fg-start-summary .fg-requirement-text'
-  const firstBrief = '会话超过 30 分钟未活动时，接口返回 401，并提供重新认证入口。'
-  await fill(raw, firstBrief)
-  check('generated title and summary appear without extra inputs', await evaluate('document.querySelector(' + JSON.stringify(title) + ').textContent.length>0 && document.querySelector(' + JSON.stringify(summary) + ').textContent===' + JSON.stringify(firstBrief) + ' && document.querySelectorAll(".fg-start-section input").length===0 && document.querySelectorAll(".fg-start-section textarea").length===1'))
-  await ready('document.querySelector(".fg-start-section [role=status]")?.textContent.includes("已自动生成")')
-  check('debounced preparation uses raw requirement', await evaluate('window.fixtureRequests.some(r=>r.route.includes("/hub/prepare")&&r.body.brief===' + JSON.stringify(firstBrief) + ')'))
-  await inspectLayout('requirement prepared')
+  const form = '.fg-start-section'
+  const brief = '新需求：超过 30 分钟返回 401，保留 C:/Projects/atlas-console。'
+  await fill(raw, brief)
+  // 只填需求原文：输入期间不生成标题、预览或重新生成按钮，也不发整理请求。
+  check('start form asks only for the requirement and prepares nothing while typing', await evaluate('(function(){const form=document.querySelector(' + JSON.stringify(form) + ');return form.textContent.includes("需求描述") && form.querySelectorAll("textarea").length===1 && form.querySelectorAll("input").length===0 && !form.textContent.includes("标题与整理稿") && !form.textContent.includes("重新生成") && window.fixtureRequests.every(r=>!r.route.includes("/hub/prepare"))})()'))
+  await inspectLayout('requirement filled')
   await evaluate('document.activeElement?.blur()')
   await saveScreenshot('workspace')
+  // 慢响应：点击后一次性请求整理，请求带的是原始原文，结果直接进启动请求。
   await evaluate('window.fixturePrepare.delay=1500')
-  const oldBrief = '旧需求：保留 30 分钟与 401。'
-  await fill(raw, oldBrief)
-  await ready('window.fixtureRequests.some(r=>r.route.includes("/hub/prepare")&&r.body.brief===' + JSON.stringify(oldBrief) + ')')
-  await evaluate('window.fixturePrepare.delay=80')
-  const nextBrief = '新需求：超过 30 分钟返回 401，保留 C:/Projects/atlas-console。'
-  await fill(raw, nextBrief)
-  await ready('window.fixturePreparePending===0 && window.fixtureRequests.some(r=>r.route.includes("/hub/prepare")&&r.body.brief===' + JSON.stringify(nextBrief) + ')')
-  check('late preparation cannot overwrite newest generated content', await evaluate('document.querySelector(' + JSON.stringify(title) + ').textContent.startsWith("新需求") && document.querySelector(' + JSON.stringify(summary) + ').textContent.includes(' + JSON.stringify(nextBrief) + ')'))
-  await evaluate('window.fixturePrepare.status="fallback"')
-  await click('重新生成标题与整理稿')
-  await ready('document.querySelector(".fg-start-section [role=status]")?.textContent.includes("本地整理")')
-  check('fallback retains complete requirement and allows start', await evaluate('document.querySelector(' + JSON.stringify(raw) + ').value===' + JSON.stringify(nextBrief) + ' && document.querySelector(' + JSON.stringify(summary) + ').textContent===' + JSON.stringify(nextBrief) + ' && !' + button('开始需求分析') + '.disabled'))
-  await evaluate('window.fixturePrepare.status="ready"')
-  await click('重新生成标题与整理稿')
-  await ready('document.querySelector(".fg-start-section [role=status]")?.textContent.includes("已自动生成标题与整理稿。")')
-  check('explicit retry refreshes generated summary', await evaluate('document.querySelector(' + JSON.stringify(summary) + ').textContent.startsWith("目标与要求")'))
   if (theme === 'light') {
     await focus(raw); await key('Enter', 2)
   } else {
@@ -156,8 +139,12 @@ const startWithKeyboard = async theme => {
   }
   await ready('window.fixtureActions.some(a=>a.action==="start") && document.querySelector(".fg-current-flow")')
   const actions = await evaluate('window.fixtureActions.filter(a=>a.action==="start")')
-  check(theme === 'light' ? 'Ctrl+Enter starts once with original and summary' : 'Enter starts once with original and summary', actions.length === 1 && actions[0].payload.brief === nextBrief && actions[0].payload.summary.startsWith('目标与要求') && actions[0].payload.title.startsWith('新需求'))
-  check('current flow shows summary and expandable original', await evaluate('document.querySelector(".fg-current-flow .fg-requirement-text")?.textContent.startsWith("目标与要求") && document.querySelector(".fg-current-flow .fg-requirement-original")?.textContent.includes("C:/Projects/atlas-console")'))
+  const prepared = await evaluate('window.fixtureRequests.filter(r=>r.route.includes("/hub/prepare"))')
+  check('clicking start prepares once with the raw requirement', prepared.length === 1 && prepared[0].body.brief === brief, prepared.length)
+  check(theme === 'light' ? 'Ctrl+Enter starts once with original and prepared summary' : 'Enter starts once with original and prepared summary', actions.length === 1 && actions[0].payload.brief === brief && actions[0].payload.title.startsWith('新需求') && actions[0].payload.summary.startsWith('目标与要求'))
+  check('start form shows no preparation status copy', await evaluate('!document.body.textContent.includes("自动生成暂不可用") && !document.body.textContent.includes("本地整理") && !document.body.textContent.includes("重新生成标题与整理稿")'))
+  check('current flow shows prepared content and expandable original', await evaluate('document.querySelector(".fg-current-flow .fg-requirement-text")?.textContent.startsWith("目标与要求") && document.querySelector(".fg-current-flow .fg-requirement-original")?.textContent.includes("C:/Projects/atlas-console")'))
+  await evaluate('window.fixturePrepare.delay=80')
 }
 const inspectRules = async () => {
   const modal = 'document.querySelector("[role=dialog]")'
