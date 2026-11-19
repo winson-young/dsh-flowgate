@@ -1373,8 +1373,64 @@ rmSync(cwd, { recursive: true, force: true })
     assert.equal(back.body.stage, 'S2')
     const last = cx.delivered[cx.delivered.length - 1]
     const text = last.message.content.map((block) => block.text).join('\n')
-    assert.match(text, /用户退回到 S2 重做/)
+    assert.match(text, /退回已经生效/)
     assert.match(text, /进入 S2（/)
+    // 补发的是状态通知：Agent 收到时若已经在 S2 重做，不能把它当成再来一次回退。
+    assert.match(text, /不要再次回退/)
+  })
+}
+
+// 等待器在场时点「退回开发修复」：决策由工具结果带回，不能再补一条排队消息——
+// 否则 Agent 跑完当前轮又收到一次退回，把刚重做的产物清掉（用户看到的「又退回一次」）。
+{
+  const sid = 'sess-back-live'
+  const cx = makeHost(cwd, sid)
+  await cx.tool('flowgate_start', { title: '退回不重复', preset: 'fast' })
+  const scope = {
+    files_expected_to_change: ['src/auth/session.ts'],
+    capabilities: ['会话过期检测'],
+    out_of_scope_explicitly: [],
+    acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
+  }
+  const docCall = cx.tool('flowgate_doc', { html: '<html><body><p>退回</p></body></html>', scope })
+  await tick()
+  await cx.request('/api/flowgate/action', { sessionId: sid, action: 'doc', payload: { decision: 'approve' } })
+  await docCall
+  const devCall = cx.tool('flowgate_gate', { summary: '代码已改完' })
+  await tick()
+  await cx.request('/api/flowgate/action', { sessionId: sid, action: 'gate', payload: { decision: 'pass' } })
+  await devCall
+  const reviewCall = cx.tool(
+    'flowgate_review',
+    { angles: [{ id: 'correctness', name: '正确性', verdict: 'pass', findings: [] }] },
+  )
+  await tick()
+  const before = cx.delivered.length
+  const back = await cx.request('/api/flowgate/action', {
+    sessionId: sid,
+    action: 'gate',
+    payload: { decision: 'back', to: 'S2' },
+  })
+  const reviewed = await reviewCall
+  check('等待器在场时退回只回退一次且不补发排队消息', () => {
+    assert.equal(back.status, 200)
+    assert.equal(back.body.stage, 'S2')
+    assert.equal(cx.delivered.length, before)
+    assert.equal(reviewed.decision, 'reject')
+    assert.equal(reviewed.next, 'S2')
+  })
+  // 同一目标阶段在时间窗内的第二次退回只留事件，不再重置刚重做的阶段产物。
+  const again = await cx.request('/api/flowgate/action', {
+    sessionId: sid,
+    action: 'gate',
+    payload: { decision: 'back', to: 'S2' },
+  })
+  check('重复退回不会二次重置阶段', () => {
+    assert.equal(again.status, 200)
+    assert.equal(again.body.stage, 'S2')
+    const file = join(cwd, '.dsh-flowgate', 'flows.jsonl')
+    const events = readFileSync(file, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+    assert.ok(events.some((event) => event.type === 'flow.rollback.skipped'))
   })
 }
 
