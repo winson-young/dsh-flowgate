@@ -4,7 +4,7 @@ import { syncBuiltinESMExports } from 'node:module'
 import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply, scopeDenial, currentService, parseChanges } from '../lib/index.js'
+import { apply, scopeDenial, shellDenial, currentService, parseChanges } from '../lib/index.js'
 import { prepareRequirement } from '../lib/requirements.js'
 
 // ---------------------------------------------------------------------------
@@ -3090,6 +3090,130 @@ rmSync(cwd, { recursive: true, force: true })
     })
   } finally {
     rmSync(grantCwd, { recursive: true, force: true })
+  }
+}
+
+// ---------------------------------------------------------------------------
+// A 档纯解析命令 + scope 命令清单：这两条决定用户还要不要勾授权。
+// 纯解析命令不执行仓库代码，任何阶段都放行；清单内的命令在 S1 批准 scope 时
+// 一并过目，S2 / S4 直接放行，清单外的变更性命令仍走原来的开关。
+// 放在最后单独起 host：currentService 是模块级单例，中途再 apply 会顶掉前面的实例。
+// ---------------------------------------------------------------------------
+{
+  const cmdCwd = mkdtempSync(join(tmpdir(), 'flowgate-scope-cmd-'))
+  try {
+    const cx = makeHost(cmdCwd, 'sess-scope-cmd')
+    const act = (action, payload) => cx.request('/api/flowgate/action', { sessionId: 'sess-scope-cmd', action, payload })
+    await cx.tool('flowgate_start', { title: 'scope 命令清单', preset: 'fast' })
+
+    const s1Parse = await cx.guard('bash', { command: 'node --check lib/index.js' })
+    const s1Tsc = await cx.guard('bash', { command: 'tsc --noEmit -p tsconfig.json' })
+    const s1Build = await cx.guard('bash', { command: 'npm run build' })
+    const s1Sneak = await cx.guard('bash', { command: 'node --check a.js; rm -rf src' })
+    check('A 档纯解析命令不需要授权就放行，夹带逃逸的照样拒', () => {
+      assert.equal(s1Parse.kind, 'allow', JSON.stringify(s1Parse))
+      assert.equal(s1Tsc.kind, 'allow', JSON.stringify(s1Tsc))
+      assert.equal(s1Build.kind, 'deny')
+      assert.equal(s1Sneak.kind, 'deny')
+      assert.match(s1Sneak.reason, /任意代码|无法核对/)
+    })
+
+    const cmdDoc = cx.tool('flowgate_doc', {
+      html: '<html><body><p>命令清单</p></body></html>',
+      scope: {
+        files_expected_to_change: ['src/cmd.ts'],
+        // 重复、空白、超长、超量都要在提交时收敛：清单长到没人逐条看就等于又一个空白授权。
+        commands: [
+          '  npm test  ',
+          'npm test',
+          'npm run *',
+          '   ',
+          'x'.repeat(400),
+          ...Array.from({ length: 25 }, (_, index) => 'cmd-' + index),
+        ],
+        capabilities: ['改 cmd.ts'],
+        out_of_scope_explicitly: [],
+        acceptance_criteria: [{ id: 'AC-1', when: '清单内命令', then: '不需要授权' }],
+      },
+    })
+    await tick()
+    const approvedCmd = await act('doc', { decision: 'approve' })
+    await cmdDoc
+    check('scope 命令清单规范化：去空、去重、截断到 300 字、最多 20 条', () => {
+      const list = approvedCmd.body.scope.data.in_scope.commands
+      assert.equal(list.length, 20)
+      assert.equal(list[0], 'npm test')
+      assert.equal(list[1], 'npm run *')
+      assert.equal(list[2].length, 300)
+      assert.equal(new Set(list).size, list.length)
+    })
+
+    const listExact = await cx.guard('bash', { command: 'npm test' })
+    const listWild = await cx.guard('bash', { command: 'npm run build --silent' })
+    const listMiss = await cx.guard('bash', { command: 'npm publish' })
+    const s2CmdState = await cx.request('/api/flowgate/state?sessionId=sess-scope-cmd')
+    check('S2 清单内命令不需要开关就放行，清单外仍然拒', () => {
+      assert.equal(s2CmdState.body.stage, 'S2')
+      // 放行完全来自 scope 清单：授权开关始终没被打开。
+      assert.equal(s2CmdState.body.shellGrant, false)
+      assert.equal(listExact.kind, 'allow', JSON.stringify(listExact))
+      assert.equal(listWild.kind, 'allow', JSON.stringify(listWild))
+      assert.equal(listMiss.kind, 'deny')
+      assert.match(listMiss.reason, /commands 清单/)
+    })
+
+    await cx.guard('bash', { command: 'npm publish ' + 'a'.repeat(300) })
+    const audit = readFileSync(join(cmdCwd, '.dsh-flowgate', 'flows.jsonl'), 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .filter((item) => item.type === 'shell.allowed' || item.type === 'shell.denied')
+    check('每条 shell 判定都进审计流水，带命令原文与判定依据', () => {
+      const allowed = audit.filter((item) => item.type === 'shell.allowed')
+      const denied = audit.filter((item) => item.type === 'shell.denied')
+      assert.ok(allowed.some((item) => item.detail.command === 'npm test' && item.detail.reason === 'scope 命令清单'))
+      assert.ok(allowed.some((item) => item.detail.command === 'node --check lib/index.js' && item.detail.reason === '只读白名单'))
+      assert.ok(denied.some((item) => item.detail.command === 'npm publish' && item.detail.outcome === 'denied'))
+      // 逃逸命令单列 outcome：事后能分清是「不在白名单」还是「想拼出别的事」。
+      assert.ok(audit.some((item) => item.detail.outcome === 'escape'))
+      const clipped = audit.find((item) => item.detail.truncated === true)
+      assert.ok(clipped, '超长命令必须标记 truncated')
+      assert.equal(clipped.detail.command.length, 200)
+    })
+  } finally {
+    rmSync(cmdCwd, { recursive: true, force: true })
+  }
+}
+
+// 阶段闸门是唯一防线：清单是用户在 S1 批准的，但放行仍然只发生在 S2 / S4。
+{
+  const stageCwd = mkdtempSync(join(tmpdir(), 'flowgate-cmd-stage-'))
+  try {
+    const flowOf = (stage, commands) => ({
+      id: 'f_cmd_stage',
+      sessionId: 'sess_cmd_stage',
+      cwd: stageCwd,
+      finished: false,
+      stage,
+      shellGrant: false,
+      events: [],
+      scope: { frozen: true, data: { in_scope: { files_expected_to_change: ['src/a.ts'], commands, capabilities: [] } } },
+    })
+    const s1 = flowOf('S1', ['npm test'])
+    const s3 = flowOf('S3', ['npm test', 'npm run *'])
+    const s4 = flowOf('S4', ['npm test', 'npm run *'])
+    check('清单命中只在 S2 / S4 放行，S1 与 S3 照样拒', () => {
+      assert.ok(shellDenial(s1, { command: 'npm test' }), 'S1 不该被清单放过')
+      assert.ok(shellDenial(s3, { command: 'npm test' }), 'S3 不该被清单放过')
+      assert.equal(shellDenial(s4, { command: 'npm test' }), null)
+      assert.equal(shellDenial(s4, { command: 'npm run build' }), null)
+    })
+    check('前缀通配只认开头，空白条目不会放行任何命令', () => {
+      assert.ok(shellDenial(s4, { command: 'docker npm run build' }))
+      assert.ok(shellDenial(flowOf('S4', ['   ']), { command: 'npm test' }))
+    })
+  } finally {
+    rmSync(stageCwd, { recursive: true, force: true })
   }
 }
 

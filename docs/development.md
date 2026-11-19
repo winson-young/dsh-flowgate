@@ -37,13 +37,13 @@ S1 批准或跳过文档批准后，宿主冻结 scope。S2 对写入 / 编辑 /
 
 五条额外边界：
 
-- **scope 条目在提交时规范化**：`flowgate_doc` 收到的 `files_expected_to_change` 里，绝对路径与项目根之外的条目会被剔除，剔除结果通过 `droppedScopeEntries` 回给界面，并在工作台「待冻结 scope」卡片里列出。批准前用户看到的就是最终放行的清单。
+- **scope 条目在提交时规范化**：`flowgate_doc` 收到的 `files_expected_to_change` 里，绝对路径与项目根之外的条目会被剔除，剔除结果通过 `droppedScopeEntries` 回给界面，并在工作台「待冻结 scope」卡片里列出。批准前用户看到的就是最终放行的清单。`commands` 清单同样在提交时收敛：去空白、去重、单条截断到 300 字、最多 20 条——清单长到没人逐条看，就等于又一个空白授权。
 - **流程数据目录不对外开放**：`.dsh-flowgate/` 由插件自身维护，任何工具对它的写入都被拒绝（含 S2）。判断按路径段匹配，`../.dsh-flowgate/x` 与 `D:/任何目录/.dsh-flowgate/x` 同样命中；否则 Agent 可以改写自己的 scope 与规则。
 - **`run_code` 只能转发单次工具调用**：程序里出现 `import(`、`require(`、`node:fs`、`child_process`、`fs.`、`writeFile`、`eval(`、`Function(` 等痕迹即拒绝——判定前先剥掉字符串字面量与注释，否则 `ops_bash({ command: 'rmdir .tmp-x' })` 这种正常清理命令、以及 `// 清理 rmdir 残留` 这种说明文字，都会被当成 Node IO 整条拒掉；能解析成 `await tools.x(严格 JSON)` 的单次调用时，按被调用的那个工具再判一次（单调用开头/结尾的注释不算程序内容，`// plan: …` 这类必填的首行说明不会让解析失败）；解析不出来但程序里提到了需要核对 scope 的工具名（含 `tools['x']` 括号访问）也拒绝，因为多语句程序取不到真实参数（shell 工具除外：它的命令文本会被嵌套调用自己的守卫再判一次）。
 - **批量操作必须内联**：`ops_batch` 的 `operations` 逐条核对，`root` 参与路径解析（`root: 'D:/'` + `path: 'evil.txt'` 不会被当成项目内文件）。用 `operationsRef` 分页引用的批量操作无法静态核对，直接拒绝。
 - **带写盘的上下文工具同样过守卫**：`decompress` 的 `toFile` 会被当作写目标核对，不再整体放行。
 
-S2 的 shell 默认只允许只读命令（`pwd`、`ls`、`cat`、`git status/diff/log/branch --list` 等），重定向、管道、子 shell、`--output` 与解释器内联执行（`node -e`、`python -c`、`npx`）在任何阶段都拒绝——授权之后也拒绝，因为这类命令的写目标是运行时算出来的。命令必须单行：只读白名单的尾部只接受空格与制表符，`pwd\nrm -rf src` 这种换行夹带不会被当成 `pwd`。需要跑构建或测试时，用户在 S2「开发变更」或 S4「测试命令」卡片里勾选「允许执行构建/测试命令」（`toggleShellGrant`），授权在本次流程内持久：阶段推进（S2→S3→S4）与回退（S4→S2）都不清除，只有用户主动取消勾选、放弃流程、验收通过结束流程、冷恢复这四路会清掉。放行仍然按阶段判定——S1 与 S3 里即使 `shellGrant` 为真也只接受只读命令，`shellDenial` 的 `(S2 || S4) && shellGrant` 才是唯一放行条件。守卫按已知工具名称、参数及命令分类工作，覆盖范围以[宿主实现](../lib/index.js)为准，不能代替文件系统沙箱。
+S2 的 shell 默认只允许只读命令（`pwd`、`ls`、`cat`、`git status/diff/log/branch --list` 等），重定向、管道、子 shell、`--output` 与解释器内联执行（`node -e`、`python -c`、`npx`）在任何阶段都拒绝——授权之后也拒绝，因为这类命令的写目标是运行时算出来的。命令必须单行：只读白名单的尾部只接受空格与制表符，`pwd\nrm -rf src` 这种换行夹带不会被当成 `pwd`。需要跑构建或测试时，用户在 S2「开发变更」或 S4「测试命令」卡片里勾选「允许执行构建/测试命令」（`toggleShellGrant`），授权在本次流程内持久：阶段推进（S2→S3→S4）与回退（S4→S2）都不清除，只有用户主动取消勾选、放弃流程、验收通过结束流程、冷恢复这四路会清掉。放行仍然按阶段判定——S1 与 S3 里即使 `shellGrant` 为真也只接受只读命令。`shellDenial` 的判定顺序是：逃逸痕迹（重定向 / 管道 / 解释器内联）→ 只读白名单 → 纯解析命令（`node --check`、`tsc --noEmit`，不执行仓库代码，任何阶段都放行、不需要授权）→ scope 命令清单（`in_scope.commands`，随需求文档一起批准，`S2` / `S4` 命中即放行，末尾 `*` 只做前缀通配）→ 阶段授权 `(S2 || S4) && shellGrant`。清单外的变更性命令仍然只能靠这个开关放行。每条 shell 判定都写进 `flows.jsonl` 的 `shell.allowed` / `shell.denied` 事件，`detail` 带命令原文（截断到 200 字并标 `truncated`）、`outcome` 与 `reason`，事后能查这一轮到底跑了哪些命令、依据哪条规则。守卫按已知工具名称、参数及命令分类工作，覆盖范围以[宿主实现](../lib/index.js)为准，不能代替文件系统沙箱。
 
 评审与默认测试子代理在执行前按预留的 `childId` 登记到父流程，并由 `tools.guard` 最终工具守卫强制只读。写入 / 编辑工具及未知的变更工具默认拒绝；未经写授权的 shell 仅允许精确的 `pwd`；Git 可能刷新索引或执行仓库配置的外部程序，因此也拒绝。`script_path`、解释器和包测试脚本默认拒绝。读取通过结构化工具完成，`run_code` 仅接受一个工具调用与严格 JSON 参数，不能执行任意 JavaScript。需要修复代码时，回退到 S2 由开发阶段处理；这层守卫仍需配合宿主文件系统沙箱。
 

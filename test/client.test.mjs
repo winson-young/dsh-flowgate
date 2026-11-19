@@ -926,6 +926,7 @@ const HubPanelIcon = componentOf('sidebar.panellist')
       pending: true,
       pendingScope: {
         files_expected_to_change: ['src/auth/session.ts', 'src/auth/store.ts'],
+        commands: ['npm test', 'npm run *'],
         capabilities: ['会话过期检测'],
         out_of_scope_explicitly: ['OAuth 第三方登录'],
         acceptance_criteria: [{ id: 'AC-1', when: '会话超过 30 分钟未活动', then: '返回 401' }],
@@ -947,6 +948,13 @@ const HubPanelIcon = componentOf('sidebar.panellist')
     assert.ok(text.includes('已剔除的越界条目'))
     assert.ok(text.includes('../outside/evil.ts'))
     assert.ok(text.includes('D:/absolute/evil.ts'))
+  })
+  // 命令清单也是用户批准的东西，批准前必须能逐条看到。
+  await check('S1 批准前展示将直接放行的命令清单', () => {
+    assert.ok(text.includes('允许直接执行的命令'))
+    assert.ok(text.includes('npm test'))
+    assert.ok(text.includes('npm run *'))
+    assert.ok(text.includes('不需要再勾'))
   })
 }
 
@@ -991,6 +999,11 @@ const HubPanelIcon = componentOf('sidebar.panellist')
   await check('S2 显示冻结 scope 的白名单与越界清单', () => {
     assert.ok(text.includes('OAuth 第三方登录'))
     assert.ok(text.includes('会话过期检测'))
+  })
+
+  // 没列命令时不能静默留白：用户要能预判「待会儿还得勾授权」。
+  await check('scope 没有命令清单时说明仍要授权', () => {
+    assert.ok(text.includes('未列出可执行命令'))
   })
 
   await check('S2 显示开发规则检查清单', () => {
@@ -1065,6 +1078,36 @@ const HubPanelIcon = componentOf('sidebar.panellist')
     const call = posted.find((item) => item.action === 'toggleShellGrant')
     assert.ok(call, '必须提交 toggleShellGrant')
     assert.equal(call.payload.enabled, true)
+  })
+}
+
+// scope 里列过命令时，开关必须先说清「这些命令不需要我」，否则用户会以为还得勾一次。
+{
+  posted = []
+  currentView = baseView('S4', {
+    shellGrant: false,
+    scope: {
+      frozen: true,
+      frozenAt: '2026-11-17T10:00:00Z',
+      withoutDocApproval: false,
+      data: {
+        version: 1,
+        frozen_at: '2026-11-17T10:00:00Z',
+        in_scope: {
+          files_expected_to_change: ['src/auth/session.ts'],
+          commands: ['npm test', 'npm run *'],
+          capabilities: ['会话过期检测'],
+        },
+      },
+    },
+  })
+  const tree = (await render(FlowDetail, {})).toJSON()
+  await check('S4 授权开关说明清单内命令不需要它', () => {
+    const all = flat(tree)
+    assert.ok(all.includes('已列 2 条可执行命令'))
+    assert.ok(all.includes('只有清单外的变更性命令才受这里控制'))
+    // S4 不渲染冻结 scope 卡片，文案不能指向「下方」看不到的东西。
+    assert.ok(!all.includes('见下方「冻结 scope」'))
   })
 }
 
