@@ -149,7 +149,11 @@ function baseView(stage, patch = {}) {
       data: {
         version: 1,
         frozen_at: '2026-11-17T10:00:00Z',
-        in_scope: { files_expected_to_change: ['src/auth/session.ts'], capabilities: ['会话过期检测'] },
+        in_scope: {
+          files_expected_to_change: ['src/auth/session.ts'],
+          capabilities: ['会话过期检测'],
+          shared_contracts: ['src/auth/session.ts 的 checkExpiry(session, now) 签名保持不变'],
+        },
         out_of_scope_explicitly: ['OAuth 第三方登录'],
         acceptance_criteria: [{ id: 'AC-1', when: '会话超过 30 分钟未活动', then: '返回 401' }],
       },
@@ -931,6 +935,7 @@ const HubPanelIcon = componentOf('sidebar.panellist')
         files_expected_to_change: ['src/auth/session.ts', 'src/auth/store.ts'],
         commands: ['npm test', 'npm run *'],
         capabilities: ['会话过期检测'],
+        shared_contracts: ['checkExpiry(session, now) 的签名与返回值保持不变'],
         out_of_scope_explicitly: ['OAuth 第三方登录'],
         acceptance_criteria: [{ id: 'AC-1', when: '会话超过 30 分钟未活动', then: '返回 401' }],
       },
@@ -951,6 +956,11 @@ const HubPanelIcon = componentOf('sidebar.panellist')
     assert.ok(text.includes('已剔除的越界条目'))
     assert.ok(text.includes('../outside/evil.ts'))
     assert.ok(text.includes('D:/absolute/evil.ts'))
+  })
+  // 影响面同样要盲签前可见：评审据它判定发现是否属于本次范围。
+  await check('S1 批准前展示本次会动的共用契约', () => {
+    assert.ok(text.includes('本次会动的共用契约与已知约束'))
+    assert.ok(text.includes('checkExpiry(session, now) 的签名与返回值保持不变'))
   })
   // 命令清单也是用户批准的东西，批准前必须能逐条看到。
   await check('S1 批准前展示将直接放行的命令清单', () => {
@@ -1002,6 +1012,13 @@ const HubPanelIcon = componentOf('sidebar.panellist')
   await check('S2 显示冻结 scope 的白名单与越界清单', () => {
     assert.ok(text.includes('OAuth 第三方登录'))
     assert.ok(text.includes('会话过期检测'))
+  })
+
+  // 影响面要和文件白名单一起摆出来：评审据它判断发现是否属于本次范围，用户批准 scope 时也批准了这部分。
+  await check('S2 显示本次会动的共用契约与已知约束', () => {
+    assert.ok(text.includes('本次会动的共用契约与已知约束'))
+    assert.ok(text.includes('checkExpiry(session, now) 签名保持不变'))
+    assert.ok(!text.includes('未声明影响面'))
   })
 
   // 没列命令时不能静默留白：用户要能预判「待会儿还得勾授权」。
@@ -1247,6 +1264,7 @@ const HubPanelIcon = componentOf('sidebar.panellist')
     presetInfo: { label: '大需求严格执行', summary: '四个评审角度 + 三个测试方向' },
     review: {
       blocking: 1,
+      advisories: 2,
       by: 'subagents',
       at: '2026-11-17T10:10:00Z',
       angles: [
@@ -1256,7 +1274,9 @@ const HubPanelIcon = componentOf('sidebar.panellist')
           verdict: 'blocking',
           suggestUpgrade: false,
           findings: [
-            { file: 'src/auth/session.ts', line: 88, severity: 'CRITICAL', summary: '过期判断用了客户端时间' },
+            { file: 'src/auth/session.ts', line: 88, severity: 'CRITICAL', summary: '过期判断用了客户端时间', ac: 'AC-1', acMatched: true },
+            { file: 'src/auth/session.ts', line: 92, severity: 'MAJOR', summary: '并发刷新没有去重', acMatched: false },
+            { file: 'src/config/secrets.ts', line: 3, severity: 'MAJOR', summary: '密钥写死在配置里', ac: 'AC-9', acMatched: true, fileInScope: false },
           ],
         },
         { id: 'test-quality', name: '测试质量', verdict: 'pass', findings: [] },
@@ -1281,6 +1301,15 @@ const HubPanelIcon = componentOf('sidebar.panellist')
     assert.ok(text.includes('src/auth/session.ts:88'))
     assert.ok(text.includes('CRITICAL'))
     assert.ok(text.includes('过期判断用了客户端时间'))
+  })
+
+  // 归属口径：挂不上验收标准、或落在 scope 文件之外的发现只作提示，不进重做清单。
+  await check('S3 标出发现的验收标准归属与仅提示条数', () => {
+    assert.ok(text.includes('2 条仅提示'))
+    assert.ok(text.includes('只有挂得上冻结 scope 验收标准'))
+    assert.ok(text.includes('AC-9'))
+    assert.ok(text.includes('未归属验收标准'))
+    assert.ok(text.includes('scope 外文件'))
   })
 
   await check('S3 门禁给出通过 / 退回 / 跳过', () => {

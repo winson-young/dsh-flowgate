@@ -339,7 +339,12 @@ const scopeInput = {
   files_expected_to_change: ['src/auth/session.ts', '../outside/evil.ts', 'D:/absolute/evil.ts'],
   capabilities: ['会话过期检测', '过期后返回 401'],
   out_of_scope_explicitly: ['OAuth 第三方登录', '前端 UI 改动'],
-  acceptance_criteria: [{ id: 'AC-1', when: 'session 超过 30 分钟未活动', then: '下一次请求返回 401' }],
+  acceptance_criteria: [
+    { id: 'AC-1', when: 'session 超过 30 分钟未活动', then: '下一次请求返回 401' },
+    { id: 'AC-2', when: '并发刷新令牌', then: '只产生一次刷新请求' },
+  ],
+  // 影响面：评审发现的归属与「这次会动哪些共用契约」都靠它，冻结后原样落进 scope.json。
+  shared_contracts: ['lib/auth/token.ts 的刷新入口参数保持 (sessionId, now) 不变'],
 }
 const docPending = runTool('flowgate_doc', {
   html: '<!doctype html><html><body><h1>需求文档</h1></body></html>',
@@ -585,7 +590,8 @@ const reviewPending = gateRound(
         name: '正确性',
         verdict: 'blocking',
         findings: [
-          { file: 'src/auth/session.ts', line: 42, severity: 'MAJOR', summary: '过期时间未考虑时区' },
+          // 挂在已声明的验收标准上、且在 scope 文件内：这类发现才进重做清单。
+          { file: 'src/auth/session.ts', line: 42, severity: 'MAJOR', ac: 'AC-1', summary: '过期时间未考虑时区' },
         ],
       },
     ],
@@ -655,7 +661,7 @@ const reviewPending2 = runTool('flowgate_review', {
       id: 'correctness',
       name: '正确性',
       verdict: 'blocking',
-      findings: [{ file: 'src/auth/session.ts', line: 12, severity: 'CRITICAL', summary: '缺少并发保护' }],
+      findings: [{ file: 'src/auth/session.ts', line: 12, severity: 'CRITICAL', ac: 'AC-2', summary: '缺少并发保护' }],
     },
   ],
 })
@@ -683,7 +689,7 @@ const reviewPending3 = gateRound(
         id: 'security',
         name: '安全',
         verdict: 'pass',
-        findings: [{ file: 'src/auth/session.ts', line: 20, severity: 'MINOR', summary: '建议日志脱敏' }],
+        findings: [{ file: 'src/auth/session.ts', line: 20, severity: 'MINOR', ac: 'AC-1', summary: '建议日志脱敏' }],
       },
     ],
   },
@@ -871,7 +877,8 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
       id: 'security',
       name: '安全',
       verdict: 'blocking',
-      findings: [{ file: 'src/config/secrets.ts', line: 7, severity: 'CRITICAL', summary: '密钥硬编码' }],
+      // 挂上了验收标准，但文件不在 scope 内：仍然不算阻塞项，且说明 scope 没划够。
+      findings: [{ file: 'src/config/secrets.ts', line: 7, severity: 'CRITICAL', ac: 'AC-1', summary: '密钥硬编码' }],
     }],
   })
   await tick()
@@ -3214,6 +3221,100 @@ rmSync(cwd, { recursive: true, force: true })
     })
   } finally {
     rmSync(stageCwd, { recursive: true, force: true })
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 评审归属口径与截断：只有挂在冻结 scope 的验收标准上、且落在 scope 文件内的
+// 非 MINOR 发现才进重做清单；对不上的降级成建议。fast 档单角度只留最重要的 3 条。
+// 放在最后单独起 host：currentService 是模块级单例，中途再 apply 会顶掉前面的实例。
+// ---------------------------------------------------------------------------
+{
+  const gateCwd = mkdtempSync(join(tmpdir(), 'flowgate-finding-gate-'))
+  try {
+    const px = makeHost(gateCwd, 'sess-finding-gate')
+    const act = (action, payload) => px.request('/api/flowgate/action', { sessionId: 'sess-finding-gate', action, payload })
+    await px.tool('flowgate_start', { title: '评审归属口径', preset: 'fast' })
+    const doc = px.tool('flowgate_doc', {
+      html: '<html><body><p>归属口径</p></body></html>',
+      scope: {
+        files_expected_to_change: ['src/gate.ts'],
+        capabilities: ['改 gate.ts'],
+        out_of_scope_explicitly: [],
+        acceptance_criteria: [{ id: 'AC-1', when: '并发调用', then: '只刷新一次令牌' }],
+        shared_contracts: ['src/gate.ts 导出的 gate(x) 签名不变'],
+      },
+    })
+    await tick()
+    const s1State = await px.request('/api/flowgate/state?sessionId=sess-finding-gate')
+    check('影响面随 scope 一起进待批准清单', () => {
+      assert.deepEqual(s1State.body.doc.pendingScope.shared_contracts, ['src/gate.ts 导出的 gate(x) 签名不变'])
+    })
+    await act('doc', { decision: 'approve' })
+    await doc
+    const frozenScope = JSON.parse(readFileSync(join(gateCwd, '.dsh-flowgate', 'scope.json'), 'utf8'))
+    const s2Status = await px.tool('flowgate_status', {})
+    check('影响面冻结进 scope.json 并写进状态摘要', () => {
+      assert.deepEqual(frozenScope.in_scope.shared_contracts, ['src/gate.ts 导出的 gate(x) 签名不变'])
+      assert.match(s2Status.summary, /本次会动的共用契约与已知约束/)
+      assert.match(s2Status.summary, /gate\(x\) 签名不变/)
+    })
+
+    const dev = px.tool('flowgate_gate', {})
+    await tick()
+    await act('gate', { decision: 'pass' })
+    await dev
+    const review = px.tool('flowgate_review', {
+      angles: [{
+        id: 'correctness',
+        name: '正确性',
+        verdict: 'blocking',
+        findings: [
+          { file: 'src/gate.ts', line: 1, severity: 'MAJOR', ac: 'AC-1', summary: '并发时可能重复刷新' },
+          { file: 'src/gate.ts', line: 2, severity: 'CRITICAL', summary: '没挂验收标准的发现' },
+          { file: 'src/other.ts', line: 3, severity: 'MAJOR', ac: 'AC-1', summary: '落在 scope 之外' },
+          { file: 'src/gate.ts', line: 4, severity: 'MAJOR', ac: 'AC-9', summary: '验收标准 id 不存在' },
+          { file: 'src/gate.ts', line: 5, severity: 'MINOR', ac: 'AC-1', summary: '只是建议' },
+        ],
+      }],
+    })
+    await tick()
+    const reviewState = await px.request('/api/flowgate/state?sessionId=sess-finding-gate')
+    const reported = reviewState.body.review
+    const kept = reported.angles[0].findings
+    check('fast 档单角度只留最重要的 3 条，被截掉的条数留痕', () => {
+      assert.equal(kept.length, 4)
+      assert.match(kept[3].summary, /另有 2 条未列出/)
+      assert.equal(kept[3].severity, 'MINOR')
+    })
+    check('只有挂在验收标准上且在 scope 文件内的发现进重做清单', () => {
+      assert.equal(reported.blocking, 1)
+      assert.equal(reported.advisories, 2)
+      assert.equal(kept[0].acMatched, false)
+      assert.equal(kept[0].blocking, false)
+      assert.equal(kept[1].acMatched, true)
+      assert.equal(kept[1].fileInScope, true)
+      assert.equal(kept[1].blocking, true)
+      assert.equal(kept[2].fileInScope, false)
+      assert.equal(kept[2].blocking, false)
+    })
+    check('scope 外的发现单独回报给界面', () => {
+      assert.equal(reviewState.body.reviewOutsideScope.length, 1)
+      assert.equal(reviewState.body.reviewOutsideScope[0].file, 'src/other.ts')
+    })
+    await act('gate', { decision: 'back', to: 'S2' })
+    const reviewResult = await review
+    check('退回时讲清哪些发现不计入重做清单', () => {
+      assert.equal(reviewResult.decision, 'reject')
+      assert.match(reviewResult.message, /另有 2 条发现对不上冻结 scope 的验收标准/)
+    })
+    const indexSource = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
+    check('评审子代理的提示里带上冻结 scope 的影响面与验收标准', () => {
+      assert.match(indexSource, /in_scope\.shared_contracts 就是本次允许触及的影响面/)
+      assert.match(indexSource, /'验收标准：' \+ JSON\.stringify\(scope\.acceptance_criteria/)
+    })
+  } finally {
+    rmSync(gateCwd, { recursive: true, force: true })
   }
 }
 
