@@ -525,10 +525,10 @@ const HubPanelIcon = componentOf('sidebar.panellist')
     assert.ok(text.includes('小功能快速开发'))
   })
   const areas = () => findTags(renderer.toJSON(), 'textarea')
-  await check('空态给的是需求描述输入框，不是只能填标题', () => {
+  await check('空态只要求填写需求原文，标题与整理稿自动生成', () => {
     assert.ok(flat(renderer.toJSON()).includes('需求描述'))
     const found = areas()
-    assert.equal(found.length, 2, '分别提供原文与可编辑整理稿')
+    assert.equal(found.length, 1, '标题与整理稿自动生成，不再提供可编辑输入框')
     assert.equal(found[0].props.rows, 4)
     assert.equal(found[0].props.required, true)
     assert.equal(found[0].props['aria-required'], true)
@@ -1821,7 +1821,7 @@ const resetHub = (members = []) => {
   await click(buttonByText(renderer.toJSON(), 'alpha'))
   await check('选中工作区后就能写需求，不用回会话', () => {
     assert.ok(hasButton(renderer.toJSON(), '开始需求分析'))
-    assert.equal(findTags(renderer.toJSON(), 'textarea').length, 2)
+    assert.equal(findTags(renderer.toJSON(), 'textarea').length, 1)
   })
   const area = findTags(renderer.toJSON(), 'textarea')[0]
   await act(async () => {
@@ -2304,7 +2304,7 @@ await check('仅有完成或放弃记录时主区直接新建，历史详情不�
       assert.ok(flat(tree).indexOf('开始新流程') < flat(tree).indexOf('流程记录'))
       assert.equal(nodeByClass(tree, 'fg-workspace-card fg-flow-history').props.open, false)
       await click(buttonByText(tree, '导出报表'))
-      assert.equal(findTags(renderer.toJSON(), 'textarea').length, 2, '历史详情不能新增第二份启动表单')
+      assert.equal(findTags(renderer.toJSON(), 'textarea').length, 1, '历史详情不能新增第二份启动表单')
     } finally { await act(async () => { renderer.unmount() }) }
   }
 })
@@ -2358,7 +2358,7 @@ await check('切换工作区等待流程数据时隐藏旧表单和旧继续入�
   const renderer = await renderHub()
   try {
     await click(buttonByText(renderer.toJSON(), 'alpha'))
-    assert.equal(findTags(renderer.toJSON(), 'textarea').length, 2)
+    assert.equal(findTags(renderer.toJSON(), 'textarea').length, 1)
     await click(buttonByText(renderer.toJSON(), '工作区列表'))
     await click(buttonByText(renderer.toJSON(), 'beta'))
     assert.ok(flat(renderer.toJSON()).includes('正在读取当前流程'))
@@ -2420,13 +2420,15 @@ await check('新建需求草稿跨规则保存、历史分页和刷新保留，�
   const assertDraft = () => {
     const tree = renderer.toJSON()
     assert.equal(findTags(tree, 'textarea')[0].props.value, brief)
-    assert.equal(inputByPlaceholder(tree, '默认使用需求第一行').props.value, '入口草稿')
+    // 标题与整理稿自动生成，只读展示，不再有对应输入框。
+    assert.equal(nodeByClass(tree, 'fg-start-title').children.join(''), '先完整保留这份长需求')
+    assert.ok(!findTags(tree, 'input').some((node) => node.props['aria-label'] === '任务标题'), '不再要求填写标题')
+    assert.ok(!findTags(tree, 'textarea').some((node) => node.props['aria-label'] === '需求整理稿'), '不再要求填写整理稿')
     assert.equal(buttonByText(tree, '大需求严格执行').props['aria-pressed'], true)
   }
   try {
     await click(buttonByText(renderer.toJSON(), 'alpha'))
     await changeValue(findTags(renderer.toJSON(), 'textarea')[0], brief)
-    await changeValue(inputByPlaceholder(renderer.toJSON(), '默认使用需求第一行'), '入口草稿')
     await click(buttonByText(renderer.toJSON(), '大需求严格执行'))
     await openWorkspaceRules(renderer)
     await click(buttonByText(ruleDialog(renderer), '保存规则'))
@@ -2452,7 +2454,7 @@ await check('新建需求草稿跨规则保存、历史分页和刷新保留，�
     assertDraft()
     await click(buttonByText(renderer.toJSON(), '开始需求分析'))
     assert.deepEqual(sessions, [alpha.path])
-    assert.deepEqual(posted.find((item) => item.action === 'start').payload, { title: '入口草稿', brief, summary: brief, preset: 'strict' })
+    assert.deepEqual(posted.find((item) => item.action === 'start').payload, { title: '先完整保留这份长需求', brief, summary: brief, preset: 'strict' })
     assert.equal(findTags(renderer.toJSON(), 'textarea')[0].props.value, '', '成功启动才清空本工作区草稿')
     await click(buttonByText(renderer.toJSON(), '工作区列表'))
     await click(buttonByText(renderer.toJSON(), 'beta'))
@@ -2464,6 +2466,11 @@ await check('新建需求草稿跨规则保存、历史分页和刷新保留，�
 // 四阶段统一草稿、内容对照与自动整理的行为契约
 // ---------------------------------------------------------------------------
 
+function generatedSummary(tree) {
+  const node = [...findTags(tree, 'p')].find((item) => item.props['aria-label'] === '自动生成的整理稿')
+  assert.ok(node, '找不到自动生成的整理稿')
+  return node.children.join('')
+}
 function fieldByAria(tree, label) {
   const field = [...findTags(tree, 'textarea'), ...findTags(tree, 'input')].find((node) => node.props['aria-label'] === label)
   assert.ok(field, '找不到输入：' + label)
@@ -2654,8 +2661,8 @@ await check('需求先派生基础标题和排版，800ms去抖只整理最新�
     await click(buttonByText(renderer.toJSON(), 'prepare-debounce'))
     const raw = '  ## 规划需求。\r\n  - 保持缩进\r\n\r\n\r\n第三段  '
     await changeValue(fieldByAria(renderer.toJSON(), '需求原文'), raw)
-    assert.equal(fieldByAria(renderer.toJSON(), '任务标题').props.value, '规划需求')
-    assert.equal(fieldByAria(renderer.toJSON(), '需求整理稿').props.value, '## 规划需求。\n  - 保持缩进\n\n第三段')
+    assert.equal(nodeByClass(renderer.toJSON(), 'fg-start-title').children.join(''), '规划需求')
+    assert.equal(generatedSummary(renderer.toJSON()), '## 规划需求。\n  - 保持缩进\n\n第三段')
     assert.equal(prepareCalls.length, 0)
     await changeValue(fieldByAria(renderer.toJSON(), '需求原文'), '第二份需求\n补充')
     assert.equal(clock.pending(), 1)
@@ -2665,7 +2672,7 @@ await check('需求先派生基础标题和排版，800ms去抖只整理最新�
   } finally { await act(async () => { renderer.unmount() }) }
 }))
 
-await check('整理响应乱序与输入途中手改不会覆盖新稿，重新生成只解锁对应字段', async () => withPrepareClock(async (clock) => {
+await check('整理响应乱序不覆盖新稿，重新生成让在途响应失效并刷新两个字段', async () => withPrepareClock(async (clock) => {
   resetHub([emptyMember('prepare-race')])
   const replies = []
   prepareHandler = (body) => new Promise((resolve) => replies.push({ ...body, resolve }))
@@ -2679,31 +2686,25 @@ await check('整理响应乱序与输入途中手改不会覆盖新稿，重新�
     assert.equal(replies.length, 2)
     await act(async () => { replies[1].resolve(response({ title: '新标题', summary: '新整理稿', status: 'ready' })) })
     await act(async () => { replies[0].resolve(response({ title: '旧标题', summary: '旧整理稿', status: 'ready' })) })
-    assert.equal(fieldByAria(renderer.toJSON(), '任务标题').props.value, '新标题')
-    assert.equal(fieldByAria(renderer.toJSON(), '需求整理稿').props.value, '新整理稿')
+    // 迟到的旧响应不能盖住新稿。
+    assert.equal(nodeByClass(renderer.toJSON(), 'fg-start-title').children.join(''), '新标题')
+    assert.equal(generatedSummary(renderer.toJSON()), '新整理稿')
+    // 两个字段都是只读展示，界面没有可手改的入口。
+    assert.ok(!findTags(renderer.toJSON(), 'input').some((node) => node.props['aria-label'] === '任务标题'))
+    assert.ok(!findTags(renderer.toJSON(), 'textarea').some((node) => node.props['aria-label'] === '需求整理稿'))
     await changeValue(fieldByAria(renderer.toJSON(), '需求原文'), '第三版')
     await clock.flush()
-    await changeValue(fieldByAria(renderer.toJSON(), '任务标题'), '我的标题')
-    await act(async () => { replies[2].resolve(response({ title: '模型标题', summary: '第三版整理', status: 'ready' })) })
-    assert.equal(fieldByAria(renderer.toJSON(), '任务标题').props.value, '我的标题')
-    assert.equal(fieldByAria(renderer.toJSON(), '需求整理稿').props.value, '第三版整理')
-    await changeValue(fieldByAria(renderer.toJSON(), '需求整理稿'), '我的整理稿')
-    await changeValue(fieldByAria(renderer.toJSON(), '需求原文'), '第四版')
+    assert.equal(replies.length, 3)
+    // 重新生成：先回落到本地派生结果，并让在途的第三次响应失效。
+    await click(buttonByText(renderer.toJSON(), '重新生成标题与整理稿'))
+    assert.equal(nodeByClass(renderer.toJSON(), 'fg-start-title').children.join(''), '第三版')
+    assert.equal(generatedSummary(renderer.toJSON()), '第三版')
     await clock.flush()
-    assert.equal(replies.length, 3, '两个字段都手改后不再发送无用整理请求')
-    assert.equal(fieldByAria(renderer.toJSON(), '任务标题').props.value, '我的标题')
-    assert.equal(fieldByAria(renderer.toJSON(), '需求整理稿').props.value, '我的整理稿')
-    await click(buttonByAria(renderer.toJSON(), '重新生成标题'))
-    await clock.flush()
-    await act(async () => { replies[3].resolve(response({ title: '第四版自动标题', summary: '不能覆盖的整理稿', status: 'ready' })) })
-    assert.equal(fieldByAria(renderer.toJSON(), '任务标题').props.value, '第四版自动标题')
-    assert.equal(fieldByAria(renderer.toJSON(), '需求整理稿').props.value, '我的整理稿')
-    await changeValue(fieldByAria(renderer.toJSON(), '任务标题'), '保留的新标题')
-    await click(buttonByAria(renderer.toJSON(), '重新整理需求'))
-    await clock.flush()
-    await act(async () => { replies[4].resolve(response({ title: '不能覆盖的新标题', summary: '第四版重新整理', status: 'ready' })) })
-    assert.equal(fieldByAria(renderer.toJSON(), '任务标题').props.value, '保留的新标题')
-    assert.equal(fieldByAria(renderer.toJSON(), '需求整理稿').props.value, '第四版重新整理')
+    assert.equal(replies.length, 4)
+    await act(async () => { replies[3].resolve(response({ title: '第三版自动标题', summary: '第三版整理', status: 'ready' })) })
+    await act(async () => { replies[2].resolve(response({ title: '失效的标题', summary: '失效的整理稿', status: 'ready' })) })
+    assert.equal(nodeByClass(renderer.toJSON(), 'fg-start-title').children.join(''), '第三版自动标题')
+    assert.equal(generatedSummary(renderer.toJSON()), '第三版整理')
   } finally { prepareHandler = null; await act(async () => { renderer.unmount() }) }
 }))
 
@@ -2720,11 +2721,11 @@ await check('切换工作区后迟到整理不串稿，返回原目录保留本�
     await click(buttonByText(renderer.toJSON(), 'prepare-beta'))
     await changeValue(fieldByAria(renderer.toJSON(), '需求原文'), '乙目录原文')
     await act(async () => { reply(response({ title: '迟到甲标题', summary: '迟到甲整理', status: 'ready' })) })
-    assert.equal(fieldByAria(renderer.toJSON(), '任务标题').props.value, '乙目录原文')
-    assert.equal(fieldByAria(renderer.toJSON(), '需求整理稿').props.value, '乙目录原文')
+    assert.equal(nodeByClass(renderer.toJSON(), 'fg-start-title').children.join(''), '乙目录原文')
+    assert.equal(generatedSummary(renderer.toJSON()), '乙目录原文')
     await click(buttonByText(renderer.toJSON(), '工作区列表'))
     await click(buttonByText(renderer.toJSON(), 'prepare-alpha'))
-    assert.equal(fieldByAria(renderer.toJSON(), '任务标题').props.value, '甲目录原文')
+    assert.equal(nodeByClass(renderer.toJSON(), 'fg-start-title').children.join(''), '甲目录原文')
     assert.equal(fieldByAria(renderer.toJSON(), '需求原文').props.value, '甲目录原文')
   } finally { prepareHandler = null; await act(async () => { renderer.unmount() }) }
 }))
@@ -2746,7 +2747,7 @@ await check('超20000字符保留完整输入并拒绝整理和启动', async ()
   } finally { await act(async () => { renderer.unmount() }) }
 }))
 
-await check('整理失败可直接启动，重复启动幂等且payload独立保留原文和手工整理稿', async () => withPrepareClock(async (clock) => {
+await check('整理失败可直接启动，重复启动幂等且payload带上自动派生的标题与整理稿', async () => withPrepareClock(async (clock) => {
   resetHub([emptyMember('prepare-fallback')]); posted = []
   prepareHandler = () => response({ error: '模型暂不可用' }, 503)
   const sessions = []
@@ -2757,16 +2758,15 @@ await check('整理失败可直接启动，重复启动幂等且payload独立保
     const raw = '  原文标题\r\n\r\n\r\n  保留原文缩进  '
     await changeValue(fieldByAria(renderer.toJSON(), '需求原文'), raw)
     await clock.flush()
-    assert.ok(flat(renderer.toJSON()).includes('自动整理暂不可用'))
+    assert.ok(flat(renderer.toJSON()).includes('自动生成暂不可用'))
     assert.equal(fieldByAria(renderer.toJSON(), '需求原文').props.value, raw)
-    await changeValue(fieldByAria(renderer.toJSON(), '需求整理稿'), '我的结构化整理\n保留验收标准')
     const button = buttonByText(renderer.toJSON(), '开始需求分析')
     await act(async () => { button.props.onClick(); button.props.onClick() })
     assert.deepEqual(sessions, ['D:/repo/prepare-fallback'])
     await act(async () => { resolveSession('prepared-session') })
     const start = posted.filter((item) => item.action === 'start')
     assert.equal(start.length, 1)
-    assert.deepEqual(start[0].payload, { title: '原文标题', preset: 'fast', brief: raw, summary: '我的结构化整理\n保留验收标准' })
+    assert.deepEqual(start[0].payload, { title: '原文标题', preset: 'fast', brief: raw, summary: '原文标题\n\n  保留原文缩进' })
   } finally { prepareHandler = null; await act(async () => { renderer.unmount() }) }
 }))
 

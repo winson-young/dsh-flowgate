@@ -122,9 +122,9 @@ S2 同时拒绝被识别为变更性的 shell 命令，如 `rm`、`mv`、`sed -i
 
 **面板里也能开第一条流程**：面板没有 `sessionId`，所以工作区主区域的「开始新流程」把 `StartPanel` 的 `sessionId` 换成 `resolveSession`——点「开始需求分析」时才向宿主换会话，链路由 `hubActions.sessionForWorkspace(path)` 提供。入口由 `/hub/flows` 的 `currentFlow` 决定，不从当前历史页推断：完成或放弃后返回 `null`，即恢复新流程表单。内嵌 `FlowDetail` 禁用重新开始入口，避免历史详情出现第二张新需求表单。
 
-新需求草稿在当前工作台面板内按目录保留原始需求、标题、整理稿、手动编辑状态和执行档位；保存规则、历史翻页、数据刷新或返回列表后仍可继续编辑，成功启动时只清空对应目录的草稿。宿主重启后，详情接口会按会话目录恢复进行中流程，无需先调用状态工具。流程目录、文件签名或快照读取发生权限等 I/O 错误时返回失败，客户端保留重试入口并隐藏新建表单；已确认损坏的 JSON 仍按原约定跳过。
+新需求草稿在当前工作台面板内按目录保留原始需求、自动生成的标题与整理稿、执行档位；保存规则、历史翻页、数据刷新或返回列表后仍可继续编辑，成功启动时只清空对应目录的草稿。宿主重启后，详情接口会按会话目录恢复进行中流程，无需先调用状态工具。流程目录、文件签名或快照读取发生权限等 I/O 错误时返回失败，客户端保留重试入口并隐藏新建表单；已确认损坏的 JSON 仍按原约定跳过。
 
-需求输入先即时生成基础标题与排版，停止输入 800ms 后请求整理接口。手动修改标题和整理稿分别锁定，迟到请求不能覆盖新输入或手工字段，主动重新整理可再次生成。模型调用只复用现有服务，不增加凭据或依赖、不开放工具调用；请求失败不阻塞启动。原文与整理稿以 `brief`、`summary` 独立保存，原文不被摘要替换。旧记录缺少 `summary` 时回退展示 `brief`，正文以纯文本渲染。
+**启动表单只要求填需求原文**：标题与整理稿是自动生成的只读展示，界面不再提供输入框，也没有「手改后锁定」这一层——它们只为了让列表和详情读起来更友好，S1 的分析始终以 `brief` 原文为唯一依据，整理稿既不替代原文，也不得据它增删目标、约束或验收标准，两者不一致时一律以原文为准（这条同时写进了 S1 唤醒消息和 `flowgate_status` 的输出）。需求输入先即时按本地规则派生基础标题与排版，停止输入 800ms 后请求整理接口覆盖；迟到请求不能覆盖更新的原文，点「重新生成标题与整理稿」会先回落到本地派生结果、再接受新一次生成，并让在途响应失效。模型调用只复用现有服务，不增加凭据或依赖、不开放工具调用；请求失败不阻塞启动。原文与整理稿以 `brief`、`summary` 独立保存，原文不被摘要替换。旧记录缺少 `summary` 时回退展示 `brief`，正文以纯文本渲染。
 
 启动链路：
 
@@ -141,7 +141,7 @@ S2 同时拒绝被识别为变更性的 shell 命令，如 `rm`、`mv`、`sed -i
 | `POST /api/flowgate/hub/members` | — | 返回 `{ members, file }`，成员含路径、名称、目录状态、流程计数、更新时间与规则概况，不含 `flows`。 |
 | `POST /api/flowgate/hub/flows` | `{ path, page, pageSize }` | 返回 `{ flows, currentFlow, total, page, pageSize, totalPages }`；`currentFlow` 从全量摘要按当前排序返回第一条满足 `!finished && !cancelled` 的流程摘要，没有则为 `null`，独立于当前历史页，并附完整 `brief` 与 `summary`；历史行仍保留 200 字符摘要，详情读完整视图。默认每页 10 条，上限 50，按更新时间倒序，越界页归到最后一页。 |
 | `POST /api/flowgate/hub/rules` | `{ path }` 或 `{ path, stages }` | 读取或原子保存四阶段配置；返回 `{ rules }`，其中 `stages` 包含内置目录、内容替换、新增条目、保存选择与两档默认。旧 `{ path, rules }` 只更新 S2，`rules: null` 也只恢复 S2。 |
-| `POST /api/flowgate/hub/prepare` | `{ path, brief }` | 不创建会话；读取已有会话或默认模型，返回 `{ title, summary, status, message? }`。缺能力、超时或无效结果均返回可启动的基础整理。 |
+| `POST /api/flowgate/hub/prepare` | `{ path, brief }` | 不创建会话；读取已有会话或默认模型，返回 `{ title, summary, status, message? }`，两者只用于界面显示。缺能力、超时或无效结果均返回可启动的基础整理。 |
 | `POST /api/flowgate/hub/add` | `{ path }` | 路径必须是现存的绝对目录（否则 400 `需要一个绝对目录路径` / `工作区必须是现存目录：<path>`）；已登记则不重复写。返回 `{ member, created, imported }`，`imported` 是这次「顺手导入」的数量（`flows` / `rules` / `customRules`）。 |
 | `POST /api/flowgate/hub/remove` | `{ path }` | 只从名单移除，返回 `{ removed, path }`。不删任何流程或配置。 |
 
@@ -159,7 +159,7 @@ S2 同时拒绝被识别为变更性的 shell 命令，如 `rm`、`mv`、`sed -i
 
 | 工具 | 用途 |
 | :--- | :--- |
-| `flowgate_start` | 启动流程；`title` / `brief` 可选，`preset` 选择档位 |
+| `flowgate_start` | 启动流程；`brief` 是分析依据，`title` / `summary` 可省略且只用于界面显示，`preset` 选择档位 |
 | `flowgate_status` | 读取阶段、范围、规则和等待状态 |
 | `flowgate_ask` | S1 提出决策问题，等待用户点选 |
 | `flowgate_doc` | 提交需求 HTML、scope 和档位建议，等待批准 |
