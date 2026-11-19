@@ -218,6 +218,22 @@ await check('flowgate_start 启动流程并进入 S1', async () => {
   assert.match((await call('flowgate_status', {})).summary, /集成工作区规则 S1/)
 })
 
+await check('工作区所有会话读取同一条流程，工具与界面均拒绝重复启动', async () => {
+  const sibling = await getState('sess-other')
+  assert.equal(sibling.active, false)
+  assert.equal(sibling.workspace.active, true)
+  assert.equal(sibling.workspace.flow.sessionId, SESSION)
+  assert.equal(sibling.workspace.flow.stage, 'S1')
+  assert.equal(sibling.workspace.flow.stageIndex, 0)
+  await assert.rejects(call('flowgate_start', {}, 'sess-other'), /已有流程在进行/)
+  await assert.rejects(call('flowgate_start', {}), /已有流程在进行/)
+  const rejected = await post({ sessionId: 'sess-other', action: 'start', payload: {} })
+  assert.equal(rejected.status, 409)
+  assert.match(rejected.data.error, /先结束或放弃/)
+  assert.equal((await getState('sess-other')).active, false)
+  assert.equal((await getState()).workspace.flow.sessionId, SESSION)
+})
+
 await check('S1 阶段的写操作被拒绝', async () => {
   const d = await guard('write', { path: 'src/auth/session.ts' })
   assert.equal(d.kind, 'deny')
@@ -363,7 +379,7 @@ await check('评审报告按角度聚合，跳过门禁进入 S4', async () => {
       id: 'correctness',
       name: '正确性',
       verdict: 'blocking',
-      findings: [{ file: 'src/auth/session.ts', line: 42, severity: 'MAJOR', summary: '未处理并发刷新' }],
+      findings: [{ file: 'src/auth/session.ts', line: 42, severity: 'MAJOR', ac: 'AC-1', summary: '未处理并发刷新' }],
     }],
   }), 'flowgate_review')
   await tick()
@@ -395,6 +411,8 @@ await check('测试报告按方向聚合，验收后流程结束', async () => {
   assert.equal(value.decision, 'pass')
   const view = await getState()
   assert.equal(view.finished, true)
+  assert.equal(view.workspace.flow, null)
+  assert.equal((await getState('sess-other')).workspace.active, false)
 })
 
 await check('流程结束后写操作不再受 scope 限制', async () => {

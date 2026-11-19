@@ -122,6 +122,7 @@ function makeHost(cwd, sessionId, options = {}) {
 }
 
 const cwd = mkdtempSync(join(tmpdir(), 'flowgate-'))
+const testRoot = cwd
 const sessionId = 'sess_test'
 const host = makeHost(cwd, sessionId)
 
@@ -846,6 +847,7 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
 {
   // 用独立 session 起一条新流程，避免被上面的流程状态污染。
   const d4Session = 'sess-d4'
+  const cwd = join(testRoot, d4Session)
   const ctx4 = makeHost(cwd, d4Session)
   const state4 = await ctx4.request('/api/flowgate/state?sessionId=' + d4Session)
   assert.equal(state4.body.active, false)
@@ -915,7 +917,7 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
 
 {
   // 上面的用例已经跑过，这里用独立 session 起一条新流程。
-  const uiCtx = makeHost(cwd, 'sess-ui')
+  const uiCtx = makeHost(join(cwd, 'ui'), 'sess-ui')
   const started = await uiCtx.request('/api/flowgate/action', {
     sessionId: 'sess-ui',
     action: 'start',
@@ -933,10 +935,12 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
     action: 'start',
     payload: { title: '第二次点击', preset: 'strict' },
   })
-  check('界面启动是幂等的：重复点击不新建流程、不改档位', () => {
-    assert.equal(again.status, 200)
-    assert.equal(again.body.id, started.body.id)
-    assert.equal(again.body.preset, 'fast')
+  const unchanged = await uiCtx.request('/api/flowgate/state?sessionId=sess-ui')
+  check('界面重复启动明确拒绝，原流程和档位保留', () => {
+    assert.equal(again.status, 409)
+    assert.match(again.body.error, /已有流程在进行/)
+    assert.equal(unchanged.body.id, started.body.id)
+    assert.equal(unchanged.body.preset, 'fast')
   })
   // 用户什么都没写就点了输入框上方那个按钮：Agent 不能照着「需求分析」四个字
   // 自己编一个需求去分析，S1 第一步必须是问清目标。
@@ -953,7 +957,7 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
     assert.doesNotMatch(text, /需求原文：/)
   })
   // 需求描述：标题由第一行派生，原文进 brief，Agent 在 S1 直接读它提问。
-  const briefCtx = makeHost(cwd, 'sess-brief')
+  const briefCtx = makeHost(join(cwd, 'brief'), 'sess-brief')
   const withBrief = await briefCtx.request('/api/flowgate/action', {
     sessionId: 'sess-brief',
     action: 'start',
@@ -981,7 +985,7 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
     assert.match(text, /不要在阶段交界处/)
   })
   // 宿主没返回 live agent 时不能吞掉启动：流程照建，只是界面提示用户去对话里说一句。
-  const noAgent = await makeHost(cwd, 'sess-no-agent').request('/api/flowgate/action', {
+  const noAgent = await makeHost(join(cwd, 'no-agent'), 'sess-no-agent').request('/api/flowgate/action', {
     sessionId: 'sess-no-agent',
     action: 'start',
     payload: { brief: '宿主拿不到 Agent 时也要能开流程' },
@@ -992,8 +996,8 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
     assert.equal(noAgent.body.nudge.ok, false)
     assert.ok(noAgent.body.nudge.reason.length > 0)
   })
-  // 上一次没唤醒成功时，用户再点一次「开始需求分析」应当重试，而不是静默返回旧视图。
-  const lateCtx = makeHost(cwd, 'sess-late-agent')
+  // 已有流程即使唤醒失败，也需明确拒绝重复启动。
+  const lateCtx = makeHost(join(cwd, 'late-agent'), 'sess-late-agent')
   const lateFirst = await lateCtx.request('/api/flowgate/action', {
     sessionId: 'sess-late-agent',
     action: 'start',
@@ -1004,18 +1008,17 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
     action: 'start',
     payload: { brief: '第一次拿不到 Agent' },
   })
-  check('唤醒失败后再点一次开始会重试，且不新建流程', () => {
+  check('唤醒失败后仍拒绝重复启动，不重复投递消息', () => {
     assert.equal(lateFirst.body.nudge.ok, false)
-    assert.equal(lateSecond.body.nudge.ok, true)
-    assert.equal(lateSecond.body.id, lateFirst.body.id)
-    assert.equal(lateCtx.delivered.length, 1)
-    assert.equal(lateCtx.delivered[0].sessionId, 'sess-late-agent')
+    assert.equal(lateSecond.status, 409)
+    assert.match(lateSecond.body.error, /先结束或放弃/)
+    assert.equal(lateCtx.delivered.length, 0)
   })
   const briefStatus = await briefCtx.tool('flowgate_status', {})
   check('流程摘要里带上需求原文，Agent 不必再问用户要一遍', () => {
     assert.match(briefStatus.summary, /需求描述：# 会话过期返回 401/)
   })
-  const longTitle = await makeHost(cwd, 'sess-brief-long').request('/api/flowgate/action', {
+  const longTitle = await makeHost(join(cwd, 'brief-long'), 'sess-brief-long').request('/api/flowgate/action', {
     sessionId: 'sess-brief-long',
     action: 'start',
     payload: { brief: '一'.repeat(60) },
@@ -1037,7 +1040,7 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
 
 // 工具的 title 不再必填，Agent 省略它也能启动。
 {
-  const toolCtx = makeHost(cwd, 'sess-ui-tool')
+  const toolCtx = makeHost(join(cwd, 'ui-tool'), 'sess-ui-tool')
   const viaTool = await toolCtx.tool('flowgate_start', {})
   check('工具启动：title 可以省略', () => {
     assert.equal(viaTool.stage, 'S1')
@@ -1139,6 +1142,7 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
 // ---------------------------------------------------------------------------
 
 {
+  const cwd = join(testRoot, 'sess-cancel')
   const cx = makeHost(cwd, 'sess-cancel')
   await cx.tool('flowgate_start', { title: '取消演示', preset: 'fast' })
 
@@ -1257,6 +1261,7 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
 
 // 开发阶段门禁挂起时放弃：gate 工具返回 cancelled，阶段不再推进。
 {
+  const cwd = join(testRoot, 'sess-cancel-gate')
   const gx = makeHost(cwd, 'sess-cancel-gate')
   await gx.tool('flowgate_start', { title: '取消开发门禁', preset: 'fast' })
   const docGate = gx.tool('flowgate_doc', {
@@ -1332,6 +1337,7 @@ rmSync(cwd, { recursive: true, force: true })
 // ---------------------------------------------------------------------------
 
 {
+  const cwd = join(testRoot, 'sess-live')
   const cx = makeHost(cwd, 'sess-live')
   const exec = (name, args) => ({ name, arguments: args, agent: { session: { header: { id: 'sess-live', cwd } } }, signal: undefined })
   const pre = cx.handlers.get('tools/pre-execute')
@@ -1403,6 +1409,7 @@ rmSync(cwd, { recursive: true, force: true })
 // ---------------------------------------------------------------------------
 
 {
+  const cwd = join(testRoot, 'sess-resume')
   const cx = makeHost(cwd, 'sess-resume')
   await cx.tool('flowgate_start', { title: '中断恢复', preset: 'fast' })
   const controller = new AbortController()
@@ -1448,6 +1455,7 @@ rmSync(cwd, { recursive: true, force: true })
 }
 
 {
+  const cwd = join(testRoot, 'sess-reboot')
   const first = makeHost(cwd, 'sess-reboot')
   await first.tool('flowgate_start', { title: '重启恢复', preset: 'fast' })
   const scope = {
@@ -1496,6 +1504,7 @@ rmSync(cwd, { recursive: true, force: true })
 }
 
 {
+  const cwd = join(testRoot, 'sess-race')
   const cx = makeHost(cwd, 'sess-race')
   await cx.tool('flowgate_start', { title: '等待竞争', preset: 'fast' })
   const scope = {
@@ -1535,6 +1544,7 @@ rmSync(cwd, { recursive: true, force: true })
 
 // 门禁等待也可能被中断：S2 的变更摘要已经采集完，用户点「完成开发」不能因为等待器没了而失效。
 {
+  const cwd = join(testRoot, 'sess-gate')
   const cx = makeHost(cwd, 'sess-gate')
   await cx.tool('flowgate_start', { title: '门禁中断', preset: 'fast' })
   const scope = {
@@ -1597,6 +1607,7 @@ rmSync(cwd, { recursive: true, force: true })
 
 // AC-5 / AC-7：跳过门禁同样要给出下一阶段动作，且返回字段集合不变（schema 不动）。
 {
+  const cwd = join(testRoot, 'sess-skip')
   const cx = makeHost(cwd, 'sess-skip')
   await cx.tool('flowgate_start', { title: '跳过门禁文案', preset: 'fast' })
   const scope = {
@@ -1644,6 +1655,7 @@ rmSync(cwd, { recursive: true, force: true })
 // 评审回归：Agent 的工具已经中断时点「修改需求」，补发的消息不能宣称 scope 已冻结，
 // 否则 Agent 会跳过改文档、直接开始改代码——而 revise 分支里 scope 根本没有冻结。
 {
+  const cwd = join(testRoot, 'sess-revise')
   const cx = makeHost(cwd, 'sess-revise')
   await cx.tool('flowgate_start', { title: '修改需求', preset: 'fast' })
   const scope = {
@@ -1689,6 +1701,7 @@ rmSync(cwd, { recursive: true, force: true })
 // 门禁被中断后点「退回开发修复」：Agent 必须被告知回到 S2 重做，否则它会停在 S3。
 {
   const sid = 'sess-back'
+  const cwd = join(testRoot, sid)
   const cx = makeHost(cwd, sid)
   await cx.tool('flowgate_start', { title: '退回唤醒', preset: 'fast' })
   const scope = {
@@ -1735,6 +1748,7 @@ rmSync(cwd, { recursive: true, force: true })
 // 否则 Agent 跑完当前轮又收到一次退回，把刚重做的产物清掉（用户看到的「又退回一次」）。
 {
   const sid = 'sess-back-live'
+  const cwd = join(testRoot, sid)
   const cx = makeHost(cwd, sid)
   await cx.tool('flowgate_start', { title: '退回不重复', preset: 'fast' })
   const scope = {
@@ -1788,6 +1802,7 @@ rmSync(cwd, { recursive: true, force: true })
 // 最后一个门禁通过后流程结束：补发的消息要说「结束了」，不能让 Agent 再找下一阶段。
 {
   const sid = 'sess-finish'
+  const cwd = join(testRoot, sid)
   const cx = makeHost(cwd, sid)
   await cx.tool('flowgate_start', { title: '结束唤醒', preset: 'fast' })
   const scope = {
@@ -1888,6 +1903,7 @@ rmSync(cwd, { recursive: true, force: true })
 
   // 换一个宿主实例：确认规则是从盘上的 config.json 继承来的，不是内存缓存。
   const secondSid = 'sess-ws-second'
+  await first.tool('flowgate_cancel', {})
   const second = makeHost(wsCwd, secondSid)
   await second.tool('flowgate_start', { title: '继承工作区默认', preset: 'fast' })
   const inherited = await stateOf(second, secondSid)
@@ -1908,6 +1924,7 @@ rmSync(cwd, { recursive: true, force: true })
   })
 
   const thirdSid = 'sess-ws-third'
+  await second.tool('flowgate_cancel', {})
   const third = makeHost(wsCwd, thirdSid)
   await third.tool('flowgate_start', { title: '继承自定义规则', preset: 'fast' })
   const thirdState = await stateOf(third, thirdSid)
@@ -2294,15 +2311,18 @@ rmSync(cwd, { recursive: true, force: true })
     })
     const started = await act('start', { title: '语义标题', brief, summary, preset: 'strict' })
     const duplicate = await act('start', { title: '重复标题', brief: '替换原文', summary: '替换摘要', preset: 'fast' })
-    check('流程完整独立保存原文和整理稿，重复启动保持幂等', () => {
+    const afterDuplicate = await cx.request('/api/flowgate/state?sessionId=' + sid)
+    check('流程完整独立保存原文和整理稿，重复启动被拒绝', () => {
       assert.equal(started.status, 200)
       assert.equal(started.body.title, '语义标题')
       assert.equal(started.body.brief, brief)
       assert.equal(started.body.summary, summary)
-      assert.equal(duplicate.body.id, started.body.id)
-      assert.equal(duplicate.body.brief, brief)
-      assert.equal(duplicate.body.summary, summary)
-      assert.equal(duplicate.body.preset, 'strict')
+      assert.equal(duplicate.status, 409)
+      assert.match(duplicate.body.error, /已有流程在进行/)
+      assert.equal(afterDuplicate.body.id, started.body.id)
+      assert.equal(afterDuplicate.body.brief, brief)
+      assert.equal(afterDuplicate.body.summary, summary)
+      assert.equal(afterDuplicate.body.preset, 'strict')
       assert.equal(started.body.scope.frozen, false)
       assert.deepEqual(started.body.writeGrants, [])
       for (const stage of Object.keys(chosen)) assert.equal(started.body.stageConfigs[stage].source, 'workspace')
@@ -2365,14 +2385,15 @@ rmSync(cwd, { recursive: true, force: true })
       assert.equal(existsSync(join(ws, '.dsh-flowgate', 'scope.json')), false)
       assert.equal(JSON.stringify(JSON.parse(readFileSync(configFile, 'utf8'))).includes('writeGrants'), false)
     })
-    const longTitle = await act('start', { title: '标'.repeat(500), brief: '标题截断' }, 'long-title-start')
+    const titleHost = makeHost(other, 'long-title-start')
+    const longTitle = await titleHost.request('/api/flowgate/action', { sessionId: 'long-title-start', action: 'start', payload: { title: '标'.repeat(500), brief: '标题截断' } })
     check('超长标题截断到 120 字符，不写进快照', () => {
       assert.equal(longTitle.status, 200)
       assert.equal(longTitle.body.title.length, 120)
     })
     // 这条流程只是参数校验的载体，立刻结束，免得抢走后面 Hub 的 currentFlow。
-    await act('cancel', {}, 'long-title-start')
-    const tooLong = await act('start', { brief: 'x'.repeat(20001) }, 'overlong-start')
+    await titleHost.tool('flowgate_cancel', {})
+    const tooLong = await titleHost.request('/api/flowgate/action', { sessionId: 'overlong-start', action: 'start', payload: { brief: 'x'.repeat(20001) } })
     check('启动明确拒绝超限需求且不静默截断', () => {
       assert.equal(tooLong.status, 409)
       assert.match(tooLong.body.error, /20000/)
@@ -2929,6 +2950,7 @@ rmSync(cwd, { recursive: true, force: true })
 
 {
   const sid = 'sess-carry'
+  const cwd = join(testRoot, sid)
   const cx = makeHost(cwd, sid)
   const act = (action, payload) => cx.request('/api/flowgate/action', { sessionId: sid, action, payload })
   const state = () => cx.request('/api/flowgate/state?sessionId=' + sid)
@@ -3042,6 +3064,7 @@ rmSync(cwd, { recursive: true, force: true })
 // 放在最后单独起一个 host：currentService 是模块级单例，中途再 apply 会顶掉前面的实例。
 // ---------------------------------------------------------------------------
 {
+  const cwd = join(testRoot, 'sess-typecheck')
   const typeCtx = makeHost(cwd, 'sess-typecheck')
   const startWith = (args) => typeCtx.tool('flowgate_start', args).catch((error) => error)
   const badBrief = await startWith({ title: '类型校验', brief: 12345 })
@@ -3315,6 +3338,65 @@ rmSync(cwd, { recursive: true, force: true })
     })
   } finally {
     rmSync(gateCwd, { recursive: true, force: true })
+  }
+}
+
+// 工作区提示与启动限制共用同一条活动流程，冷恢复后也必须成立。
+{
+  const ws = mkdtempSync(join(tmpdir(), 'flowgate-共享 工作区-'))
+  const services = { sessions: { get: (id) => ({ header: { id, cwd: id === 'nested' ? join(ws, 'nested') : id === 'outside' ? join(ws, '..', 'other-workspace') : id === 'case-alias' ? ws.toUpperCase() : ws } }) } }
+  const state = (host, id) => host.request('/api/flowgate/state?sessionId=' + id)
+  try {
+    const first = makeHost(ws, 'owner', { services })
+    assert.equal((await state(first, 'sibling')).body.workspace.flow, null)
+    await first.tool('flowgate_start', { title: '共享提示' })
+    const shared = (await state(first, 'sibling')).body
+    check('同工作区无流程会话也读取活动流程的阶段摘要', () => {
+      assert.equal(shared.active, false)
+      assert.equal(shared.workspace.active, true)
+      assert.equal(shared.workspace.flow.sessionId, 'owner')
+      assert.equal(shared.workspace.flow.stage, 'S1')
+      assert.equal(shared.workspace.flow.stageIndex, 0)
+    })
+    if (process.platform === 'win32') {
+      const alias = (await state(first, 'case-alias')).body.workspace
+      const rejected = await first.request('/api/flowgate/action', { sessionId: 'case-alias', action: 'start', payload: { title: '不得替换原流程' } })
+      const owner = (await state(first, 'owner')).body
+      check('Windows 工作区路径仅大小写不同时共享提示并拒绝第二条，原流程保持不变', () => {
+        assert.equal(alias.flow.sessionId, 'owner')
+        assert.equal(rejected.status, 409)
+        assert.match(rejected.body.error, /已有流程在进行.*先结束或放弃/)
+        assert.equal(owner.title, '共享提示')
+        assert.equal(owner.workspace.flow.sessionId, 'owner')
+        assert.equal(owner.stage, 'S1')
+      })
+    }
+    const nested = (await state(first, 'nested')).body.workspace
+    const outside = (await state(first, 'outside')).body.workspace
+    check('工作区精确隔离，子目录和相邻工作区不显示父工作区提示', () => {
+      assert.equal(nested.flow, null)
+      assert.equal(outside.flow, null)
+    })
+    const restored = makeHost(ws, 'owner', { services })
+    const cold = await state(restored, 'sibling')
+    const duplicate = await restored.request('/api/flowgate/action', { sessionId: 'sibling', action: 'start', payload: {} })
+    check('宿主冷恢复后其他会话仍显示活动流程并拒绝第二条流程', () => {
+      assert.equal(cold.body.workspace.flow.sessionId, 'owner')
+      assert.equal(duplicate.status, 409)
+      assert.match(duplicate.body.error, /已有流程在进行.*先结束或放弃/)
+    })
+    await restored.tool('flowgate_cancel', {})
+    assert.equal((await state(restored, 'sibling')).body.workspace.flow, null)
+    const next = await restored.request('/api/flowgate/action', { sessionId: 'sibling', action: 'start', payload: {} })
+    const history = (await state(restored, 'owner')).body
+    check('放弃后可启动新流程，历史会话的结束状态不遮住工作区活动摘要', () => {
+      assert.equal(next.status, 200)
+      assert.equal(history.cancelled, true)
+      assert.equal(history.workspace.flow.sessionId, 'sibling')
+    })
+    await restored.request('/api/flowgate/action', { sessionId: 'sibling', action: 'cancel', payload: {} })
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
   }
 }
 

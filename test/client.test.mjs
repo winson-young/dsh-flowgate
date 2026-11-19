@@ -452,10 +452,11 @@ await check('apply 注册左侧栏面板与会话输入框上方的阶段提示'
   assert.equal(byName('sidebar.panellist').options.id, 'flowgate-hub')
   assert.equal(byName('sidebar.panellist').options.label(), '流程工作台')
   assert.equal(byName('main').options.key, 'flowgate-hub')
-  // 宿主的 order：任务条 0、目标条 10、排队消息 20；15 落在目标条下、消息与输入框上。
+  // 核对插槽注册的顺序值：提示 30 排在任务 0、目标 10、排队消息 20 之后。
   const dock = byName('conversation.input.dock')
   assert.equal(dock.options.id, 'flowgate-hub-stage-hint')
-  assert.equal(dock.options.order, 15)
+  assert.equal(dock.options.order, 30)
+  assert.ok(dock.options.order > 20, '提示的顺序值必须大于排队消息的顺序值')
 })
 
 await check('会话视图仍不注册：流程状态只走输入框上方那一行', () => {
@@ -464,6 +465,137 @@ await check('会话视图仍不注册：流程状态只走输入框上方那一�
 })
 
 const stageHint = registrations.find((item) => item.options.name === 'conversation.input.dock').Component
+
+// 工作区摘要与当前会话独立：不附带 active/finished 等旧会话开关。
+function workspaceFlow(patch = {}) {
+  return {
+    sessionId: 'other-running-session',
+    stage: 'S4', stageIndex: 3, label: '测试',
+    waiting: false, waitingKind: null,
+    activity: { text: '核对工作区结果' }, elapsedMs: 125000,
+    updatedAt: '2026-11-19T12:00:00Z',
+    ...patch,
+  }
+}
+
+await check('阶段提示：工作区摘要优先，本会话已结束或无流程也展示其他会话', async () => {
+  for (const patch of [{}, { active: false }, { finished: true }, { cancelled: true }]) {
+    currentView = baseView('S1', {
+      progress: { stageIndex: 0, label: '旧会话需求' },
+      waiting: true, waitingKind: 'doc', elapsedMs: 1000,
+      activity: { text: '旧会话动作' },
+      ...patch, workspace: { flow: workspaceFlow() },
+    })
+    const tree = (await render(stageHint, {})).toJSON()
+    const text = flat(tree)
+    assert.ok(text.includes('S4 测试'), text)
+    assert.ok(text.includes('正在核对工作区结果'), text)
+    assert.ok(text.includes('已用 2 分 5 秒'), text)
+    assert.ok(!text.includes('旧会话') && !text.includes('批准并冻结'), text)
+    assert.ok(nodeByClass(tree, 'fg-hint'), '不得继承本会话等待态')
+    assert.equal(buttons(tree).length, 0)
+  }
+})
+
+await check('阶段提示：工作区等待使用摘要阶段与 waitingKind，不回读本会话', async () => {
+  for (const [flow, expected] of [
+    [workspaceFlow({ stage: 'S3', stageIndex: 2, label: '评审', waiting: true, waitingKind: 'gate' }), '等你点「通过评审，进入测试」'],
+    [workspaceFlow({ stage: 'S1', stageIndex: 0, label: '需求分析', waiting: true, waitingKind: 'answer' }), '等你回答上面的问题'],
+  ]) {
+    currentView = baseView('S2', { workspace: { flow } })
+    const tree = (await render(stageHint, {})).toJSON()
+    assert.ok(nodeByClass(tree, 'fg-hint is-waiting'))
+    assert.ok(flat(tree).includes(expected), flat(tree))
+    assert.ok(!flat(tree).includes('完成开发'), flat(tree))
+  }
+})
+
+await check('阶段提示：workspace 存在时空摘要不回退，本会话运行也不占行', async () => {
+  for (const workspace of [{ flow: null }, {}, null]) {
+    currentView = baseView('S2', { workspace })
+    assert.equal((await render(stageHint, {})).toJSON(), null, JSON.stringify(workspace))
+  }
+  currentView = null
+  assert.equal((await render(stageHint, {})).toJSON(), null)
+  assert.equal((await render(stageHint, {}, false)).toJSON(), null, '没有会话不占行')
+})
+
+await check('阶段提示：四阶段复用 Icon，每阶段图形不同且不增加读屏噪音', async () => {
+  const paths = []
+  for (const [index, stage] of ['S1', 'S2', 'S3', 'S4'].entries()) {
+    currentView = baseView(stage, { workspace: { flow: workspaceFlow({ stage, stageIndex: index }) } })
+    const renderer = await render(stageHint, {})
+    const tree = renderer.toJSON()
+    const icons = findTags(nodeByClass(tree, 'fg-hint-stage'), 'svg')
+    assert.equal(icons.length, 1)
+    assert.equal(icons[0].props.className, 'fg-icon')
+    assert.equal(icons[0].props['aria-hidden'], true)
+    assert.equal(renderer.root.findAll((node) => node.type?.name === 'Icon').length, 1, '复用现有 Icon 组件')
+    paths.push(findTags(icons[0], 'path')[0].props.d)
+  }
+  assert.equal(new Set(paths).size, 4, '四阶段必须使用不同图形')
+})
+
+await check('阶段提示：切 session 首帧不闪旧 view，旧请求晚到不覆盖新会话', async () => {
+  const originalFetch = globalThis.fetch
+  const nextId = 'hint-switch-next-' + (++seq)
+  const staleId = 'hint-switch-stale-' + (++seq)
+  const commits = []
+  let renderer = null
+  let releaseNext = null
+  let releaseStale = null
+  function ObserveHint(props) {
+    React.useLayoutEffect(() => { if (renderer) commits.push(flat(renderer.toJSON())) })
+    return h(stageHint, props)
+  }
+  try {
+    currentView = baseView('S2', { workspace: { flow: workspaceFlow({ stage: 'S2', stageIndex: 1, label: '旧工作区开发' }) } })
+    renderer = await render(ObserveHint, { session: { sessionId: 'hint-switch-old-' + (++seq) } }, false)
+    assert.ok(flat(renderer.toJSON()).includes('旧工作区开发'))
+    globalThis.fetch = async (url, init) => {
+      const id = new URL(String(url), 'http://localhost').searchParams.get('sessionId')
+      if (id === nextId) return new Promise((resolve) => { releaseNext = resolve })
+      if (id === staleId) return new Promise((resolve) => { releaseStale = resolve })
+      return originalFetch(url, init)
+    }
+    commits.length = 0
+    await act(async () => { renderer.update(h(ObserveHint, { session: { sessionId: staleId } })) })
+    assert.equal(renderer.toJSON(), null, '新会话尚无摘要时不占行')
+    assert.ok(commits.length > 0)
+    assert.ok(commits.every((text) => !text.includes('旧工作区开发')), JSON.stringify(commits))
+    await act(async () => { renderer.update(h(ObserveHint, { session: { sessionId: nextId } })) })
+    assert.equal(renderer.toJSON(), null)
+    assert.equal(typeof releaseNext, 'function')
+    assert.equal(typeof releaseStale, 'function')
+    await act(async () => { releaseNext(response({ active: false, workspace: { flow: workspaceFlow({ label: '新工作区测试' }) } })) })
+    assert.ok(flat(renderer.toJSON()).includes('S4 新工作区测试'))
+    await act(async () => { releaseStale(response({ active: false, workspace: { flow: workspaceFlow({ label: '迟到旧摘要' }) } })) })
+    assert.ok(flat(renderer.toJSON()).includes('S4 新工作区测试'))
+    assert.ok(!flat(renderer.toJSON()).includes('迟到旧摘要'))
+  } finally {
+    if (renderer) await act(async () => { renderer.unmount() })
+    globalThis.fetch = originalFetch
+    // 断言提前失败时也收掉在飞请求，不影响后续用例。
+    await act(async () => {
+      releaseNext?.(response(null))
+      releaseStale?.(response(null))
+    })
+  }
+})
+
+await check('阶段提示样式：宽度交给同座位，移除外框背景和左右留白并约束盒模型', () => {
+  const css = styleNodes[0].textContent
+  const hint = css.match(/\.fg-hint\s*\{([^}]+)\}/)[1]
+  assert.match(css, /\.fg-hint, \.fg-hint \*, \.fg-hint \*::before, \.fg-hint \*::after\s*\{\s*box-sizing:\s*border-box;/)
+  assert.match(hint, /width:\s*100%;/)
+  assert.match(hint, /min-width:\s*0;/)
+  assert.match(hint, /padding:\s*7px 0;/)
+  assert.match(hint, /margin:\s*0;/)
+  assert.match(hint, /border:\s*0;/)
+  assert.match(hint, /border-radius:\s*0;/)
+  assert.match(hint, /background:\s*transparent;/)
+  assert.ok(!/\.fg-hint\.is-waiting\s*\{/.test(css), '等待态也不应恢复卡片背景或边框')
+})
 
 await check('阶段提示：一行说清第几步、在做什么、已用多久', async () => {
   currentView = baseView('S2', {
