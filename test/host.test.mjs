@@ -534,9 +534,10 @@ check('run_code 里组合只读工具照常放行', () => assert.equal(allowRead
   })
 }
 
-// 授权只在当阶段有效：S2 开着授权进 S3，必须自动失效。
+// 命令授权在本次流程内持久：S2 打开之后进 S3、进 S4、退回 S2 都不清除（AC1/AC2/AC3），
+// 但放行仍按阶段判定——S1 与 S3 只接受只读命令（AC4）。
 const grantBeforeAdvance = await postAction('toggleShellGrant', { enabled: true })
-check('进入阶段推进前重新授权', () => assert.equal(grantBeforeAdvance.status, 200))
+check('进入阶段推进前授权', () => assert.equal(grantBeforeAdvance.status, 200))
 
 // scope 未冻结分支：直接构造 flow 验证守卫文案。
 check('scope 未冻结时 S2 写操作返回「scope 未冻结」', () => {
@@ -555,7 +556,16 @@ check('S2 完成开发后进入 S3', () => {
   assert.match(devResult.message, /不要在阶段交界处停下/)
 })
 const afterDev = await getState()
-check('离开 S2 后命令授权自动失效', () => assert.equal(afterDev.body.shellGrant, false))
+check('AC1 离开 S2 进入 S3 后命令授权仍然有效', () => {
+  assert.equal(afterDev.body.stage, 'S3')
+  assert.equal(afterDev.body.shellGrant, true)
+})
+// AC4：授权字段跨阶段存活，但放行仍按阶段判定——评审阶段不能跑变更性命令。
+const s3ShellAfterAdvance = await guard('bash', { command: 'npm run build' })
+check('AC4 授权为真但在 S3 仍拒绝变更性 shell', () => {
+  assert.equal(s3ShellAfterAdvance.kind, 'deny')
+  assert.match(s3ShellAfterAdvance.reason, /只允许只读 shell 命令/)
+})
 check('S2 记录变更摘要凭据', () => {
   assert.equal(afterDev.body.stages.find((s) => s.id === 'S2').status, 'passed')
   assert.ok(afterDev.body.devChanges.files.includes('src/auth/session.ts'))
@@ -592,6 +602,28 @@ check('评审通过后进入 S4', () => {
 check('评审报告结构化聚合', () => {
   assert.equal(reviewResult.blocking, 1)
 })
+// AC2：S2 那次授权带得进 S4，不必重新勾选就能跑测试命令。
+const s4InheritedState = await getState()
+const s4InheritedShell = await guard('bash', { command: 'npm run build' })
+check('AC2 带着既有授权进 S4 直接放行变更性命令', () => {
+  assert.equal(s4InheritedState.body.stage, 'S4')
+  assert.equal(s4InheritedState.body.shellGrant, true)
+  assert.equal(s4InheritedShell.kind, 'allow')
+})
+
+// AC3：回退只清写授权、不清命令授权。先在 S4 把两种授权都打开。
+const ac3Dir = await postAction('addDirection', {
+  name: '回退授权口径',
+  points: ['回退后仍能跑构建与测试'],
+  needsWrite: true,
+})
+const ac3DirId = ac3Dir.body.directions.find((d) => d.name === '回退授权口径').id
+const ac3Grant = await postAction('toggleWriteGrant', { id: ac3DirId, enabled: true })
+const ac3Shell = await postAction('toggleShellGrant', { enabled: true })
+check('AC3 前置：S4 里写授权与命令授权都打开', () => {
+  assert.deepEqual(ac3Grant.body.writeGrants, [ac3DirId])
+  assert.equal(ac3Shell.body.shellGrant, true)
+})
 
 // 回退验证：S4 门禁点「退回开发修复」。
 const s4Gate = runTool('flowgate_gate', {})
@@ -601,7 +633,19 @@ check('门禁可回退到 S2', () => {
   assert.equal(backToDev.status, 200)
   assert.equal(backToDev.body.stage, 'S2')
 })
+check('AC3 回退保留命令授权', () => assert.equal(backToDev.body.shellGrant, true))
+check('AC3 回退仍清空写授权', () => assert.deepEqual(backToDev.body.writeGrants, []))
 await s4Gate
+
+// AC7：界面文案与新语义一致，不能再声称「阶段推进就失效」。
+{
+  const clientSource = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+  check('AC7 授权文案不再声称只在当前阶段有效', () => {
+    assert.doesNotMatch(clientSource, /授权只在当前阶段有效/)
+    assert.doesNotMatch(clientSource, /阶段推进后需重新授权/)
+    assert.match(clientSource, /本次流程内一直有效/)
+  })
+}
 
 const devPending2 = gateRound('flowgate_gate', {}, { decision: 'pass' })
 await devPending2
@@ -683,6 +727,10 @@ check('D2 用户显式勾选后授权生效', () => {
 const revoked = await postAction('toggleWriteGrant', { id: customDirId, enabled: false })
 check('D2 取消勾选后授权撤销', () => assert.deepEqual(revoked.body.writeGrants, []))
 
+// 流程结束前把授权打开，验证结束会清掉它（AC6）。
+const beforeFinishGrant = await postAction('toggleShellGrant', { enabled: true })
+check('AC6 前置：结束前命令授权为真', () => assert.equal(beforeFinishGrant.body.shellGrant, true))
+
 const testPending = gateRound(
   'flowgate_test',
   {
@@ -708,6 +756,7 @@ check('AC-8 流程结束且跳过计数为 0', () => {
   assert.equal(finalState.body.finished, true)
   assert.equal(finalState.body.skippedCount, 0)
 })
+check('AC6 流程结束后命令授权被清除', () => assert.equal(finalState.body.shellGrant, false))
 check('AC-8 flows.jsonl 记录完整阶段事件', () => {
   const file = join(cwd, '.dsh-flowgate', 'flows.jsonl')
   assert.ok(existsSync(file), 'flows.jsonl 未生成')
@@ -1237,6 +1286,35 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
     assert.match(log, /"type":"flow\.cancelled"/)
     assert.match(log, /不想做了/)
   })
+
+  // AC6：放弃流程时授权必须一起清掉，别把「看似仍有效」的开关留在已结束的流程里。
+  // 放在本块最后：另起宿主会换掉内存里的 service 实例，前面的 cx 断言必须先跑完。
+  {
+    const grantCwd = mkdtempSync(join(tmpdir(), 'flowgate-grant-'))
+    const gx = makeHost(grantCwd, 'sess-cancel-grant')
+    await gx.tool('flowgate_start', { title: '放弃前授权', preset: 'fast' })
+    const gxDoc = gx.tool('flowgate_doc', {
+      html: '<html><body><p>授权</p></body></html>',
+      scope: {
+        files_expected_to_change: ['src/g.ts'],
+        capabilities: ['改 g.ts'],
+        out_of_scope_explicitly: [],
+        acceptance_criteria: [{ id: 'AC-1', when: '授权后放弃', then: '开关清空' }],
+      },
+    })
+    await tick()
+    const gxApprove = await gx.request('/api/flowgate/action', { sessionId: 'sess-cancel-grant', action: 'doc', payload: { decision: 'approve' } })
+    await gxDoc
+    const gxGrant = await gx.request('/api/flowgate/action', { sessionId: 'sess-cancel-grant', action: 'toggleShellGrant', payload: { enabled: true } })
+    const gxCancel = await gx.request('/api/flowgate/action', { sessionId: 'sess-cancel-grant', action: 'cancel', payload: {} })
+    check('AC6 放弃流程时命令授权一并清除', () => {
+      assert.equal(gxApprove.status, 200)
+      assert.equal(gxGrant.status, 200)
+      assert.equal(gxGrant.body.shellGrant, true)
+      assert.equal(gxCancel.status, 200)
+      assert.equal(gxCancel.body.shellGrant, false)
+    })
+  }
 }
 
 rmSync(cwd, { recursive: true, force: true })
@@ -2323,7 +2401,7 @@ rmSync(cwd, { recursive: true, force: true })
     const brokenHost = makeHost(ws, 'broken-session')
     const brokenState = await brokenHost.request('/api/flowgate/state?sessionId=broken-session')
     const brokenHub = await brokenHost.request('/api/flowgate/hub/flows', { path: ws })
-    check('残缺快照冷恢复时补齐结构并撤销授权，无法修复的条目直接丢弃', () => {
+    check('AC6 残缺快照冷恢复时补齐结构并撤销授权，无法修复的条目直接丢弃', () => {
       assert.equal(brokenState.status, 200)
       assert.equal(brokenState.body.active, true)
       assert.equal(brokenState.body.stage, 'S1')
@@ -2965,6 +3043,54 @@ rmSync(cwd, { recursive: true, force: true })
     assert.match(String(badBrief?.message ?? badBrief), /需求原文必须是字符串/)
     assert.match(String(badSummary?.message ?? badSummary), /需求整理稿必须是字符串/)
   })
+}
+
+// ---------------------------------------------------------------------------
+// AC4 的 S1 那一半与 AC6 的冷恢复那一半：授权字段可以跨阶段存活，
+// 但放行永远按阶段判定；冷恢复则一律清除，不静默继承。
+// 放在最后单独起 host：currentService 是模块级单例，中途再 apply 会顶掉前面的实例。
+// ---------------------------------------------------------------------------
+{
+  const grantCwd = mkdtempSync(join(tmpdir(), 'flowgate-s1-grant-'))
+  try {
+    const sx = makeHost(grantCwd, 'sess-s1-grant')
+    await sx.tool('flowgate_start', { title: '回退到 S1 的授权口径', preset: 'fast' })
+    const s1Doc = sx.tool('flowgate_doc', {
+      html: '<html><body><p>回退授权</p></body></html>',
+      scope: {
+        files_expected_to_change: ['src/s1.ts'],
+        capabilities: ['改 s1.ts'],
+        out_of_scope_explicitly: [],
+        acceptance_criteria: [{ id: 'AC-1', when: '退回 S1', then: '变更性命令仍被拒' }],
+      },
+    })
+    await tick()
+    await sx.request('/api/flowgate/action', { sessionId: 'sess-s1-grant', action: 'doc', payload: { decision: 'approve' } })
+    await s1Doc
+    const s1Grant = await sx.request('/api/flowgate/action', { sessionId: 'sess-s1-grant', action: 'toggleShellGrant', payload: { enabled: true } })
+    // S2 直接退回 S1：rollbackTo 现在刻意不清 shellGrant，字段会带着 true 进 S1。
+    const s1Back = await sx.request('/api/flowgate/action', { sessionId: 'sess-s1-grant', action: 'gate', payload: { decision: 'back', to: 'S1' } })
+    const s1Shell = await sx.guard('bash', { command: 'npm run build' })
+    check('AC4 退回 S1 后命令授权仍在但变更性 shell 仍被拒', () => {
+      assert.equal(s1Grant.body.shellGrant, true)
+      assert.equal(s1Back.body.stage, 'S1')
+      assert.equal(s1Back.body.shellGrant, true)
+      assert.equal(s1Shell.kind, 'deny')
+      assert.match(s1Shell.reason, /只允许只读 shell 命令/)
+    })
+
+    // AC6 冷恢复：上一段把 shellGrant 留成 true 并落了盘，新宿主必须把它清掉。
+    // 这里用结构完好的快照，才不会像残缺快照那条一样分不清是 repairFlow 还是 hydrate 起的效。
+    const cold = makeHost(grantCwd, 'sess-s1-grant')
+    const coldState = await cold.request('/api/flowgate/state?sessionId=sess-s1-grant')
+    check('AC6 结构完好的快照冷恢复后命令授权被清除', () => {
+      assert.equal(coldState.body.active, true)
+      assert.equal(coldState.body.stage, 'S1')
+      assert.equal(coldState.body.shellGrant, false)
+    })
+  } finally {
+    rmSync(grantCwd, { recursive: true, force: true })
+  }
 }
 
 console.log('\n全部通过：' + passed.length + ' 项')

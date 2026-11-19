@@ -434,22 +434,121 @@ plugin.apply({
   get(name) { return name === 'workspaces' ? fakeWorkspaces : undefined },
 })
 
-await check('apply 只注册左侧栏面板（图标 + 面板本体）', () => {
-  // 入口收敛到左侧栏：会话视图「本次流程」与输入框上方常驻条都已移除，
-  // 否则同一件事有三个入口，用户每次都要判断该点哪个。
-  assert.equal(registrations.length, 2)
+await check('apply 注册左侧栏面板与会话输入框上方的阶段提示', () => {
+  // 入口仍收敛到左侧栏；只多一条只读提示条，它不开第二个门禁通道，
+  // 也不和侧栏条目共用 id——两处各自独立。
+  assert.equal(registrations.length, 3)
   const names = registrations.map((item) => item.options.name).sort()
-  assert.deepEqual(names, ['main', 'sidebar.panellist'])
+  assert.deepEqual(names, ['conversation.input.dock', 'main', 'sidebar.panellist'])
   const byName = (name) => registrations.find((item) => item.options.name === name)
   // 侧栏条目 id 与 main 的 key 必须同名，否则点图标打不开面板。
   assert.equal(byName('sidebar.panellist').options.id, 'flowgate-hub')
   assert.equal(byName('sidebar.panellist').options.label(), '流程工作台')
   assert.equal(byName('main').options.key, 'flowgate-hub')
+  // 宿主的 order：任务条 0、目标条 10、排队消息 20；15 落在目标条下、消息与输入框上。
+  const dock = byName('conversation.input.dock')
+  assert.equal(dock.options.id, 'flowgate-hub-stage-hint')
+  assert.equal(dock.options.order, 15)
 })
 
-await check('会话视图与输入框常驻条都不再注册', () => {
+await check('会话视图仍不注册：流程状态只走输入框上方那一行', () => {
   assert.equal((registrations.filter((item) => item.options.name === 'conversation.view')).length, 0)
-  assert.equal((registrations.filter((item) => item.options.name === 'conversation.input.dock')).length, 0)
+  assert.equal((registrations.filter((item) => item.options.name === 'conversation.input.dock')).length, 1)
+})
+
+const stageHint = registrations.find((item) => item.options.name === 'conversation.input.dock').Component
+
+await check('阶段提示：一行说清第几步、在做什么、已用多久', async () => {
+  currentView = baseView('S2', {
+    progress: { stageIndex: 1, label: '开发', percent: 50 },
+    activity: { tool: 'edit', text: '编辑 lib/client.js', elapsedMs: 1000 },
+    elapsedMs: 96000,
+  })
+  const tree = (await render(stageHint, {})).toJSON()
+  assert.ok(nodeByClass(tree, 'fg-hint'), '应渲在输入框卡片上方那一行')
+  const text = flat(tree)
+  assert.ok(text.includes('S2 开发'), '应写明第几步与阶段名：' + text)
+  assert.ok(text.includes('正在编辑 lib/client.js'), '应显示当前动作：' + text)
+  assert.ok(text.includes('已用 1 分 36 秒'), '应显示已用时：' + text)
+  assert.equal(buttons(tree).length, 0, '只读提示不放按钮')
+})
+
+await check('阶段提示：宿主真实挂载形态（InputZone 的 session.sessionId）也渲染', async () => {
+  currentView = baseView('S2', {
+    progress: { stageIndex: 1, label: '开发', percent: 50 },
+    elapsedMs: 96000,
+  })
+  // 宿主传给插槽组件的是 InputZone，sessionId 挂在 props.session.sessionId 上；
+  // 这是组件唯一的真实挂载路径，写错时线上一个字都不显示。
+  const tree = (await render(stageHint, { session: { sessionId: 'zone-session' } }, false)).toJSON()
+  assert.ok(nodeByClass(tree, 'fg-hint'), '应渲染：' + flat(tree))
+  assert.ok(flat(tree).includes('S2 开发'), '应认出当前阶段：' + flat(tree))
+})
+
+await check('阶段提示：已用时长不随轮询反复播报', async () => {
+  currentView = baseView('S2', { progress: { stageIndex: 1, label: '开发' }, elapsedMs: 96000 })
+  const tree = (await render(stageHint, {})).toJSON()
+  const elapsed = nodeByClass(tree, 'fg-hint-elapsed')
+  assert.ok(elapsed, '应显示已用时长：' + flat(tree))
+  assert.equal(elapsed.props['aria-hidden'], 'true', '时长每 1.5 秒都在变，不该让读屏器反复重播整行')
+})
+
+await check('阶段提示：门禁在等时点名要点的按钮，并说明去哪里点', async () => {
+  currentView = baseView('S3', {
+    waiting: true,
+    waitingKind: 'gate',
+    progress: { stageIndex: 2, label: '评审', percent: 60 },
+  })
+  const tree = (await render(stageHint, {})).toJSON()
+  const text = flat(tree)
+  assert.ok(nodeByClass(tree, 'fg-hint is-waiting'), '等待态要有单独样式')
+  assert.ok(text.includes('S3 评审'))
+  assert.ok(text.includes('等你点「通过评审，进入测试」'), '应点名要点的按钮：' + text)
+  assert.ok(text.includes('流程工作台'), '应说明去哪里点：' + text)
+  assert.equal(buttons(tree).length, 0, '提示条本身不放按钮')
+})
+
+await check('阶段提示：S1 的两种等待各自点名要做的动作', async () => {
+  for (const [kind, want] of [['answer', '等你回答上面的问题'], ['doc', '等你点「批准并冻结 scope」']]) {
+    currentView = baseView('S1', { waiting: true, waitingKind: kind })
+    const text = flat((await render(stageHint, {})).toJSON())
+    assert.ok(text.includes(want), kind + ' 应点名要做的动作：' + text)
+  }
+  // 子代理那边的 waitingKind 与阶段都取不到时，只说等确认，不编一个不存在的按钮名。
+  currentView = baseView('S9', { waiting: true, waitingKind: null })
+  const text = flat((await render(stageHint, {})).toJSON())
+  assert.ok(text.includes('等你确认后继续'), '不该编造按钮名：' + text)
+})
+
+await check('阶段提示：视图没带 progress 时退回 stages 里的当前阶段', async () => {
+  currentView = baseView('S3')
+  const text = flat((await render(stageHint, {})).toJSON())
+  assert.ok(text.includes('S3 评审'), '应能从 stages 认出当前阶段：' + text)
+  assert.ok(text.includes('等待 Agent 下一步'), '没有动作时给中性文案：' + text)
+  // 视图没带 elapsedMs 时不该渲染出一个不真实的「已用 0 秒」。
+  assert.ok(!text.includes('已用 0 秒'), '缺时长时整段不渲染：' + text)
+})
+
+await check('阶段提示：阶段名缺失时只写 S 几，不留尾随空格', async () => {
+  currentView = baseView('S2', {
+    stages: [
+      { id: 'S1', label: '' },
+      { id: 'S2', label: '' },
+      { id: 'S3', label: '' },
+      { id: 'S4', label: '' },
+    ],
+  })
+  const tree = (await render(stageHint, {})).toJSON()
+  const stage = nodeByClass(tree, 'fg-hint-stage')
+  assert.ok(stage, '应渲染阶段段：' + flat(tree))
+  assert.equal(texts(stage).join(''), 'S2', '没有阶段名时只写 S2：' + JSON.stringify(texts(stage)))
+})
+
+await check('阶段提示：没有流程、已结束或已放弃时一行都不占', async () => {
+  for (const patch of [{ active: false }, { finished: true }, { cancelled: true }]) {
+    currentView = baseView('S2', patch)
+    assert.equal((await render(stageHint, {})).toJSON(), null, '不该渲染：' + JSON.stringify(patch))
+  }
 })
 
 await check('样式只注入一次', () => {
@@ -950,7 +1049,11 @@ const HubPanelIcon = componentOf('sidebar.panellist')
   const tree = renderer.toJSON()
   await check('S4 主区提供命令授权开关', () => {
     assert.ok(flat(tree).includes('允许执行构建/测试命令'))
-    assert.ok(flat(tree).includes('默认关闭：S4 只允许只读 shell 命令'))
+    // 文案改为「流程内持久」口径后，这里钉住它：不再按阶段说话，也不再要求重启后重勾。
+    const all = flat(tree)
+    assert.ok(all.includes('默认关闭'))
+    assert.ok(all.includes('本次流程内一直有效'))
+    assert.ok(!/S4 只允许只读 shell 命令/.test(all), '旧文案（按阶段说话）必须消失')
   })
   await check('S4 勾选命令授权提交 toggleShellGrant', async () => {
     const grant = checkboxNodes(renderer.toJSON()).find((node) => node.props.checked === false)
