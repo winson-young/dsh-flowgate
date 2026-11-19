@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, readFileSync, existsSync, rmSync } from 'node:fs'
+import { mkdirSync, readFileSync, existsSync, rmSync, writeFileSync } from 'node:fs'
+import { clientFactoryRevision } from '../lib/runtime.js'
 import { join } from 'node:path'
 
 // 假宿主：只实现 flowgate 用到的 ctx 能力（inject/effect/on/get/tools/connection/workingDirectory），
@@ -396,7 +397,7 @@ await check('评审报告按角度聚合，跳过门禁进入 S4', async () => {
   assert.equal(view.skippedCount, 1)
 })
 
-await check('测试报告按方向聚合，验收后流程结束', async () => {
+await check('测试汇总通过不能替代 AC 证据，明确接受缺口后结束', async () => {
   const pending = within(call('flowgate_test', {
     directions: [{
       id: 'smoke',
@@ -405,12 +406,21 @@ await check('测试报告按方向聚合，验收后流程结束', async () => {
     }],
   }), 'flowgate_test')
   await tick()
-  const res = await post({ sessionId: SESSION, action: 'gate', payload: { decision: 'pass' } })
+  const rejected = await post({ sessionId: SESSION, action: 'gate', payload: { decision: 'pass' } })
+  assert.equal(rejected.status, 409)
+  assert.match(rejected.data.error, /验收标准.*未通过/)
+  assert.equal((await getState()).waiting, true, '拒绝发生在唤醒等待工具之前')
+  const falseFlag = await post({ sessionId: SESSION, action: 'gate', payload: { decision: 'pass', acceptUncovered: 'true' } })
+  assert.equal(falseFlag.status, 409, '字符串不能冒充明确的布尔确认')
+  const res = await post({ sessionId: SESSION, action: 'gate', payload: { decision: 'pass', acceptUncovered: true, acceptanceNote: '接受本次未执行会话请求的验证缺口' } })
   assert.equal(res.status, 200)
   const value = await pending
   assert.equal(value.decision, 'pass')
   const view = await getState()
   assert.equal(view.finished, true)
+  assert.equal(view.acceptanceDecision.status, 'accepted-with-gaps')
+  assert.equal(view.acceptanceDecision.note, '接受本次未执行会话请求的验证缺口')
+  assert.equal(view.acceptance.counts.uncovered, 1, '接受例外不能把未覆盖项改成通过')
   assert.equal(view.workspace.flow, null)
   assert.equal((await getState('sess-other')).workspace.active, false)
 })
@@ -446,6 +456,111 @@ await check('scope.json 冻结后落盘', async () => {
   assert.ok(existsSync(file))
   const scope = JSON.parse(readFileSync(file, 'utf8'))
   assert.equal(scope.in_scope.files_expected_to_change[0], 'src/auth/session.ts')
+})
+
+await check('当前版本的逐 AC 实际执行证据才可正常验收通过', async () => {
+  const S = 'sess-proof'
+  const sample = join(CWD, 'proof.txt')
+  writeFileSync(sample, '本轮已读取的样例', 'utf8')
+  await call('flowgate_start', { title: '证据闭环', preset: 'fast' }, S)
+  const doc = within(call('flowgate_doc', {
+    html: '<html><body>验证实际样例读取</body></html>',
+    scope: { files_expected_to_change: ['proof.txt'], capabilities: [], out_of_scope_explicitly: [],
+      acceptance_criteria: [{ id: 'AC-1', when: '读取本轮样例文件', then: '得到本轮写入的精确文本',
+        verification: { method: 'integration', procedure: '在集成测试中读取 proof.txt 并断言精确文本' } }] },
+  }, S), '证据文档')
+  await tick()
+  assert.equal((await post({ sessionId: S, action: 'doc', payload: { decision: 'approve' } })).status, 200)
+  await doc
+  const dev = within(call('flowgate_gate', {}, S), '证据开发门禁')
+  await tick()
+  assert.equal((await post({ sessionId: S, action: 'gate', payload: { decision: 'pass' } })).status, 200)
+  await dev
+  const review = within(call('flowgate_review', { angles: [{ id: 'correctness', name: '正确性', verdict: 'pass', findings: [] }] }, S), '证据评审')
+  await tick()
+  assert.equal((await post({ sessionId: S, action: 'gate', payload: { decision: 'pass' } })).status, 200)
+  await review
+  const version = (await getState(S)).snapshot.id
+  assert.equal(readFileSync(sample, 'utf8'), '本轮已读取的样例')
+  const verified = within(call('flowgate_test', {
+    directions: [{ id: 'smoke', name: '读取集成验证', points: [{ point: '读取样例并断言精确文本', result: 'pass' }] }],
+    acceptance: [{ ac: 'AC-1', status: 'pass', method: 'integration', version,
+      evidence: 'test/integration.test.mjs 已实际 readFileSync(proof.txt) 并 strictEqual 精确文本，通过。' }],
+  }, S), '证据验收')
+  await tick()
+  const mid = await getState(S)
+  assert.equal(mid.acceptance.counts.pass, 1)
+  assert.equal(mid.acceptance.items[0].method, 'integration')
+  assert.equal(mid.acceptance.items[0].version, version)
+  const accepted = await post({ sessionId: S, action: 'gate', payload: { decision: 'pass' } })
+  assert.equal(accepted.status, 200, JSON.stringify(accepted.data))
+  await verified
+  const done = await getState(S)
+  assert.equal(done.finished, true)
+  assert.equal(done.acceptanceDecision.status, 'passed')
+  assert.equal(done.acceptanceDecision.counts.pass, 1)
+})
+
+await check('state 只根据真实上报的客户端代码指纹核对页面版本', async () => {
+  const digest = clientFactoryRevision(readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8'))
+  assert.match(digest, /^[a-f0-9]{64}$/)
+  const query = async (revision) => (await stateRoute.fetch({ url: 'http://host/api/flowgate/state?sessionId=sess-proof&clientRevision=' + revision + '&pageId=de54a6e1-b162-42c9-910a-470575847521&viewportWidth=1280&viewportHeight=800' })).json()
+  assert.equal((await query(digest)).runtime.status, 'verified')
+  assert.equal((await query('f'.repeat(64))).runtime.status, 'mismatch')
+  assert.equal((await query('invalid')).runtime.status, 'unverified', '非法或缺失指纹必须清除旧页面核验')
+  assert.equal((await query(digest)).runtime.status, 'verified')
+  assert.equal((await getState('sess-proof')).runtime.status, 'unverified', '旧页面不带指纹不能借用同会话新页面的已核对状态')
+})
+
+await check('布局采集回执绑定内容、页面实例和视口，视口变化会使证据失效', async () => {
+  // 此处是宿主 API 契约夹具；矩形来自测试替身，不是实际桌面布局结果。
+  const S = 'sess-layout-proof'
+  await call('flowgate_start', { title: '布局回执契约', preset: 'fast' }, S)
+  const doc = within(call('flowgate_doc', { html: '<html><body>对齐采集契约</body></html>',
+    scope: { files_expected_to_change: ['proof.txt'], capabilities: [], out_of_scope_explicitly: [],
+      acceptance_criteria: [{ id: 'AC-1', when: '显示样例行', then: '与参照左右对齐',
+        verification: { method: 'visual', procedure: '从已核对页面采集实际左右边界' } }] },
+  }, S), '布局回执文档')
+  await tick()
+  assert.equal((await post({ sessionId: S, action: 'doc', payload: { decision: 'approve' } })).status, 200)
+  await doc
+  const dev = within(call('flowgate_gate', {}, S), '布局回执开发门禁')
+  await tick()
+  assert.equal((await post({ sessionId: S, action: 'gate', payload: { decision: 'pass' } })).status, 200)
+  await dev
+  const review = within(call('flowgate_review', { angles: [{ id: 'correctness', name: '正确性', verdict: 'pass', findings: [] }] }, S), '布局回执评审')
+  await tick()
+  assert.equal((await post({ sessionId: S, action: 'gate', payload: { decision: 'pass' } })).status, 200)
+  await review
+  const digest = clientFactoryRevision(readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8'))
+  const pageId = 'a6ac4d37-b034-4bdf-b622-6c72b74c6083'
+  const page = async (width = 1280) => (await stateRoute.fetch({ url: 'http://host/api/flowgate/state?sessionId=' + S + '&clientRevision=' + digest + '&pageId=' + pageId + '&viewportWidth=' + width + '&viewportHeight=800' })).json()
+  const view = await page()
+  assert.equal(view.runtime.status, 'verified')
+  const viewport = { width: 1280, height: 800 }
+  const measurements = [{ element: '.fixture-row', reference: 'fixture-reference', left: 10, right: 400, referenceLeft: 10, referenceRight: 400 }]
+  const payload = { version: view.snapshot.id, pageId, clientRevision: digest, viewport, measurements }
+  assert.equal((await post({ sessionId: S, action: 'layout-evidence', payload: { ...payload, pageId: 'wrong-page' } })).status, 409)
+  assert.equal((await post({ sessionId: S, action: 'layout-evidence', payload: { ...payload, version: '0'.repeat(64) } })).status, 409)
+  assert.equal((await post({ sessionId: S, action: 'layout-evidence', payload: { ...payload, measurements: [{ ...measurements[0], right: 10 }] } })).status, 409)
+  const captured = await post({ sessionId: S, action: 'layout-evidence', payload })
+  assert.equal(captured.status, 200, JSON.stringify(captured.data))
+  const receipt = captured.data.layoutEvidence
+  assert.equal(receipt.version, view.snapshot.id)
+  assert.equal(receipt.pageId, pageId)
+  const test = within(call('flowgate_test', { directions: [{ id: 'smoke', name: '布局取证契约', points: [{ point: '验证回执绑定', result: 'pass' }] }],
+    acceptance: [{ ac: 'AC-1', status: 'pass', method: 'visual', version: view.snapshot.id,
+      evidence: '宿主 API 契约夹具已核验采集回执绑定，不代表真实桌面测量。', evidenceId: receipt.id,
+      runtime: { hostRevision: view.runtime.hostRevision, clientRevision: digest, pageId, viewport }, measurements }],
+  }, S), '布局回执验收')
+  await tick()
+  assert.equal((await page()).acceptance.counts.pass, 1)
+  assert.equal((await page(1024)).acceptance.counts.uncovered, 1, '同代码不同视口不能沿用测量')
+  assert.equal((await post({ sessionId: S, action: 'gate', payload: { decision: 'pass' } })).status, 409)
+  assert.equal((await page()).acceptance.counts.pass, 1)
+  assert.equal((await post({ sessionId: S, action: 'gate', payload: { decision: 'pass' } })).status, 200)
+  await test
+  assert.equal((await page()).acceptanceDecision.status, 'passed')
 })
 
 await check('flowgate_review_run 为每个角度 spawn 只读子代理并带上开发规则', async () => {

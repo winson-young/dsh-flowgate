@@ -32,13 +32,14 @@
     "dsh": ">=0.2.2-rc.3 <0.3.0-0"
   },
   "scripts": {
-    "test": "node test/host.test.mjs && node test/subagents.test.mjs && node test/integration.test.mjs && node test/client.test.mjs && node test/install.test.mjs",
+    "test": "node test/provenance.test.mjs && node test/acceptance.test.mjs && node test/runtime.test.mjs && node test/host.test.mjs && node test/subagents.test.mjs && node test/integration.test.mjs && node test/client.test.mjs && node test/install.test.mjs",
     "test:host": "node test/host.test.mjs",
     "test:subagents": "node test/subagents.test.mjs",
     "test:client": "node test/client.test.mjs",
     "test:integration": "node test/integration.test.mjs",
     "test:install": "node test/install.test.mjs",
-    "check": "node --check lib/index.js && node --check lib/client.js"
+    "stamp": "node scripts/stamp-revisions.mjs",
+    "check": "node scripts/stamp-revisions.mjs --check && node --check lib/index.js && node --check lib/client.js && node --check lib/provenance.js && node --check lib/acceptance.js && node --check lib/runtime.js && node --check lib/revisions.js && node --check docs/verify-layout.mjs"
   },
   "dsh": {
     "bundle": {

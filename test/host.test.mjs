@@ -752,16 +752,17 @@ const testPending = gateRound(
       },
     ],
   },
-  { decision: 'pass' },
+  // 本夹具只验证授权回收；S4 已改方向规则，显式跳过而不伪造当前验收证据。
+  { decision: 'skip' },
 )
 const testResult = await testPending
-check('S4 验收通过后流程结束', () => assert.equal(testResult.next, 'done'))
+check('S4 显式跳过后流程结束', () => assert.equal(testResult.next, 'done'))
 
 // AC-8：flows.jsonl 完整、跳过计数正确。
 const finalState = await getState()
-check('AC-8 流程结束且跳过计数为 0', () => {
+check('AC-8 流程结束且显式跳过 S4 的计数为 1', () => {
   assert.equal(finalState.body.finished, true)
-  assert.equal(finalState.body.skippedCount, 0)
+  assert.equal(finalState.body.skippedCount, 1)
 })
 check('AC6 流程结束后命令授权被清除', () => assert.equal(finalState.body.shellGrant, false))
 check('AC-8 flows.jsonl 记录完整阶段事件', () => {
@@ -1837,9 +1838,9 @@ rmSync(cwd, { recursive: true, force: true })
   const done = await cx.request('/api/flowgate/action', {
     sessionId: sid,
     action: 'gate',
-    payload: { decision: 'pass' },
+    payload: { decision: 'pass', acceptUncovered: true },
   })
-  check('无等待器时最后一个门禁通过后说明流程已结束', () => {
+  check('无等待器时显式接受证据缺口后说明流程已结束', () => {
     assert.equal(done.status, 200)
     assert.equal(done.body.stage, 'S4')
     assert.equal(done.body.finished, true)
@@ -3047,7 +3048,12 @@ rmSync(cwd, { recursive: true, force: true })
     }],
   })
   await tick()
-  const doneGate = await act('gate', { decision: 'pass' })
+  const uncoveredGate = await act('gate', { decision: 'pass' })
+  check('环境排除与缺失 AC 证据不能默认验收通过', () => {
+    assert.equal(uncoveredGate.status, 409)
+    assert.match(uncoveredGate.body.error, /acceptUncovered/)
+  })
+  const doneGate = await act('gate', { decision: 'pass', acceptUncovered: true })
   await excludedTest
   check('环境受限的点显式排除并单独计数', () => {
     assert.equal(doneGate.status, 200)
@@ -3248,8 +3254,8 @@ rmSync(cwd, { recursive: true, force: true })
 }
 
 // ---------------------------------------------------------------------------
-// 评审归属口径与截断：只有挂在冻结 scope 的验收标准上、且落在 scope 文件内的
-// 非 MINOR 发现才进重做清单；对不上的降级成建议。fast 档单角度只留最重要的 3 条。
+// 评审归属口径与完整计数：只有挂在冻结 scope 的验收标准上、且落在 scope 文件内的
+// 非 MINOR 发现才进重做清单；对不上的降级成建议。fast 档同样保留完整发现。
 // 放在最后单独起 host：currentService 是模块级单例，中途再 apply 会顶掉前面的实例。
 // ---------------------------------------------------------------------------
 {
@@ -3298,6 +3304,7 @@ rmSync(cwd, { recursive: true, force: true })
           { file: 'src/other.ts', line: 3, severity: 'MAJOR', ac: 'AC-1', summary: '落在 scope 之外' },
           { file: 'src/gate.ts', line: 4, severity: 'MAJOR', ac: 'AC-9', summary: '验收标准 id 不存在' },
           { file: 'src/gate.ts', line: 5, severity: 'MINOR', ac: 'AC-1', summary: '只是建议' },
+          ...Array.from({ length: 4 }, (_, index) => ({ file: 'src/gate.ts', line: 6 + index, severity: 'MINOR', ac: 'AC-1', summary: '额外建议 ' + index })),
         ],
       }],
     })
@@ -3305,14 +3312,15 @@ rmSync(cwd, { recursive: true, force: true })
     const reviewState = await px.request('/api/flowgate/state?sessionId=sess-finding-gate')
     const reported = reviewState.body.review
     const kept = reported.angles[0].findings
-    check('fast 档单角度只留最重要的 3 条，被截掉的条数留痕', () => {
-      assert.equal(kept.length, 4)
-      assert.match(kept[3].summary, /另有 2 条未列出/)
-      assert.equal(kept[3].severity, 'MINOR')
+    check('fast 档保留完整发现与超过 3 条的 MINOR 计数，不用摘要冒充发现', () => {
+      assert.equal(kept.length, 9)
+      assert.deepEqual(reported.counts, { total: 9, critical: 1, major: 3, minor: 5, blocking: 1, advisories: 8, unscoped: 3 })
+      assert.equal(kept.filter((finding) => finding.severity === 'MINOR').length, 5)
+      assert.ok(kept.every((finding) => !/另有.*未列出/.test(finding.summary)))
     })
     check('只有挂在验收标准上且在 scope 文件内的发现进重做清单', () => {
       assert.equal(reported.blocking, 1)
-      assert.equal(reported.advisories, 2)
+      assert.equal(reported.advisories, 8)
       assert.equal(kept[0].acMatched, false)
       assert.equal(kept[0].blocking, false)
       assert.equal(kept[1].acMatched, true)
@@ -3325,11 +3333,19 @@ rmSync(cwd, { recursive: true, force: true })
       assert.equal(reviewState.body.reviewOutsideScope.length, 1)
       assert.equal(reviewState.body.reviewOutsideScope[0].file, 'src/other.ts')
     })
-    await act('gate', { decision: 'back', to: 'S2' })
+    const returned = await act('gate', { decision: 'back', to: 'S2', note: '先补 AC-1 并发复现，再修复重复刷新' })
     const reviewResult = await review
-    check('退回时讲清哪些发现不计入重做清单', () => {
+    check('退回时保留用户 note 和按 AC 的修复清单，MINOR 与范围外发现仍作建议', () => {
+      assert.equal(returned.status, 200)
       assert.equal(reviewResult.decision, 'reject')
-      assert.match(reviewResult.message, /另有 2 条发现对不上冻结 scope 的验收标准/)
+      assert.match(reviewResult.message, /另有 8 条非阻塞发现/)
+      assert.match(reviewResult.message, /先补 AC-1 并发复现，再修复重复刷新/)
+      assert.match(reviewResult.message, /退回修复清单（按 AC）/)
+      assert.equal(returned.body.remediation.note, '先补 AC-1 并发复现，再修复重复刷新')
+      assert.ok(returned.body.remediation.items.some((item) => item.ac === 'AC-1' && item.source === 'review' && item.summary === '并发时可能重复刷新'))
+      assert.ok(returned.body.remediation.items.some((item) => item.ac === 'AC-1' && item.source === 'acceptance'))
+      assert.ok(returned.body.remediation.items.every((item) => item.ac === 'AC-1'))
+      assert.equal(returned.body.remediation.advisories.length, 8)
     })
     const indexSource = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
     check('评审子代理的提示里带上冻结 scope 的影响面与验收标准', () => {
@@ -3395,6 +3411,258 @@ rmSync(cwd, { recursive: true, force: true })
       assert.equal(history.workspace.flow.sessionId, 'sibling')
     })
     await restored.request('/api/flowgate/action', { sessionId: 'sibling', action: 'cancel', payload: {} })
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 内容、规则与执行证据必须通过真实宿主工具与 HTTP 门禁串起来，不能只测纯函数。
+// ---------------------------------------------------------------------------
+async function provenanceFixture(label) {
+  const ws = mkdtempSync(join(tmpdir(), 'flowgate-provenance-' + label + '-'))
+  const sid = 'provenance-' + label
+  mkdirSync(join(ws, 'src'))
+  writeFileSync(join(ws, 'src/session.mjs'), 'export const response = (expired) => expired ? 401 : 200\n')
+  writeFileSync(join(ws, 'src/helper.mjs'), 'export const unchanged = true\n')
+  const px = makeHost(ws, sid)
+  px.shell.run = async () => ({
+    exitCode: 0, signal: null, timedOut: false, aborted: false,
+    stdout: { text: ' M src/session.mjs\n M src/helper.mjs\n---numstat---\n1\t1\tsrc/session.mjs\n1\t1\tsrc/helper.mjs\n', truncated: false },
+    stderr: { text: '', truncated: false },
+  })
+  const act = (action, payload) => px.request('/api/flowgate/action', { sessionId: sid, action, payload })
+  const state = async () => (await px.request('/api/flowgate/state?sessionId=' + sid)).body
+  const round = async (name, args, payload) => {
+    const pending = px.tool(name, args)
+    await tick()
+    const result = await act('gate', payload)
+    assert.equal(result.status, 200, JSON.stringify(result.body))
+    await pending
+    return result
+  }
+  const angles = ['correctness', 'safety'].map((id) => ({ id, name: id, verdict: 'pass', findings: [] }))
+  const directions = ['smoke', 'regression'].map((id) => ({ id, name: id, points: [{ point: '过期请求返回 401', result: 'pass' }] }))
+  await px.tool('flowgate_start', { title: label, preset: 'fast' })
+  const doc = px.tool('flowgate_doc', {
+    html: '<html><body><p>按内容与执行证据验收</p></body></html>',
+    scope: {
+      files_expected_to_change: ['src/session.mjs', 'src/helper.mjs'],
+      capabilities: ['过期请求拒绝'], out_of_scope_explicitly: [],
+      acceptance_criteria: [{ id: 'AC-1', when: '会话过期后发请求', then: '返回 401', verification: { method: 'unit', procedure: '调用 response(true) 并断言状态码' } }],
+    },
+  })
+  await tick()
+  assert.equal((await act('doc', { decision: 'approve' })).status, 200)
+  await doc
+  await round('flowgate_gate', {}, { decision: 'pass' })
+  return { ws, sid, px, act, state, round, angles, directions }
+}
+
+{
+  const fx = await provenanceFixture('hard-cap-severity')
+  try {
+    const findings = ['CRITICAL', 'MAJOR', 'MINOR'].flatMap((severity, index) =>
+      Array.from({ length: [201, 2, 3][index] }, (_, i) => ({ file: 'src/session.mjs', ac: 'AC-1', severity, summary: severity + ' ' + i })))
+    const pending = fx.px.tool('flowgate_review', { angles: [{ id: 'correctness', name: '正确性', verdict: 'blocking', findings }] })
+    await tick()
+    const view = await fx.state()
+    check('硬上限省略项保留原严重度与阻塞数量，不能合成 MINOR 或丢失分级', () => {
+      assert.equal(view.review.angles[0].findings.length, 200)
+      assert.deepEqual(view.review.counts, { total: 206, critical: 201, major: 2, minor: 3, blocking: 203, advisories: 3, unscoped: 0 })
+      assert.deepEqual(view.review.angles[0].omittedCounts, { total: 6, critical: 1, major: 2, minor: 3, blocking: 3, advisories: 3, unscoped: 0 })
+    })
+    assert.equal((await fx.act('gate', { decision: 'back', to: 'S2' })).status, 200)
+    await pending
+    await fx.px.tool('flowgate_cancel', {})
+  } finally { rmSync(fx.ws, { recursive: true, force: true }) }
+}
+
+for (const change of ['content', 'rules']) {
+  const fx = await provenanceFixture('reuse-' + change)
+  const { ws, px, act, state, round, angles, directions } = fx
+  try {
+    await round('flowgate_review', { angles }, { decision: 'pass' })
+    await round('flowgate_test', { directions }, { decision: 'back', to: 'S2' })
+    const before = await state()
+    assert.equal(before.snapshot.complete, true)
+    assert.ok(before.carryOver.angles.every((entry) => entry.reusable))
+    assert.ok(before.carryOver.directions.every((entry) => entry.reusable))
+    if (change === 'content') {
+      // 同一路径、同长度、同一组 git 状态；只有实际文件内容发生改变。
+      writeFileSync(join(ws, 'src/session.mjs'), 'export const response = (expired) => expired ? 403 : 200\n')
+    } else {
+      const enabledRule = before.stageConfigs.S2.ids[0]
+      assert.ok(enabledRule)
+      assert.equal((await act('toggleRule', { id: enabledRule, enabled: false })).status, 200)
+    }
+    const changed = await state()
+    check((change === 'content' ? '同路径内容改变' : '规则改变') + '使整轮所有评审角度和测试方向都不可复用', () => {
+      assert.equal(changed.snapshot.complete, true)
+      assert.notEqual(changed.snapshot.id, before.snapshot.id)
+      assert.deepEqual(changed.snapshot.files.map((file) => file.path), before.snapshot.files.map((file) => file.path))
+      assert.equal(changed.carryOver.sameCode, false)
+      assert.equal(changed.carryOver.angles.length, 2)
+      assert.equal(changed.carryOver.directions.length, 2)
+      assert.ok(changed.carryOver.angles.every((entry) => !entry.reusable))
+      assert.ok(changed.carryOver.directions.every((entry) => !entry.reusable))
+      if (change === 'rules') assert.deepEqual(changed.snapshot.files, before.snapshot.files)
+      else assert.deepEqual(changed.snapshot.files.find((file) => file.path === 'src/helper.mjs'), before.snapshot.files.find((file) => file.path === 'src/helper.mjs'))
+    })
+    await round('flowgate_gate', {}, { decision: 'pass' })
+    const reviewError = await px.tool('flowgate_review', { angles: [], reusedAngles: ['correctness'] }).catch((error) => error)
+    check((change === 'content' ? '内容变化' : '规则变化') + '不能用 reusedAngles 偷渡旧报告', () => assert.match(String(reviewError?.message), /快照已失效.*不能复用/))
+    await round('flowgate_review', { angles }, { decision: 'pass' })
+    const testError = await px.tool('flowgate_test', { directions: [], reusedDirections: ['smoke'] }).catch((error) => error)
+    check((change === 'content' ? '内容变化' : '规则变化') + '不能用 reusedDirections 偷渡旧报告', () => assert.match(String(testError?.message), /快照已失效.*不能复用/))
+    await px.tool('flowgate_cancel', {})
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+}
+
+for (const stage of ['S3', 'S4']) {
+  for (const invalidation of ['changed', 'incomplete']) {
+    const { ws, px, act, state, round, angles, directions } = await provenanceFixture(stage + '-' + invalidation)
+    try {
+      if (stage === 'S4') await round('flowgate_review', { angles }, { decision: 'pass' })
+      if (invalidation === 'incomplete') {
+        rmSync(join(ws, 'src/helper.mjs'))
+        mkdirSync(join(ws, 'src/helper.mjs'))
+      }
+      const pending = px.tool(stage === 'S3' ? 'flowgate_review' : 'flowgate_test', stage === 'S3' ? { angles } : { directions })
+      await tick()
+      if (invalidation === 'changed') writeFileSync(join(ws, 'src/session.mjs'), 'export const response = () => 403\n')
+      const rejected = await act('gate', { decision: 'pass', acceptUncovered: true })
+      const after = await state()
+      check(stage + ' ' + (invalidation === 'changed' ? '已过期' : '不完整') + '报告快照不能通过，显式接受缺口也不能绕过', () => {
+        assert.equal(rejected.status, 409)
+        assert.match(rejected.body.error, /快照已失效或不完整/)
+        assert.equal(after.stage, stage)
+        assert.equal(after.finished, false)
+        assert.equal(after.gate.pending, true)
+        if (invalidation === 'incomplete') assert.equal(after.snapshot.complete, false)
+      })
+      await px.tool('flowgate_cancel', {})
+      await pending
+    } finally {
+      rmSync(ws, { recursive: true, force: true })
+    }
+  }
+}
+
+{
+  const { ws, px, act, state, round, angles, directions } = await provenanceFixture('old-review')
+  try {
+    await round('flowgate_review', { angles }, { decision: 'pass' })
+    const reviewed = await state()
+    writeFileSync(join(ws, 'src/session.mjs'), 'export const response = () => 403\n')
+    const pending = px.tool('flowgate_test', { directions })
+    await tick()
+    const rejected = await act('gate', { decision: 'pass', acceptUncovered: true })
+    const after = await state()
+    check('S4 当前测试报告也不能替代已经过期的 S3 通过快照', () => {
+      assert.equal(after.test.snapshot.id, after.snapshot.id)
+      assert.equal(after.test.snapshot.complete, true)
+      assert.equal(after.review.snapshot.id, reviewed.snapshot.id)
+      assert.notEqual(after.review.snapshot.id, after.snapshot.id)
+      assert.equal(rejected.status, 409)
+      assert.match(rejected.body.error, /评审后代码或规则已变化/)
+      assert.equal(after.finished, false)
+    })
+    await px.tool('flowgate_cancel', {})
+    await pending
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+}
+
+for (const evidenceCase of ['missing', 'empty', 'valid', 'nonpass-point']) {
+  const { ws, px, act, state, round, angles, directions } = await provenanceFixture('evidence-' + evidenceCase)
+  try {
+    const reviewedVersion = (await state()).snapshot.id
+    await round('flowgate_review', {
+      angles,
+      acceptance: [{ ac: 'AC-1', status: 'pass', method: 'unit', evidence: '静态检查声称通过，不能替代执行', version: reviewedVersion }],
+    }, { decision: 'pass' })
+    const reviewed = await state()
+    assert.equal(reviewed.acceptance.counts.pass, 0)
+    const version = reviewed.snapshot.id
+    const source = readFileSync(join(ws, 'src/session.mjs'), 'utf8')
+    const executed = await import('data:text/javascript,' + encodeURIComponent(source))
+    const actualStatus = executed.response(true)
+    assert.equal(actualStatus, 401)
+    const evidence = '实际调用当前 src/session.mjs response(true) 得到 ' + actualStatus + '，assert.equal(actualStatus, 401) 通过'
+    const acceptance = evidenceCase === 'missing' ? [] : [{ ac: 'AC-1', status: 'pass', method: 'unit', evidence: evidenceCase === 'empty' ? '' : evidence, version }]
+    const reportedDirections = evidenceCase === 'nonpass-point'
+      ? [{ ...directions[0], points: [{ point: '未验证的额外边界', result: 'uncovered' }] }]
+      : directions
+    const pending = px.tool('flowgate_test', { directions: reportedDirections, acceptance })
+    await tick()
+    const submitted = await state()
+    const first = await act('gate', { decision: 'pass' })
+    if (evidenceCase === 'valid') {
+      const result = await pending
+      const finished = await state()
+      check('当前版本有实际 AC 执行证据且验证要点全通过才记录 passed', () => {
+        assert.equal(first.status, 200)
+        assert.equal(result.decision, 'pass')
+        assert.equal(finished.acceptanceDecision.status, 'passed')
+        assert.equal(finished.acceptance.counts.pass, 1)
+        assert.equal(finished.acceptance.items[0].evidence, evidence)
+        assert.equal(finished.acceptance.items[0].version, version)
+        assert.equal(finished.finished, true)
+      })
+    } else {
+      const stillPending = await state()
+      check(evidenceCase + '：缺执行证据或存在非 pass 要点时最终门禁返回 409', () => {
+        assert.equal(first.status, 409)
+        assert.match(first.body.error, /acceptUncovered/)
+        assert.equal(stillPending.finished, false)
+        assert.equal(stillPending.gate.pending, true)
+        assert.equal(stillPending.acceptance.counts.pass, evidenceCase === 'nonpass-point' ? 1 : 0)
+      })
+      const accepted = await act('gate', { decision: 'pass', acceptUncovered: true, acceptanceNote: '明确接受未覆盖项，保留账本原状态' })
+      await pending
+      const finished = await state()
+      check(evidenceCase + '：显式例外记录 accepted-with-gaps，AC 原状态与验证要点不被改写', () => {
+        assert.equal(accepted.status, 200)
+        assert.equal(finished.finished, true)
+        assert.equal(finished.acceptanceDecision.status, 'accepted-with-gaps')
+        assert.equal(finished.acceptanceDecision.note, '明确接受未覆盖项，保留账本原状态')
+        assert.deepEqual(finished.acceptance, submitted.acceptance)
+        assert.deepEqual(finished.test.directions, submitted.test.directions)
+        assert.equal(finished.acceptanceDecision.unpassedPoints, evidenceCase === 'nonpass-point' ? 1 : 0)
+      })
+    }
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+}
+
+{
+  const ws = mkdtempSync(join(tmpdir(), 'flowgate-running-recovery-'))
+  const sid = 'running-recovery'
+  try {
+    const first = makeHost(ws, sid)
+    const started = await first.tool('flowgate_start', { title: '恢复未完成任务' })
+    const file = join(ws, '.dsh-flowgate', 'flows', started.flowId + '.json')
+    const raw = JSON.parse(readFileSync(file, 'utf8'))
+    raw.execution = { status: 'running', taskId: 'persisted-task-42', stage: 'S3', text: '仍在等待最终结果' }
+    writeFileSync(file, JSON.stringify(raw))
+    const restored = makeHost(ws, sid)
+    const cold = (await restored.request('/api/flowgate/state?sessionId=' + sid)).body
+    const persisted = JSON.parse(readFileSync(file, 'utf8'))
+    check('持久化 running 任务冷恢复后标为 failed，任务 ID 不能冒充执行完成', () => {
+      assert.equal(cold.active, true)
+      assert.equal(cold.finished, false)
+      assert.equal(cold.stageSummary.execution.status, 'failed')
+      assert.match(cold.stageSummary.execution.text, /没有可确认的最终执行结果.*不能按任务 ID 认为已经完成/)
+      assert.equal(cold.acceptanceDecision, null)
+      assert.equal(persisted.execution.status, 'failed')
+      assert.equal(persisted.execution.taskId, 'persisted-task-42')
+    })
+    await restored.tool('flowgate_cancel', {})
   } finally {
     rmSync(ws, { recursive: true, force: true })
   }

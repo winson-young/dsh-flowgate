@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
+import { createHash, webcrypto } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
+import vm from 'node:vm'
 import React from 'react'
 import TestRenderer from 'react-test-renderer'
 
@@ -38,16 +41,21 @@ function pressEscape() {
 globalThis.CSSStyleSheet = undefined
 
 let plugin = null
+let clientFactory = null
+Object.defineProperty(globalThis, 'crypto', { configurable: true, value: webcrypto })
 // 工作台的页面记忆存在 localStorage 里：这里给一个内存替身，用例之间可清空。
 const memoryStore = new Map()
 globalThis.window = {
+  innerWidth: 1280,
+  innerHeight: 720,
+  devicePixelRatio: 1,
   localStorage: {
     getItem(key) { return memoryStore.has(key) ? memoryStore.get(key) : null },
     setItem(key, value) { memoryStore.set(key, String(value)) },
     removeItem(key) { memoryStore.delete(key) },
   },
   __ModuleLoader__: {
-    load(entry) { plugin = entry.factory(require) },
+    load(entry) { clientFactory = entry.factory; plugin = entry.factory(require) },
   },
 }
 
@@ -442,8 +450,7 @@ plugin.apply({
 })
 
 await check('apply 注册左侧栏面板与会话输入框上方的阶段提示', () => {
-  // 入口仍收敛到左侧栏；只多一条只读提示条，它不开第二个门禁通道，
-  // 也不和侧栏条目共用 id——两处各自独立。
+  // 会话提示条提供快捷启动入口；门禁仍在工作台确认，两处注册 id 独立。
   assert.equal(registrations.length, 3)
   const names = registrations.map((item) => item.options.name).sort()
   assert.deepEqual(names, ['conversation.input.dock', 'main', 'sidebar.panellist'])
@@ -493,7 +500,8 @@ await check('阶段提示：工作区摘要优先，本会话已结束或无流�
     assert.ok(text.includes('已用 2 分 5 秒'), text)
     assert.ok(!text.includes('旧会话') && !text.includes('批准并冻结'), text)
     assert.ok(nodeByClass(tree, 'fg-hint'), '不得继承本会话等待态')
-    assert.equal(buttons(tree).length, 0)
+    assert.equal(buttons(tree).length, 1)
+    assert.ok(buttonByText(tree, '开始需求分析'))
   }
 })
 
@@ -510,14 +518,16 @@ await check('阶段提示：工作区等待使用摘要阶段与 waitingKind，�
   }
 })
 
-await check('阶段提示：workspace 存在时空摘要不回退，本会话运行也不占行', async () => {
+await check('阶段提示：workspace 空摘要不回退，入口始终保留', async () => {
   for (const workspace of [{ flow: null }, {}, null]) {
     currentView = baseView('S2', { workspace })
-    assert.equal((await render(stageHint, {})).toJSON(), null, JSON.stringify(workspace))
+    const tree = (await render(stageHint, {})).toJSON()
+    assert.ok(buttonByText(tree, '开始需求分析'))
+    assert.equal(nodeByClass(tree, 'fg-hint-stage'), null, JSON.stringify(workspace))
   }
   currentView = null
-  assert.equal((await render(stageHint, {})).toJSON(), null)
-  assert.equal((await render(stageHint, {}, false)).toJSON(), null, '没有会话不占行')
+  assert.ok(buttonByText((await render(stageHint, {})).toJSON(), '开始需求分析'))
+  assert.equal((await render(stageHint, {}, false)).toJSON(), null, '没有有效会话不占行')
 })
 
 await check('阶段提示：四阶段复用 Icon，每阶段图形不同且不增加读屏噪音', async () => {
@@ -560,11 +570,13 @@ await check('阶段提示：切 session 首帧不闪旧 view，旧请求晚到�
     }
     commits.length = 0
     await act(async () => { renderer.update(h(ObserveHint, { session: { sessionId: staleId } })) })
-    assert.equal(renderer.toJSON(), null, '新会话尚无摘要时不占行')
+    assert.ok(buttonByText(renderer.toJSON(), '开始需求分析'), '新会话加载中仍有入口')
+    assert.equal(nodeByClass(renderer.toJSON(), 'fg-hint-stage'), null)
     assert.ok(commits.length > 0)
     assert.ok(commits.every((text) => !text.includes('旧工作区开发')), JSON.stringify(commits))
     await act(async () => { renderer.update(h(ObserveHint, { session: { sessionId: nextId } })) })
-    assert.equal(renderer.toJSON(), null)
+    assert.ok(buttonByText(renderer.toJSON(), '开始需求分析'))
+    assert.equal(nodeByClass(renderer.toJSON(), 'fg-hint-stage'), null)
     assert.equal(typeof releaseNext, 'function')
     assert.equal(typeof releaseStale, 'function')
     await act(async () => { releaseNext(response({ active: false, workspace: { flow: workspaceFlow({ label: '新工作区测试' }) } })) })
@@ -583,14 +595,16 @@ await check('阶段提示：切 session 首帧不闪旧 view，旧请求晚到�
   }
 })
 
-await check('阶段提示样式：宽度交给同座位，移除外框背景和左右留白并约束盒模型', () => {
+await check('阶段提示样式：沿用宿主宽度变量和居中规则（静态契约，非视觉验收）', () => {
   const css = styleNodes[0].textContent
   const hint = css.match(/\.fg-hint\s*\{([^}]+)\}/)[1]
   assert.match(css, /\.fg-hint, \.fg-hint \*, \.fg-hint \*::before, \.fg-hint \*::after\s*\{\s*box-sizing:\s*border-box;/)
-  assert.match(hint, /width:\s*100%;/)
+  assert.ok(hint.includes('width: calc(100% - 2 * var(--dsh-composer-side-clearance, 0px) - 4 * var(--dsh-composer-dock-inset, 0px));'))
+  assert.ok(hint.includes('max-width: calc(var(--dsh-composer-card-max-width, 100%) - 4 * var(--dsh-composer-dock-inset, 0px));'))
+  assert.match(hint, /flex:\s*none;/)
   assert.match(hint, /min-width:\s*0;/)
   assert.match(hint, /padding:\s*7px 0;/)
-  assert.match(hint, /margin:\s*0;/)
+  assert.match(hint, /margin:\s*0 auto;/)
   assert.match(hint, /border:\s*0;/)
   assert.match(hint, /border-radius:\s*0;/)
   assert.match(hint, /background:\s*transparent;/)
@@ -609,7 +623,7 @@ await check('阶段提示：一行说清第几步、在做什么、已用多久'
   assert.ok(text.includes('S2 开发'), '应写明第几步与阶段名：' + text)
   assert.ok(text.includes('正在编辑 lib/client.js'), '应显示当前动作：' + text)
   assert.ok(text.includes('已用 1 分 36 秒'), '应显示已用时：' + text)
-  assert.equal(buttons(tree).length, 0, '只读提示不放按钮')
+  assert.equal(buttons(tree).length, 1, '阶段信息旁提供快捷启动入口')
 })
 
 await check('阶段提示：宿主真实挂载形态（InputZone 的 session.sessionId）也渲染', async () => {
@@ -644,7 +658,7 @@ await check('阶段提示：门禁在等时点名要点的按钮，并说明去�
   assert.ok(text.includes('S3 评审'))
   assert.ok(text.includes('等你点「通过评审，进入测试」'), '应点名要点的按钮：' + text)
   assert.ok(text.includes('流程工作台'), '应说明去哪里点：' + text)
-  assert.equal(buttons(tree).length, 0, '提示条本身不放按钮')
+  assert.equal(buttons(tree).length, 1, '等待门禁时也保留快捷入口')
 })
 
 await check('阶段提示：S1 的两种等待各自点名要做的动作', async () => {
@@ -683,11 +697,296 @@ await check('阶段提示：阶段名缺失时只写 S 几，不留尾随空格'
   assert.equal(texts(stage).join(''), 'S2', '没有阶段名时只写 S2：' + JSON.stringify(texts(stage)))
 })
 
-await check('阶段提示：没有流程、已结束或已放弃时一行都不占', async () => {
+await check('阶段提示：没有流程、已结束或已放弃时仅保留快捷入口', async () => {
   for (const patch of [{ active: false }, { finished: true }, { cancelled: true }]) {
     currentView = baseView('S2', patch)
-    assert.equal((await render(stageHint, {})).toJSON(), null, '不该渲染：' + JSON.stringify(patch))
+    const tree = (await render(stageHint, {})).toJSON()
+    assert.ok(buttonByText(tree, '开始需求分析'))
+    assert.equal(nodeByClass(tree, 'fg-hint-stage'), null, JSON.stringify(patch))
   }
+})
+
+function quickDialog(renderer) { return findTags(renderer.toJSON(), 'dialog')[0] || null }
+
+await check('快捷需求：关闭保留草稿和档位，切会话关闭并隔离草稿', async () => {
+  currentView = baseView('S1', { active: false, workspace: { flow: null } })
+  const first = 'quick-draft-a', second = 'quick-draft-b'
+  const renderer = await render(stageHint, { session: { sessionId: first } }, false)
+  try {
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    let dialog = quickDialog(renderer)
+    const title = findTags(dialog, 'h2')[0]
+    assert.equal(dialog.props['aria-labelledby'], title.props.id)
+    assert.equal(dialog.props['aria-modal'], 'true')
+    const raw = '  快捷需求 "引用" @"D:\\项目 空格\\文件"\n./路径 /d/repo \\\\server\\共享  '
+    await changeValue(fieldByAria(dialog, '需求原文'), raw)
+    await click(buttonByText(quickDialog(renderer), '大需求严格执行'))
+    await click(buttonByText(quickDialog(renderer), '关闭'))
+    assert.equal(quickDialog(renderer), null)
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    assert.equal(fieldByAria(quickDialog(renderer), '需求原文').props.value, raw)
+    assert.equal(buttonByText(quickDialog(renderer), '大需求严格执行').props['aria-pressed'], true)
+    await act(async () => { renderer.update(h(stageHint, { session: { sessionId: second } })) })
+    assert.equal(quickDialog(renderer), null, '切换会话应关闭旧弹窗')
+    await settle()
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    assert.equal(fieldByAria(quickDialog(renderer), '需求原文').props.value, '')
+    await changeValue(fieldByAria(quickDialog(renderer), '需求原文'), '第二个会话')
+    await act(async () => { renderer.update(h(stageHint, { session: { sessionId: first } })) })
+    await settle()
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    assert.equal(fieldByAria(quickDialog(renderer), '需求原文').props.value, raw)
+  } finally { await act(async () => { renderer.unmount() }) }
+})
+
+await check('快捷需求：按钮和Ctrl/Cmd+Enter正确提交当前会话、原文与档位，成功清草稿', async () => {
+  for (const mode of ['click', 'ctrl', 'meta']) {
+    currentView = baseView('S1', { active: false, workspace: { flow: null } }); posted = []
+    const sessionId = 'quick-success-' + mode
+    const renderer = await render(stageHint, { sessionId }, false)
+    try {
+      await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+      const raw = '  新需求 "@file" 中文\n保留空格  '
+      await changeValue(fieldByAria(quickDialog(renderer), '需求原文'), raw)
+      await click(buttonByText(quickDialog(renderer), '大需求严格执行'))
+      if (mode === 'click') await click(buttonByText(quickDialog(renderer), '开始需求分析'))
+      else {
+        assert.equal(await pressKey(fieldByAria(quickDialog(renderer), '需求原文'), { ctrlKey: mode === 'ctrl', metaKey: mode === 'meta' }), 1)
+        await settle()
+      }
+      const starts = posted.filter((item) => item.action === 'start')
+      assert.equal(starts.length, 1)
+      assert.equal(starts[0].sessionId, sessionId)
+      assert.equal(starts[0].payload.brief, raw)
+      assert.equal(starts[0].payload.preset, 'strict')
+      assert.equal(quickDialog(renderer), null, '成功应关闭弹窗')
+      await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+      assert.equal(fieldByAria(quickDialog(renderer), '需求原文').props.value, '')
+      assert.equal(buttonByText(quickDialog(renderer), '小功能快速开发').props['aria-pressed'], true)
+    } finally { await act(async () => { renderer.unmount() }) }
+  }
+})
+
+await check('快捷需求：空白、超长、输入法组合态不提交，正好20000字符可提交', async () => {
+  currentView = baseView('S1', { active: false, workspace: { flow: null } }); posted = []; prepareCalls.length = 0
+  const renderer = await render(stageHint, { sessionId: 'quick-boundaries' }, false)
+  try {
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    for (const raw of ['', ' \n\t ', '中'.repeat(20001), 'a'.repeat(100000)]) {
+      await changeValue(fieldByAria(quickDialog(renderer), '需求原文'), raw)
+      assert.equal(fieldByAria(quickDialog(renderer), '需求原文').props.value, raw, '不截断用户输入')
+      assert.equal(buttonByText(quickDialog(renderer), '开始需求分析').props.disabled, true)
+      await pressKey(fieldByAria(quickDialog(renderer), '需求原文'), { ctrlKey: true })
+    }
+    assert.equal(posted.length, 0); assert.equal(prepareCalls.length, 0)
+    await changeValue(fieldByAria(quickDialog(renderer), '需求原文'), '正常需求')
+    assert.equal(await pressKey(fieldByAria(quickDialog(renderer), '需求原文'), { ctrlKey: true, isComposing: true }), 0)
+    assert.equal(await pressKey(fieldByAria(quickDialog(renderer), '需求原文'), { metaKey: true, nativeEvent: { isComposing: true } }), 0)
+    assert.equal(posted.length, 0)
+    const limit = '中'.repeat(20000)
+    await changeValue(fieldByAria(quickDialog(renderer), '需求原文'), limit)
+    assert.equal(buttonByText(quickDialog(renderer), '开始需求分析').props.disabled, false)
+    await click(buttonByText(quickDialog(renderer), '开始需求分析'))
+    assert.equal(posted.length, 1); assert.equal(posted[0].payload.brief, limit)
+  } finally { await act(async () => { renderer.unmount() }) }
+})
+
+await check('快捷需求：请求期间及切走返回均防重复提交，关闭/Esc/遮罩不能中断，完成后解锁', async () => {
+  currentView = baseView('S1', { active: false, workspace: { flow: null } }); posted = []; prepareCalls.length = 0
+  let release
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (url, init) => {
+    if (!String(url).includes('/action')) return originalFetch(url, init)
+    posted.push(JSON.parse(init.body))
+    return new Promise((resolve) => { release = resolve })
+  }
+  const renderer = await render(stageHint, { sessionId: 'quick-busy' }, false)
+  try {
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    await changeValue(fieldByAria(quickDialog(renderer), '需求原文'), '延迟启动')
+    const button = buttonByText(quickDialog(renderer), '开始需求分析')
+    await act(async () => { button.props.onClick(); button.props.onClick() })
+    await pressKey(fieldByAria(quickDialog(renderer), '需求原文'), { metaKey: true })
+    assert.equal(posted.length, 1)
+    assert.equal(buttonByText(quickDialog(renderer), '关闭').props.disabled, true)
+    await click(buttonByText(quickDialog(renderer), '关闭'))
+    await act(async () => { pressEscape() })
+    let prevented = 0
+    await act(async () => {
+      quickDialog(renderer).props.onCancel({ preventDefault() { prevented += 1 } })
+      const target = {}
+      quickDialog(renderer).props.onClick({ target, currentTarget: target })
+    })
+    assert.equal(prevented, 1); assert.ok(quickDialog(renderer))
+    await act(async () => { renderer.update(h(stageHint, { sessionId: 'quick-busy-other' })) })
+    assert.equal(quickDialog(renderer), null)
+    await act(async () => { renderer.update(h(stageHint, { sessionId: 'quick-busy' })) })
+    await settle()
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    assert.equal(fieldByAria(quickDialog(renderer), '需求原文').props.value, '延迟启动')
+    assert.equal(fieldByAria(quickDialog(renderer), '需求原文').props.disabled, true, '旧请求未结束时返回也不能改写提交中的草稿')
+    assert.equal(buttonByText(quickDialog(renderer), '正在启动…').props.disabled, true)
+    await pressKey(fieldByAria(quickDialog(renderer), '需求原文'), { ctrlKey: true })
+    await click(buttonByText(quickDialog(renderer), '正在启动…'))
+    assert.equal(posted.length, 1, '跨挂载仍然只有一次请求')
+    await act(async () => { release(response({ ok: true })) })
+    assert.equal(posted.length, 1); assert.equal(quickDialog(renderer), null)
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    assert.equal(fieldByAria(quickDialog(renderer), '需求原文').props.value, '', '成功后共享草稿已清空')
+    assert.equal(fieldByAria(quickDialog(renderer), '需求原文').props.disabled, false)
+  } finally {
+    release?.(response({ ok: true })); globalThis.fetch = originalFetch
+    await act(async () => { renderer.unmount() })
+  }
+})
+
+await check('快捷需求：启动失败保留原文、档位和错误并恢复关闭能力', async () => {
+  currentView = baseView('S1', { active: false, workspace: { flow: null } })
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (url, init) => String(url).includes('/action') ? response({ error: '启动服务暂不可用' }, 503) : originalFetch(url, init)
+  const renderer = await render(stageHint, { sessionId: 'quick-failure' }, false)
+  try {
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    await changeValue(fieldByAria(quickDialog(renderer), '需求原文'), '不能丢失的原文')
+    await click(buttonByText(quickDialog(renderer), '大需求严格执行'))
+    await click(buttonByText(quickDialog(renderer), '开始需求分析'))
+    assert.equal(fieldByAria(quickDialog(renderer), '需求原文').props.value, '不能丢失的原文')
+    assert.equal(buttonByText(quickDialog(renderer), '大需求严格执行').props['aria-pressed'], true)
+    assert.ok(flat(quickDialog(renderer)).includes('启动服务暂不可用'))
+    assert.equal(buttonByText(quickDialog(renderer), '关闭').props.disabled, false)
+    await click(buttonByText(quickDialog(renderer), '关闭'))
+    assert.equal(quickDialog(renderer), null)
+  } finally { globalThis.fetch = originalFetch; await act(async () => { renderer.unmount() }) }
+})
+
+await check('快捷需求：切走返回后的延迟失败持续保留原文档位及原因，成功重试后清除', async () => {
+  currentView = baseView('S1', { active: false, workspace: { flow: null } }); posted = []
+  const originalFetch = globalThis.fetch
+  let release, attempts = 0
+  globalThis.fetch = (url, init) => {
+    if (!String(url).includes('/action')) return originalFetch(url, init)
+    posted.push(JSON.parse(init.body))
+    if (++attempts === 1) return new Promise((resolve) => { release = resolve })
+    return response({ ok: true })
+  }
+  const renderer = await render(stageHint, { sessionId: 'quick-late-error' }, false)
+  const switchTo = async (sessionId) => {
+    await act(async () => { renderer.update(h(stageHint, { sessionId })) })
+    await settle()
+  }
+  try {
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    await changeValue(fieldByAria(quickDialog(renderer), '需求原文'), '异步失败也不能丢失')
+    await click(buttonByText(quickDialog(renderer), '大需求严格执行'))
+    await click(buttonByText(quickDialog(renderer), '开始需求分析'))
+    await switchTo('quick-late-error-other'); await switchTo('quick-late-error')
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    await act(async () => { release(response({ error: '延迟启动失败的具体原因' }, 503)) })
+    assert.ok(flat(quickDialog(renderer)).includes('延迟启动失败的具体原因'))
+    await click(buttonByText(quickDialog(renderer), '关闭'))
+    // 重新订阅会拉取成功状态并清除临时 entry.error；启动错误仍须保留。
+    await switchTo('quick-late-error-other'); await switchTo('quick-late-error')
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    assert.ok(flat(quickDialog(renderer)).includes('延迟启动失败的具体原因'))
+    assert.equal(fieldByAria(quickDialog(renderer), '需求原文').props.value, '异步失败也不能丢失')
+    assert.equal(buttonByText(quickDialog(renderer), '大需求严格执行').props['aria-pressed'], true)
+    assert.equal(buttonByText(quickDialog(renderer), '开始需求分析').props.disabled, false)
+    await click(buttonByText(quickDialog(renderer), '开始需求分析'))
+    assert.equal(attempts, 2); assert.equal(quickDialog(renderer), null)
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    assert.equal(fieldByAria(quickDialog(renderer), '需求原文').props.value, '')
+    assert.ok(!flat(quickDialog(renderer)).includes('延迟启动失败的具体原因'))
+  } finally {
+    release?.(response({ error: '清理延迟请求' }, 503)); globalThis.fetch = originalFetch
+    await act(async () => { renderer.unmount() })
+  }
+})
+
+await check('快捷需求：同会话/跨会话运行流程都只允许写草稿，加载失败禁止提交', async () => {
+  for (const patch of [
+    { workspace: { flow: workspaceFlow({ sessionId: 'quick-guard' }) } },
+    { workspace: { flow: workspaceFlow() } },
+    { active: false, workspace: {} },
+    { active: false, workspace: null },
+    {},
+  ]) {
+    currentView = baseView('S2', patch); posted = []; prepareCalls.length = 0
+    const sessionId = patch.workspace?.flow?.sessionId === 'quick-guard' ? 'quick-guard' : 'quick-guard-' + (++seq)
+    const renderer = await render(stageHint, { sessionId }, false)
+    try {
+      await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+      await changeValue(fieldByAria(quickDialog(renderer), '需求原文'), '先记下新需求')
+      assert.ok(/请先结束或放弃|暂时无法确认工作区流程状态/.test(flat(quickDialog(renderer))))
+      assert.equal(buttonByText(quickDialog(renderer), '开始需求分析').props.disabled, true)
+      await pressKey(fieldByAria(quickDialog(renderer), '需求原文'), { ctrlKey: true })
+      await click(buttonByText(quickDialog(renderer), '开始需求分析'))
+      assert.equal(posted.length, 0); assert.equal(prepareCalls.length, 0)
+      assert.equal(fieldByAria(quickDialog(renderer), '需求原文').props.disabled, false)
+    } finally { await act(async () => { renderer.unmount() }) }
+  }
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = () => response({ error: '读取状态失败' }, 503)
+  const renderer = await render(stageHint, { sessionId: 'quick-load-failure' }, false)
+  try {
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    await changeValue(fieldByAria(quickDialog(renderer), '需求原文'), '状态未知')
+    assert.ok(flat(quickDialog(renderer)).includes('暂时无法确认流程状态'))
+    assert.equal(buttonByText(quickDialog(renderer), '开始需求分析').props.disabled, true)
+  } finally { globalThis.fetch = originalFetch; await act(async () => { renderer.unmount() }) }
+})
+
+await check('快捷需求：焦点进入原文、Tab回绕，Esc/关闭/遮罩退出后恢复触发按钮', async () => {
+  currentView = baseView('S1', { active: false, workspace: { flow: null } })
+  let focused = null, showCalls = 0
+  const nodes = new Map(), tabNodes = []
+  const mock = (element) => {
+    const key = element.props.className === 'fg-hint-start' ? 'trigger'
+      : element.props.className === 'fg-modal-card' ? 'card'
+        : element.type === 'dialog' ? 'dialog' : element.type === 'textarea' ? 'input' : null
+    if (!key) return null
+    if (nodes.has(key)) return nodes.get(key)
+    const node = { focus() { focused = node }, open: false, showModal() { this.open = true; showCalls += 1 } }
+    if (key === 'card') node.querySelectorAll = () => tabNodes
+    nodes.set(key, node)
+    return node
+  }
+  let renderer
+  await act(async () => { renderer = TestRenderer.create(h(stageHint, { sessionId: 'quick-focus' }), { createNodeMock: mock }) })
+  try {
+    await settle()
+    const trigger = renderer.root.findByProps({ className: 'fg-hint-start' }).instance
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    assert.equal(showCalls, 1, '快捷弹窗进入浏览器顶层')
+    assert.equal(focused, renderer.root.findByType('textarea').instance, '初始焦点应在原文')
+    const first = { focus() { focused = first } }, last = { focus() { focused = last } }
+    tabNodes.push(first, { disabled: true, focus() { assert.fail('禁用控件不能获得焦点') } }, last)
+    let prevented = 0
+    const tab = (target, shiftKey) => quickDialog(renderer).props.onKeyDown({
+      key: 'Tab', currentTarget: nodes.get('dialog'), target, shiftKey, preventDefault() { prevented += 1 },
+    })
+    last.focus(); tab(last, false); assert.equal(focused, first)
+    tab(first, true); assert.equal(focused, last)
+    tab(nodes.get('card'), true); assert.equal(focused, last); assert.equal(prevented, 3)
+    await act(async () => { pressEscape() })
+    assert.equal(quickDialog(renderer), null); assert.equal(focused, trigger)
+    for (const via of ['close', 'overlay']) {
+      await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+      if (via === 'close') await click(buttonByText(quickDialog(renderer), '关闭'))
+      else await act(async () => { const target = {}; quickDialog(renderer).props.onClick({ target, currentTarget: target }) })
+      assert.equal(quickDialog(renderer), null); assert.equal(focused, trigger)
+    }
+  } finally { await act(async () => { renderer.unmount() }) }
+  const plain = await render(stageHint, { sessionId: 'quick-tab' }, false)
+  try {
+    await click(buttonByText(plain.toJSON(), '开始需求分析'))
+    const dialog = quickDialog(plain), card = focusDomOf(dialog)
+    const focusable = card.querySelectorAll('button,textarea').filter((node) => !node.disabled)
+    const first = focusable[0], last = focusable.at(-1)
+    let prevented = 0
+    const tab = (target, shiftKey) => dialog.props.onKeyDown({ key: 'Tab', currentTarget: card, target, shiftKey, preventDefault() { prevented += 1 } })
+    last.focus(); tab(last, false); assert.equal(card.activeElement, first)
+    tab(first, true); assert.equal(card.activeElement, last); assert.equal(prevented, 2)
+  } finally { await act(async () => { plain.unmount() }) }
 })
 
 await check('样式只注入一次', () => {
@@ -1502,17 +1801,18 @@ const HubPanelIcon = componentOf('sidebar.panellist')
     assert.ok(text.includes('返回了 500'))
   })
 
-  await check('S4 门禁给出验收 / 退回 / 跳过', () => {
-    assert.ok(buttonByText(tree, '验收通过，结束流程'))
+  await check('S4 门禁给出明确例外验收 / 退回 / 跳过', () => {
+    assert.ok(buttonByText(tree, '接受未通过项并结束'))
     assert.ok(buttonByText(tree, '退回开发修复'))
     assert.ok(buttonByText(tree, '跳过测试门禁'))
   })
 
-  await check('S4 点「验收通过」提交 gate/pass', async () => {
-    await click(buttonByText(renderer.toJSON(), '验收通过，结束流程'))
+  await check('S4 点「接受未通过项」提交明确例外 gate/pass', async () => {
+    await click(buttonByText(renderer.toJSON(), '接受未通过项并结束'))
     const last = posted[posted.length - 1]
     assert.equal(last.action, 'gate')
     assert.equal(last.payload.decision, 'pass')
+    assert.equal(last.payload.acceptUncovered, true)
   })
 }
 
@@ -3335,6 +3635,343 @@ await check('延迟保存禁用控件时原生summary仍参与Tab与Shift+Tab首
     ruleHandler = null
     await act(async () => { renderer.unmount() })
   }
+})
+
+// ---------------------------------------------------------------------------
+// 客户端契约与诊断：这些是逻辑及数值替身测试，不代表真实浏览器布局已验证。
+// ---------------------------------------------------------------------------
+
+function acceptanceOf(statuses) {
+  const items = statuses.map((status, index) => ({ id: 'AC-' + (index + 1), when: '输入 ' + index, then: '输出 ' + index,
+    method: '独立浏览器测量', procedure: '选择目标并比较边界', status, evidence: '测量记录 ' + index, artifact: 'layout-' + index + '.json', version: 'v1', reason: status === 'uncovered' ? '缺少真实浏览器' : '' }))
+  const counts = { total: items.length, pending: 0, pass: 0, fail: 0, uncovered: 0 }
+  for (const item of items) counts[item.status] += 1
+  return { version: 'v1', items, counts }
+}
+
+await check('验收表展示方法步骤、逐项状态、证据与产物', async () => {
+  currentView = baseView('S4', { acceptance: acceptanceOf(['pass', 'fail', 'uncovered', 'pending']) })
+  const tree = (await render(FlowDetail, {})).toJSON()
+  assert.equal(findTags(tree, 'table').length, 1)
+  for (const text of ['独立浏览器测量', '选择目标并比较边界', '测量记录 0', 'layout-0.json', '未通过', '未覆盖', '待验证', '缺少真实浏览器']) assert.ok(flat(tree).includes(text), text)
+})
+
+await check('scope展示冻结的验证方法和步骤', async () => {
+  currentView = baseView('S2')
+  currentView.scope.data.acceptance_criteria[0] = { ...currentView.scope.data.acceptance_criteria[0], method: 'API 请求', procedure: '先过期再请求接口' }
+  const text = flat((await render(FlowDetail, {})).toJSON())
+  assert.ok(text.includes('验证方法：API 请求'))
+  assert.ok(text.includes('验证步骤：先过期再请求接口'))
+})
+
+await check('S4未全通过时使用明确结束文案并提交例外说明', async () => {
+  for (const [statuses, label] of [[['pass', 'uncovered'], '接受未覆盖并结束'], [['pending'], '接受未覆盖并结束'], [['fail', 'uncovered'], '接受未通过项并结束']]) {
+    currentView = baseView('S4', { waiting: true, acceptance: acceptanceOf(statuses) })
+    posted = []
+    const renderer = await render(FlowDetail, {})
+    assert.ok(!hasButton(renderer.toJSON(), '验收通过，结束流程'))
+    const field = findTags(renderer.toJSON(), 'textarea').find((node) => node.props['aria-label'] === '接受说明（可选）')
+    await changeValue(field, '允许稍后补齐验证')
+    await click(buttonByText(renderer.toJSON(), label))
+    const payload = posted.find((item) => item.action === 'gate').payload
+    assert.equal(payload.acceptUncovered, true)
+    assert.equal(payload.acceptanceNote, '允许稍后补齐验证')
+    assert.deepEqual(currentView.acceptance.items.map((item) => item.status), statuses)
+  }
+})
+
+await check('AC全通过但测试要点未通过时仍明确接受例外', async () => {
+  for (const result of ['fail', 'uncovered', 'excluded']) {
+    currentView = baseView('S4', { waiting: true, acceptance: acceptanceOf(['pass']), test: { directions: [{ id: 'smoke', points: [{ point: '独立验证', result }] }] } })
+    posted = []
+    const renderer = await render(FlowDetail, {})
+    const label = result === 'fail' ? '接受未通过项并结束' : '接受未覆盖并结束'
+    await click(buttonByText(renderer.toJSON(), label))
+    assert.equal(posted.find((item) => item.action === 'gate').payload.acceptUncovered, true)
+  }
+})
+
+await check('S4全部通过时沿用原按钮且不发送例外许可', async () => {
+  currentView = baseView('S4', { waiting: true, acceptance: acceptanceOf(['pass']) })
+  posted = []
+  const renderer = await render(FlowDetail, {})
+  await click(buttonByText(renderer.toJSON(), '验收通过，结束流程'))
+  assert.equal(posted.find((item) => item.action === 'gate').payload.acceptUncovered, undefined)
+})
+
+await check('退回开发附可选说明，留空时交由宿主自动修复清单', async () => {
+  for (const note of ['', '修复边界并补验证']) {
+    currentView = baseView('S3', { waiting: true })
+    posted = []
+    const renderer = await render(FlowDetail, {})
+    const field = findTags(renderer.toJSON(), 'textarea').find((node) => node.props['aria-label'] === '退回说明（可选）')
+    await changeValue(field, note)
+    await click(buttonByText(renderer.toJSON(), '退回开发修复'))
+    const payload = posted.find((item) => item.action === 'gate').payload
+    assert.equal(payload.to, 'S2')
+    assert.equal(payload.note, note || undefined)
+  }
+})
+
+await check('S2展示自动修复清单与建议数量', async () => {
+  currentView = baseView('S2', { remediation: { reason: '验收未覆盖', note: '补真实测量', items: [{ ac: 'AC-1', summary: '修正对齐边界', source: 'test', severity: 'MAJOR', status: 'pending' }], advisories: [{}] } })
+  const text = flat((await render(FlowDetail, {})).toJSON())
+  for (const wanted of ['本轮修复清单', '验收未覆盖', '补真实测量', '修正对齐边界', '另有 1 条建议']) assert.ok(text.includes(wanted), text)
+})
+
+await check('零阻塞仍显示完整严重度与未覆盖AC，fast只折叠余项', async () => {
+  const findings = Array.from({ length: 5 }, (_, index) => ({ severity: 'MINOR', summary: 'minor-' + index, file: 'src/auth/session.ts', ac: 'AC-1', acMatched: true, fileInScope: true }))
+  currentView = baseView('S3', { acceptance: acceptanceOf(['uncovered']), review: { counts: { total: 5, critical: 0, major: 0, minor: 5, blocking: 0, advisories: 5, unscoped: 0 }, fresh: 1, reused: [], angles: [{ id: 'correctness', name: '正确性', verdict: 'advisory', findings }] } })
+  const tree = (await render(FlowDetail, {})).toJSON()
+  const text = flat(tree)
+  for (const wanted of ['无阻塞项', '共 5 条发现', 'MINOR 5', '未覆盖 1', '本轮评审 1', '展开其余 2 条发现', 'minor-4']) assert.ok(text.includes(wanted), text)
+  const details = findTags(tree, 'details').find((node) => flat(node).includes('展开其余'))
+  assert.ok(details && !details.props.open, '余项使用原生details折叠，所有发现仍在树内')
+  assert.equal(findTags(details, 'div').filter((node) => node.props.className === 'fg-item fg-finding').length, 2)
+})
+
+await check('摘要分开实现验证生效执行，技术哈希仅在诊断详情内', async () => {
+  currentView = baseView('S2', { acceptance: acceptanceOf(['uncovered']), runtime: { status: 'unverified', hostRevision: 'host-hash', expectedClientRevision: 'client-hash' }, snapshot: { id: 'snapshot-hash', complete: false, files: [], errors: ['读取失败'] }, stageSummary: { implementation: { status: 'complete', text: '已完成实现' }, verification: acceptanceOf(['uncovered']).counts, runtime: { status: 'unverified', text: '页面尚未核对' }, execution: { status: 'idle', text: '等待独立验证' }, review: { fresh: 1, reused: 2, total: 3 }, test: { fresh: 2, reused: 1, total: 3 } } })
+  const tree = (await render(FlowDetail, {})).toJSON()
+  for (const text of ['实现：', '验证：', '生效：', '执行：', '已完成实现', '页面尚未核对', '等待独立验证', '采集不完整', '读取失败', '评审：本轮 1 · 复用 2 · 合计 3']) assert.ok(flat(tree).includes(text), text)
+  const diagnostics = findTags(tree, 'details').find((node) => flat(node).includes('技术诊断'))
+  assert.ok(flat(diagnostics).includes('host-hash'))
+  assert.ok(!diagnostics.props.open)
+})
+
+await check('客户端上报实际factory的SHA-256，唯一标记可供宿主提取', async () => {
+  const source = await readFile(new URL('../lib/client.js', import.meta.url), 'utf8')
+  assert.equal(source.split('/* flowgate-factory:start */').length, 2)
+  assert.equal(source.split('/* flowgate-factory:end */').length, 2)
+  const declared = source.split('/* flowgate-factory:start */')[1].split('/* flowgate-factory:end */')[0].trim()
+  const expected = createHash('sha256').update(clientFactory.toString().replaceAll('\r\n', '\n')).digest('hex')
+  assert.equal(createHash('sha256').update(declared.replaceAll('\r\n', '\n')).digest('hex'), expected)
+  const originalFetch = globalThis.fetch
+  const calls = []
+  try {
+    currentView = baseView('S2')
+    globalThis.fetch = async (url, init) => { calls.push(String(url)); return originalFetch(url, init) }
+    await render(FlowDetail, {})
+    assert.ok(calls.some((url) => new URL(url, 'http://localhost').searchParams.get('clientRevision') === expected))
+  } finally { globalThis.fetch = originalFetch }
+})
+
+await check('布局probe使用真实数值接口，覆盖对齐失败、容差与缺失能力', async () => {
+  const originalFetch = globalThis.fetch
+  const previousQuery = document.querySelectorAll
+  const previousStyle = window.getComputedStyle
+  const expected = createHash('sha256').update(clientFactory.toString().replaceAll('\r\n', '\n')).digest('hex')
+  const sessionId = 'layout-probe-session'
+  let right = 300
+  const pageId = window.__DSH_FLOWGATE_DIAGNOSTICS__.pageId
+  const verified = { status: 'verified', clientRevision: expected, expectedClientRevision: expected, pageId, viewport: { width: window.innerWidth, height: window.innerHeight } }
+  let runtime = { ...verified }
+  const reports = []
+  const receipts = []
+  let receiptMode = 'valid'
+  let version = 'layout-snapshot'
+  const owner = { getAttribute: () => sessionId }
+  const target = { tagName: 'DIV', closest: () => owner, getRootNode: () => document, getBoundingClientRect: () => ({ left: 20, right }), isConnected: true }
+  const reference = { getBoundingClientRect: () => ({ left: 20, right: 300 }), isConnected: true }
+  const references = [{ name: '实际输入卡片', selector: '.explicit-input-card' }]
+  let styleCalls = 0
+  try {
+    globalThis.fetch = async (url, init) => {
+      if (init?.method === 'POST') {
+        assert.equal(String(url), '/api/flowgate/action')
+        const body = JSON.parse(init.body)
+        assert.equal(body.sessionId, sessionId)
+        assert.equal(body.action, 'layout-evidence')
+        assert.equal(body.payload.version, version)
+        assert.equal(body.payload.pageId, pageId)
+        assert.equal(body.payload.clientRevision, expected)
+        assert.deepEqual(body.payload.viewport, { width: window.innerWidth, height: window.innerHeight })
+        assert.equal(body.payload.measurements.length, 1)
+        receipts.push(body.payload)
+        if (receiptMode === 'http') return response({}, 503)
+        if (receiptMode === 'throw') throw new Error('receipt network unavailable')
+        if (receiptMode === 'missing') return response({})
+        if (receiptMode === 'resize') window.innerWidth = 900
+        return response({ layoutEvidence: { id: 'receipt-' + receipts.length, ...body.payload,
+          ...(receiptMode === 'mismatch' ? { pageId: 'other-page' } : {}) } })
+      }
+      const query = new URL(String(url), 'http://localhost').searchParams
+      assert.equal(query.get('clientRevision'), expected)
+      assert.equal(query.get('pageId'), pageId)
+      assert.equal(Number(query.get('viewportWidth')), window.innerWidth)
+      assert.equal(Number(query.get('viewportHeight')), window.innerHeight)
+      reports.push({ width: Number(query.get('viewportWidth')), height: Number(query.get('viewportHeight')) })
+      return response({ active: true, runtime, snapshot: { id: version } })
+    }
+    document.querySelectorAll = (selector) => selector === '.fg-hint' ? [target] : selector === '.explicit-input-card' ? [reference] : []
+    window.getComputedStyle = () => { styleCalls += 1; return { display: 'block', visibility: 'visible' } }
+    const probe = window.__DSH_FLOWGATE_DIAGNOSTICS__.inspectLayout
+    let result = await probe({ sessionId, references })
+    assert.equal(result.status, 'pass')
+    assert.equal(result.pageId, pageId)
+    assert.equal(result.runtime.pageId, pageId)
+    assert.equal(result.version, version)
+    assert.equal(result.evidenceId, 'receipt-1')
+    assert.deepEqual(receipts[0].measurements, result.measurements)
+    assert.deepEqual(result.viewport, { width: 1280, height: 720, devicePixelRatio: 1 })
+    assert.deepEqual(result.measurements[0], { element: '.fg-hint', reference: '实际输入卡片', left: 20, right: 300, referenceLeft: 20, referenceRight: 300 })
+    assert.ok(styleCalls >= 2)
+    for (receiptMode of ['http', 'throw', 'missing', 'mismatch', 'resize']) {
+      const failedReceipt = await probe({ sessionId, references })
+      assert.equal(failedReceipt.status, 'uncovered', receiptMode)
+      assert.equal(failedReceipt.evidenceId, null)
+      window.innerWidth = 1280
+    }
+    receiptMode = 'valid'
+    version = null
+    assert.equal((await probe({ sessionId, references })).status, 'uncovered')
+    version = 'layout-snapshot'
+    const shadowRoot = { querySelectorAll: () => [reference] }
+    assert.equal((await probe({ sessionId, element: { ...target, getRootNode: () => shadowRoot }, references })).status, 'pass', '显式元素实例可在其ShadowRoot内测量参照')
+    right = 303
+    assert.equal((await probe({ sessionId, references })).status, 'fail')
+    assert.equal((await probe({ sessionId, references, tolerancePx: 3 })).status, 'pass')
+    assert.equal((await probe({ sessionId, references: [] })).status, 'uncovered')
+    assert.equal((await probe({ sessionId, references: [{ name: '缺失', selector: '.missing' }] })).status, 'uncovered')
+    assert.equal((await probe({ sessionId, element: '.missing', references })).status, 'uncovered')
+    assert.equal((await probe({ sessionId, element: { ...target, closest: () => ({ getAttribute: () => 'wrong-session' }) }, references })).status, 'uncovered')
+    const select = document.querySelectorAll
+    document.querySelectorAll = (selector) => selector === '.fg-hint' ? [target, target] : select(selector)
+    assert.equal((await probe({ sessionId, references })).status, 'uncovered')
+    document.querySelectorAll = (selector) => selector === '.explicit-input-card' ? [reference, reference] : select(selector)
+    assert.equal((await probe({ sessionId, references })).status, 'uncovered')
+    document.querySelectorAll = select
+    assert.equal((await probe({ sessionId, references, tolerancePx: -1 })).status, 'uncovered')
+    assert.equal((await probe({ references })).status, 'uncovered')
+    const workingFetch = globalThis.fetch
+    globalThis.fetch = async () => response({}, 503)
+    assert.equal((await probe({ sessionId, references })).status, 'uncovered')
+    globalThis.fetch = workingFetch
+    runtime = { ...runtime, status: 'mismatch' }
+    assert.equal((await probe({ sessionId, references })).status, 'uncovered')
+    runtime = { ...runtime, status: 'verified', expectedClientRevision: 'different-source' }
+    assert.equal((await probe({ sessionId, references })).status, 'uncovered')
+    runtime = { ...verified, pageId: 'another-page-instance' }
+    assert.equal((await probe({ sessionId, references })).status, 'uncovered')
+    runtime = { ...verified, pageId: undefined }
+    assert.equal((await probe({ sessionId, references })).status, 'uncovered')
+    runtime = { ...verified, viewport: undefined }
+    assert.equal((await probe({ sessionId, references })).status, 'uncovered')
+    runtime = { ...verified }
+    right = 300
+    window.innerWidth = 1024
+    assert.equal((await probe({ sessionId, references })).status, 'uncovered')
+    const reportCount = reports.length
+    runtime = { ...verified, viewport: { width: 1024, height: 720 } }
+    assert.equal((await probe({ sessionId, references })).status, 'pass')
+    assert.equal(reports.length, reportCount + 1, '视口变化后每次测量必须重新pull')
+    assert.deepEqual(reports.at(-1), { width: 1024, height: 720 })
+    window.innerWidth = 1280
+    window.getComputedStyle = undefined
+    assert.equal((await probe({ sessionId, references })).status, 'uncovered')
+  } finally {
+    globalThis.fetch = originalFetch
+    document.querySelectorAll = previousQuery
+    window.getComputedStyle = previousStyle
+    window.innerWidth = 1280
+  }
+})
+
+await check('无WebCrypto时正常拉取且诊断未核对，不伪造指纹', async () => {
+  const source = await readFile(new URL('../lib/client.js', import.meta.url), 'utf8')
+  let isolatedPlugin
+  const urls = []
+  const isolatedWindow = { getComputedStyle: () => ({ display: 'block' }), __ModuleLoader__: { load(entry) { isolatedPlugin = entry.factory(require) } } }
+  vm.runInNewContext(source, { window: isolatedWindow, document, crypto: undefined, TextEncoder, fetch: async (url) => { urls.push(String(url)); return response(baseView('S2', { runtime: { status: 'unverified' } })) }, setInterval, clearInterval })
+  const renderer = await render(isolatedPlugin.components.FlowDetail, {})
+  try {
+    const probe = await isolatedWindow.__DSH_FLOWGATE_DIAGNOSTICS__.inspectLayout({ sessionId: 'no-crypto', references: [{ name: 'ref', selector: '.ref' }] })
+    assert.equal(probe.status, 'uncovered')
+    assert.equal(probe.clientRevision, null)
+    assert.ok(urls.length >= 2)
+    assert.ok(urls.every((url) => !new URL(url, 'http://localhost').searchParams.has('clientRevision')))
+  } finally { await act(async () => { renderer.unmount() }) }
+})
+
+await check('指纹计算未完成时首次正常拉取，完成后的请求携带实际指纹', async () => {
+  const source = await readFile(new URL('../lib/client.js', import.meta.url), 'utf8')
+  let isolatedPlugin
+  let releaseDigest
+  const digest = new Promise((resolve) => { releaseDigest = resolve })
+  const urls = []
+  const isolatedWindow = { __ModuleLoader__: { load(entry) { isolatedPlugin = entry.factory(require) } } }
+  vm.runInNewContext(source, { window: isolatedWindow, document, crypto: { subtle: { digest: () => digest } }, TextEncoder,
+    fetch: async (url) => { urls.push(String(url)); return response(baseView('S2')) }, setInterval, clearInterval })
+  const renderer = await render(isolatedPlugin.components.FlowDetail, {})
+  try {
+    assert.ok(urls.length > 0)
+    assert.ok(urls.every((url) => !new URL(url, 'http://localhost').searchParams.has('clientRevision')))
+    releaseDigest(await webcrypto.subtle.digest('SHA-256', new TextEncoder().encode('deferred-test-source')))
+    await isolatedWindow.__DSH_FLOWGATE_DIAGNOSTICS__.inspectLayout({ sessionId: 'digest-ready' })
+    const expected = createHash('sha256').update('deferred-test-source').digest('hex')
+    assert.equal(new URL(urls.at(-1), 'http://localhost').searchParams.get('clientRevision'), expected)
+  } finally { await act(async () => { renderer.unmount() }) }
+})
+
+await check('同代码的不同factory页面实例有独立身份，缺能力旧页不能沿用新页认证', async () => {
+  const source = await readFile(new URL('../lib/client.js', import.meta.url), 'utf8')
+  const calls = []
+  let latestRuntime
+  function createPage(crypto) {
+    const isolatedWindow = { innerWidth: 1280, innerHeight: 720, __ModuleLoader__: { load(entry) { entry.factory(require) } } }
+    vm.runInNewContext(source, { window: isolatedWindow, document, crypto, TextEncoder, setInterval, clearInterval,
+      fetch: async (url, init) => {
+        assert.notEqual(init?.method, 'POST', '身份未核对时不得保存布局采集')
+        const query = new URL(String(url), 'http://localhost').searchParams
+        calls.push(query)
+        return response({ runtime: latestRuntime || { status: 'unverified' }, snapshot: { id: 'same-snapshot' } })
+      } })
+    return isolatedWindow.__DSH_FLOWGATE_DIAGNOSTICS__
+  }
+  const first = createPage(webcrypto)
+  const second = createPage(webcrypto)
+  assert.notEqual(first.pageId, second.pageId)
+  assert.match(first.pageId, /^[a-f0-9-]{36}$/)
+  assert.ok(Object.isFrozen(first))
+  const one = await first.inspectLayout({ sessionId: 'same-task' })
+  const two = await second.inspectLayout({ sessionId: 'same-task' })
+  assert.equal(one.clientRevision, two.clientRevision, '相同源码应有相同哈希')
+  assert.equal(calls[0].get('pageId'), first.pageId)
+  assert.equal(calls[1].get('pageId'), second.pageId)
+  latestRuntime = { status: 'verified', pageId: second.pageId, clientRevision: two.clientRevision,
+    expectedClientRevision: two.clientRevision, viewport: { width: 1280, height: 720 } }
+  assert.equal((await first.inspectLayout({ sessionId: 'same-task' })).status, 'uncovered', '其他页面认证不能用于本页')
+  const noUuid = createPage({ subtle: webcrypto.subtle })
+  const noUuidResult = await noUuid.inspectLayout({ sessionId: 'same-task' })
+  assert.equal(noUuid.pageId, null)
+  assert.equal(noUuidResult.status, 'uncovered')
+  assert.ok(noUuidResult.clientRevision)
+  assert.equal(calls.at(-1).has('pageId'), false)
+  const noDigest = createPage({ randomUUID: () => webcrypto.randomUUID() })
+  const oldPage = await noDigest.inspectLayout({ sessionId: 'same-task' })
+  assert.equal(oldPage.clientRevision, null)
+  assert.equal(oldPage.status, 'uncovered', '缺指纹旧页不能沿用服务端残留的新页verified')
+  assert.equal(oldPage.evidenceId, null)
+  assert.equal(calls.at(-1).has('clientRevision'), false)
+})
+
+await check('已有样式节点和ShadowRoot样式内容会在热更新时替换', async () => {
+  const originalGet = document.getElementById
+  const oldStyle = { id: 'dsh-flowgate-styles', textContent: 'old-style' }
+  try {
+    document.getElementById = () => oldStyle
+    plugin.apply({ slots: { inject() {}, register() {} } })
+    assert.ok(oldStyle.textContent.includes('.fg-ac-table'))
+    assert.notEqual(oldStyle.textContent, 'old-style')
+    const shadowStyle = { textContent: 'stale-shadow-style' }
+    let renderer
+    await act(async () => {
+      renderer = TestRenderer.create(h(HubPanel, {}), { createNodeMock: (element) => element.props.className === 'fg-root fg-hub'
+        ? { getRootNode: () => ({ getElementById: () => shadowStyle }) } : null })
+    })
+    mounted.push(renderer)
+    assert.equal(shadowStyle.textContent, oldStyle.textContent)
+  } finally { document.getElementById = originalGet }
 })
 
 // ---------------------------------------------------------------------------

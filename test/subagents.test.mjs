@@ -211,14 +211,17 @@ function makeHost(options = {}) {
       assert.equal(response.status, 200)
       return response.json()
     },
-    async action(action, payload = {}) {
+    async requestAction(action, payload = {}) {
       const route = routes.get('/api/flowgate/action')
       const response = await route.fetch(new Request('http://host/api/flowgate/action', {
         method: 'POST', body: JSON.stringify({ sessionId, action, payload }),
       }))
-      const body = await response.json()
-      assert.equal(response.status, 200, JSON.stringify(body))
-      return body
+      return { status: response.status, body: await response.json() }
+    },
+    async action(action, payload = {}) {
+      const response = await host.requestAction(action, payload)
+      assert.equal(response.status, 200, JSON.stringify(response.body))
+      return response.body
     },
     async hub(route, body) {
       const endpoint = routes.get('/api/flowgate/hub/' + route)
@@ -227,13 +230,13 @@ function makeHost(options = {}) {
       }))
       return { status: response.status, body: await response.json() }
     },
-    async advance(stage = 'S3') {
+    async advance(stage = 'S3', { reviewDecision = 'pass', criteria } = {}) {
       await host.call('flowgate_start', { title: '新版子代理黑盒回归', preset: 'fast' })
       const doc = host.call('flowgate_doc', {
         html: '<!doctype html><html><body>fixture requirements</body></html>',
         scope: {
           files_expected_to_change: ['src/auth/session.ts'], capabilities: ['fixture'],
-          out_of_scope_explicitly: [], acceptance_criteria: [{ id: 'AC-1', when: '运行', then: '可验证' }],
+          out_of_scope_explicitly: [], acceptance_criteria: criteria ?? [{ id: 'AC-1', when: '运行', then: '可验证' }],
         },
       })
       await eventually(async () => (await host.state()).waitingKind === 'doc', '文档待确认')
@@ -246,19 +249,20 @@ function makeHost(options = {}) {
       if (stage === 'S4') {
         const review = host.call('flowgate_review', { angles: [{ id: 'correctness', name: '正确性', verdict: 'pass', findings: [] }] })
         await eventually(async () => (await host.state()).waitingKind === 'gate', '评审门禁')
-        await host.action('gate', { decision: 'pass' })
+        await host.action('gate', { decision: reviewDecision })
         await within(review, '评审完成')
       }
       assert.equal((await host.state()).stage, stage)
     },
-    async complete(kind, promise) {
+    // 这些传输/权限夹具没有实际 AC 执行证据；S4 默认明确跳过，不冒充验收通过。
+    async complete(kind, promise, payload = { decision: kind === 'test' ? 'skip' : 'pass' }) {
       const field = kind === 'review' ? 'review' : 'test'
       await eventually(async () => {
         const state = await host.state()
         return state[field] && state.waitingKind === 'gate'
       }, field + '报告与门禁')
       const before = await host.state()
-      await host.action('gate', { decision: 'pass' })
+      await host.action('gate', payload)
       const value = await within(promise, field + '运行返回')
       return { before, value }
     },
@@ -327,7 +331,7 @@ await test('新版 review：预留真实 childId，执行前已有最终只读�
 
 await test('新版 test：按方向聚合通过、失败与未覆盖，清理后才进入门禁', async () => {
   await fixture({}, async (host) => {
-    await host.advance('S4')
+    await host.advance('S4', { reviewDecision: 'skip' })
     const added = await host.action('addDirection', { name: '三种验证结果', points: ['主路径', '错误路径', '未覆盖路径'] })
     const custom = added.directions.find((item) => item.name === '三种验证结果')
     for (const direction of added.directions.filter((item) => item.id !== custom.id)) {
@@ -373,6 +377,7 @@ await test('异步 result：第一子代理未完成时不提前聚合或启动�
     const pending = observe(host.call('flowgate_review_run'))
     await eventually(() => host.activations.length === 1, '首个 activation')
     assert.equal((await host.state()).review, null)
+    assert.equal((await host.state()).stageSummary.execution.status, 'running', 'receipt 任务 ID 不能证明 result 已完成')
     assert.equal(pending.settled, false)
     host.activations[0].result.resolve(reportFor(host.activations[0].spec))
     await eventually(() => host.activations.length === 2, '第二个 activation')
@@ -381,6 +386,7 @@ await test('异步 result：第一子代理未完成时不提前聚合或启动�
     host.activations[1].result.resolve(reportFor(host.activations[1].spec))
     const { before } = await host.complete('review', pending.promise)
     assert.equal(before.review.angles.length, 2)
+    assert.equal(before.stageSummary.execution.status, 'completed')
   })
 })
 
@@ -470,7 +476,7 @@ for (const granted of [false, true]) {
       assert.equal((await host.check('unknown_plugin_tool', {}, id, true)).kind, 'deny')
       assert.equal((await host.check('ops_bash', { command: 'pwd', sandbox_permissions: 'danger-full-access' }, id, true)).kind, 'deny')
     } }, async (host) => {
-      await host.advance('S4')
+      await host.advance('S4', { reviewDecision: 'skip' })
       const added = await host.action('addDirection', { name: '迁移回滚', points: ['迁移后回滚'], needsWrite: true })
       const direction = added.directions.find((item) => item.name === '迁移回滚')
       for (const item of added.directions.filter((item) => item.id !== direction.id)) {
@@ -496,6 +502,7 @@ for (const [name, options, marker] of [
         await host.advance(kind === 'review' ? 'S3' : 'S4')
         const { before } = await host.complete(kind, host.call('flowgate_' + kind + '_run'))
         const report = before[kind]
+        assert.equal(before.stageSummary.execution.status, 'failed', '降级报告不能掩盖实际执行失败')
         assert.match(JSON.stringify(report), marker)
         if (kind === 'review') {
           assert.ok(report.angles.every((angle) => angle.verdict === 'advisory'))
@@ -520,12 +527,14 @@ await test('正常完成也要等 dispose 结束，清理期间保护子会话�
     await eventually(() => host.activations[0]?.disposeCalls === 1, '进入清理')
     const first = host.activations[0]
     assert.equal(first.stopped, false)
+    assert.equal((await host.state()).stageSummary.execution.status, 'running', 'result 已完成但 dispose 未结束时仍在运行')
     assert.equal((await host.check('ops_write_file', { path: 'x' }, first.childId, true)).kind, 'deny')
     assert.equal((await host.state()).review, null)
     assert.equal(host.activations.length, 1)
     assert.equal(pending.settled, false)
     disposeGate.resolve()
-    await host.complete('review', pending.promise)
+    const { before } = await host.complete('review', pending.promise)
+    assert.equal(before.stageSummary.execution.status, 'completed', '全部 dispose 成功后才显示执行完成')
     assert.ok(host.activations.every((activation) => activation.stopped))
   })
 })
@@ -580,7 +589,7 @@ for (const failure of ['startFails', 'cleanupFails']) {
     await fixture({ [failure]: true, onStart: async (activation, host) => {
       assert.equal((await host.check('ops_bash', { command: 'touch fixture-output' }, activation.childId, true)).kind, 'allow')
     } }, async (host) => {
-      await host.advance('S4')
+      await host.advance('S4', { reviewDecision: 'skip' })
       const added = await host.action('addDirection', { name: '授权失败方向', points: ['执行并回滚'], needsWrite: true })
       const custom = added.directions.find((direction) => direction.name === '授权失败方向')
       for (const direction of added.directions.filter((direction) => direction.id !== custom.id)) {
@@ -881,8 +890,203 @@ for (const kind of ['review', 'test']) for (const cancellation of ['signal', 'fl
       const state = await host.state()
       assert.equal(state[kind], null)
       assert.equal(state.waiting, false)
+      assert.notEqual(state.stageSummary.execution.status, 'completed', '取消或回退不能显示执行成功')
       if (cancellation === 'rollback') assert.equal(state.stage, 'S2')
       if (cancellation === 'flowgate_cancel') assert.equal(state.cancelled, true)
+    })
+  })
+}
+
+
+await test('S4 执行状态等待 result 与 dispose，不把任务 ID 或报告接收当验收通过', async () => {
+  const disposeGate = defer()
+  await fixture({ manualResult: true, disposeGate }, async (host) => {
+    await host.advance('S4')
+    const running = observe(host.call('flowgate_test_run'))
+    await eventually(() => host.activations.length === 1, '测试 receipt 已发布')
+    const activation = host.activations[0]
+    assert.equal((await host.state()).stageSummary.execution.status, 'running')
+    assert.equal((await host.state()).test, null)
+    assert.equal(running.settled, false)
+    activation.result.resolve(reportFor(activation.spec, activation.points))
+    await eventually(() => activation.disposeCalls === 1, '测试 result 完成并进入清理')
+    assert.equal(activation.stopped, false)
+    assert.equal((await host.state()).stageSummary.execution.status, 'running')
+    assert.equal((await host.state()).test, null)
+    disposeGate.resolve()
+    const { before } = await host.complete('test', running.promise)
+    assert.equal(before.stageSummary.execution.status, 'completed')
+    assert.ok(host.activations.every((child) => child.stopped))
+    assert.equal(before.acceptance.counts.pass, 0, '方向通过总数不能替代 AC 执行证据')
+    assert.equal(before.acceptance.counts.uncovered, 1)
+    assert.equal((await host.state()).acceptanceDecision.status, 'skipped')
+  })
+})
+
+for (const kind of ['review', 'test']) {
+  await test(kind + ' 内容快照不变时全量复用：新执行 0，保持原验收状态', async () => {
+    await fixture({}, async (host) => {
+      await host.advance(kind === 'review' ? 'S3' : 'S4')
+      const first = host.call('flowgate_' + kind + '_run')
+      await eventually(async () => Boolean((await host.state())[kind]) && (await host.state()).waitingKind === 'gate', '首轮报告门禁')
+      const original = await host.state()
+      const entries = original[kind][kind === 'review' ? 'angles' : 'directions']
+      assert.equal(original.stageSummary[kind].fresh, entries.length)
+      await host.action('gate', { decision: 'back', to: 'S2', note: '检查原快照复用' })
+      await within(first, '首轮退回')
+      const dev = host.call('flowgate_gate')
+      await eventually(async () => (await host.state()).waitingKind === 'gate', '复用前开发门禁')
+      await host.action('gate', { decision: 'pass' })
+      await within(dev, '复用前开发提交')
+      assert.equal((await host.state()).snapshot.id, original.snapshot.id)
+      if (kind === 'test') {
+        await host.complete('review', host.call('flowgate_review', { angles: [{ id: 'correctness', name: '正确性', verdict: 'pass', findings: [] }] }))
+      }
+      const started = host.activations.length
+      const { before } = await host.complete(kind, host.call('flowgate_' + kind + '_run'))
+      assert.equal(host.activations.length, started, '全复用不得启动任何新子代理')
+      assert.deepEqual(before[kind].reused, entries.map((entry) => entry.id))
+      assert.equal(before[kind].fresh, 0)
+      assert.deepEqual(before.stageSummary[kind], { fresh: 0, reused: entries.length, total: entries.length })
+      assert.equal(before.stageSummary.execution.status, 'completed')
+      assert.match(before.stageSummary.execution.text, kind === 'review' ? /本轮新评审 0 个角度/ : /本轮新测 0 个方向/)
+      assert.deepEqual(before.acceptance.counts, original.acceptance.counts)
+      assert.equal(before.acceptance.counts.pass, 0)
+    })
+  })
+}
+
+for (const kind of ['review', 'test']) for (const stale of [false, true]) {
+  await test(kind + ' 子报告传输 AC 证据与原始版本，不替陈旧证据补盖当前版本：' + stale, async () => {
+    let submitted
+    await fixture({
+      onStart: async (activation, host) => {
+        const state = await host.state()
+        const prompt = activation.spec.prompt[0].text
+        assert.ok(prompt.includes(state.snapshot.id), '子代理提示必须携带实际内容版本')
+        assert.match(prompt, /getBoundingClientRect\(\)/)
+        assert.match(prompt, /element\/reference\/left\/right\/referenceLeft\/referenceRight/)
+        assert.match(prompt, /hostRevision,clientRevision,pageId,viewport/)
+        assert.match(prompt, /inspectLayout.*evidenceId/)
+        assert.match(prompt, /401.*未认证/)
+        assert.match(prompt, /真实 DOM 时记录 uncovered/)
+        assert.match(prompt, /CSS 字符串.*不是实际执行证据/)
+        assert.match(prompt, /不得伪造命令、测量或截图/)
+        if (host.activations.length === 1) {
+          submitted = {
+            ac: 'AC-1', status: 'uncovered', method: 'visual',
+            evidence: '模拟宿主没有已认证的真实 DOM；未执行视觉测量。',
+            version: stale ? '0'.repeat(64) : state.snapshot.id,
+          }
+          activation.acceptance = [submitted]
+        }
+      },
+      response: (activation) => ({
+        stopReason: 'completed',
+        structured: { ...JSON.parse(reportFor(activation.spec, activation.points).output[0].text), acceptance: activation.acceptance ?? [] },
+        output: [],
+      }),
+    }, async (host) => {
+      await host.advance(kind === 'review' ? 'S3' : 'S4', { criteria: [{
+        id: 'AC-1', when: '显示实际宿主界面', then: '目标与任务参照元素左右边缘对齐',
+        verification: { method: 'visual', procedure: '核对页面版本后测量真实元素左右边缘' },
+      }] })
+      const { before } = await host.complete(kind, host.call('flowgate_' + kind + '_run'))
+      assert.equal(before[kind].snapshot.id, before.snapshot.id)
+      assert.equal(before[kind].snapshot.complete, true)
+      assert.equal(before[kind].acceptance.length, 1)
+      for (const [key, value] of Object.entries(submitted)) assert.deepEqual(before[kind].acceptance[0][key], value)
+      assert.equal(before[kind].acceptance[0].version, stale ? '0'.repeat(64) : before.snapshot.id)
+      assert.equal(before.acceptance.items[0].status, 'uncovered')
+      assert.equal(before.acceptance.counts.pass, 0)
+      if (stale) assert.match(before.acceptance.items[0].reason, /版本/)
+      else assert.match(before.acceptance.items[0].evidence, /未执行视觉测量/)
+    })
+  })
+}
+
+await test('S4 规则改变后已通过的 S3 快照失效，即使显式接受缺口也返回 409', async () => {
+  await fixture({}, async (host) => {
+    await host.advance('S4')
+    const reviewed = (await host.state()).review.snapshot.id
+    await host.action('addDirection', { name: '评审后新增规则', points: ['真实执行仍待覆盖'] })
+    const pending = host.call('flowgate_test_run')
+    await eventually(async () => Boolean((await host.state()).test) && (await host.state()).waitingKind === 'gate', '新规则测试报告')
+    const state = await host.state()
+    assert.notEqual(state.snapshot.id, reviewed)
+    assert.equal(state.test.snapshot.id, state.snapshot.id)
+    const rejected = await host.requestAction('gate', { decision: 'pass', acceptUncovered: true })
+    assert.equal(rejected.status, 409)
+    assert.match(rejected.body.error, /评审后代码或规则已变化/)
+    assert.equal((await host.state()).finished, false)
+    await host.complete('test', pending)
+  })
+})
+
+await test('S4 无 AC 证据及非通过要点必须显式接受缺口，接受后仍保留未覆盖', async () => {
+  await fixture({}, async (host) => {
+    await host.advance('S4')
+    const pending = host.call('flowgate_test_run')
+    await eventually(async () => Boolean((await host.state()).test) && (await host.state()).waitingKind === 'gate', '缺口测试报告')
+    const before = await host.state()
+    const rejected = await host.requestAction('gate', { decision: 'pass' })
+    assert.equal(rejected.status, 409)
+    assert.match(rejected.body.error, /acceptUncovered: true/)
+    assert.equal((await host.state()).finished, false)
+    await host.complete('test', pending, { decision: 'pass', acceptUncovered: true, acceptanceNote: '测试夹具明确接受未覆盖；不声称实际通过' })
+    const accepted = await host.state()
+    assert.equal(accepted.finished, true)
+    assert.equal(accepted.acceptanceDecision.status, 'accepted-with-gaps')
+    assert.equal(accepted.acceptanceDecision.version, before.snapshot.id)
+    assert.equal(accepted.acceptanceDecision.counts.pass, 0)
+    assert.deepEqual(accepted.acceptance.counts, before.acceptance.counts)
+    assert.equal(accepted.acceptanceDecision.unpassedPoints, 1)
+  })
+})
+
+for (const kind of ['review', 'test']) for (const stale of [false, true]) {
+  await test(kind + ' 人工顶层 AC 证据在自动全复用后保留来源内容与原始版本：' + stale, async () => {
+    await fixture({}, async (host) => {
+      await host.advance(kind === 'review' ? 'S3' : 'S4')
+      const state = await host.state()
+      const submitted = {
+        ac: 'AC-1', status: 'uncovered', method: 'manual',
+        evidence: '来源：人工顶层报告；当前模拟宿主未进行实际执行，保持未覆盖。',
+        version: stale ? '0'.repeat(64) : state.snapshot.id,
+      }
+      const entries = kind === 'review'
+        ? state.angles.map(({ id, name }) => ({ id, name, verdict: 'advisory', findings: [] }))
+        : state.directions.map(({ id, name, points }) => ({ id, name, points: points.map((point) => ({ point, result: 'uncovered', detail: '人工夹具没有实际执行' })) }))
+      const field = kind === 'review' ? 'angles' : 'directions'
+      assert.ok(entries.length > 0)
+      assert.ok(entries.every((entry) => !('acceptance' in entry)), '证据必须仅位于人工报告顶层')
+      const originalCall = host.call('flowgate_' + kind, { [field]: entries, acceptance: [submitted] })
+      await eventually(async () => Boolean((await host.state())[kind]) && (await host.state()).waitingKind === 'gate', '人工顶层报告门禁')
+      const original = await host.state()
+      assert.equal(original[kind].acceptance.length, 1)
+      for (const [key, value] of Object.entries(submitted)) assert.deepEqual(original[kind].acceptance[0][key], value)
+      await host.action('gate', { decision: 'back', to: 'S2', note: '检查人工顶层证据的同快照复用' })
+      await within(originalCall, '人工报告退回')
+      const dev = host.call('flowgate_gate')
+      await eventually(async () => (await host.state()).waitingKind === 'gate', '人工证据复用前开发门禁')
+      await host.action('gate', { decision: 'pass' })
+      await within(dev, '人工证据复用前提交开发')
+      assert.equal((await host.state()).snapshot.id, original.snapshot.id)
+      if (kind === 'test') {
+        await host.complete('review', host.call('flowgate_review', { angles: [{ id: 'correctness', name: '正确性', verdict: 'pass', findings: [] }] }))
+      }
+      const started = host.activations.length
+      const { before } = await host.complete(kind, host.call('flowgate_' + kind + '_run'))
+      assert.equal(host.activations.length, started, '全复用不得启动新的子代理')
+      assert.deepEqual(before[kind].reused, entries.map((entry) => entry.id))
+      assert.equal(before[kind].fresh, 0)
+      assert.equal(before[kind].snapshot.id, original.snapshot.id)
+      assert.equal(before[kind].acceptance.length, 1, '角度或方向没有局部证据也必须保留人工顶层证据')
+      for (const [key, value] of Object.entries(submitted)) assert.deepEqual(before[kind].acceptance[0][key], value)
+      assert.equal(before.acceptance.items[0].status, 'uncovered')
+      assert.equal(before.acceptance.counts.pass, 0)
+      if (stale) assert.match(before.acceptance.items[0].reason, /版本/)
+      else assert.match(before.acceptance.items[0].evidence, /来源：人工顶层报告/)
     })
   })
 }
