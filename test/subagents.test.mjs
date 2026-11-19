@@ -314,7 +314,14 @@ await test('新版 review：预留真实 childId，执行前已有最终只读�
       assert.equal(activation.stopped, true)
       assert.equal((await host.check('write', { path: 'x' }, activation.childId, true)).kind, 'allow', '确认停止后才允许移除子会话归属')
     }
-    assert.match(host.activations.find((activation) => activation.spec.label.includes('正确性')).spec.prompt[0].text, /用户定义的开发规则/)
+    const correctnessPrompt = host.activations.find((activation) => activation.spec.label.includes('正确性')).spec.prompt[0].text
+    assert.match(correctnessPrompt, /用户定义的开发规则/)
+    // 全量枚举：一次报全被改函数的边界分支，不逐条增量上报。
+    assert.match(correctnessPrompt, /全量枚举/)
+    assert.match(correctnessPrompt, /发现一个报一个/)
+    for (const token of ['带引号引用', '普通引用', '未引用', 'Unicode', 'UNC', '盘根', '上限 + 1']) {
+      assert.ok(correctnessPrompt.includes(token), '提示词缺少边界分支：' + token)
+    }
   })
 })
 
