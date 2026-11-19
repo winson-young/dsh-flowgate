@@ -38,7 +38,14 @@ function pressEscape() {
 globalThis.CSSStyleSheet = undefined
 
 let plugin = null
+// 工作台的页面记忆存在 localStorage 里：这里给一个内存替身，用例之间可清空。
+const memoryStore = new Map()
 globalThis.window = {
+  localStorage: {
+    getItem(key) { return memoryStore.has(key) ? memoryStore.get(key) : null },
+    setItem(key, value) { memoryStore.set(key, String(value)) },
+    removeItem(key) { memoryStore.delete(key) },
+  },
   __ModuleLoader__: {
     load(entry) { plugin = entry.factory(require) },
   },
@@ -1686,6 +1693,8 @@ const idleAlphaMember = {
 }
 
 const resetHub = (members = []) => {
+  // 页面记忆是跨挂载的状态：每个用例都从「没有记忆」开始，免得互相干扰。
+  memoryStore.clear()
   currentMembers = members
   addResult = null
   listCalls.length = 0
@@ -1933,6 +1942,104 @@ const resetHub = (members = []) => {
   globalThis.fetch = saved
   await check('名单读取失败时面板显示错误而不是空白', () => {
     assert.match(text, /读盘失败/)
+  })
+}
+
+// ---------------------------------------------------------------------------
+// 工作台的页面记忆
+// ---------------------------------------------------------------------------
+
+{
+  // 切到别的会话再点进工作台：面板会重新挂载，不能每次都回到首页。
+  resetHub([alphaMember])
+  const first = await render(HubPanel, {
+    useHubWorkspaces: useWorkspacesOf([]),
+    hubActions: hubActionsWith(),
+  })
+  await click(buttonByText(first.toJSON(), 'alpha'))
+  await click(buttonByText(first.toJSON(), '继续流程'))
+  assert.ok(flat(first.toJSON()).includes('流程详情'), '前置：详情已展开')
+  first.unmount()
+
+  const second = await render(HubPanel, {
+    useHubWorkspaces: useWorkspacesOf([]),
+    hubActions: hubActionsWith(),
+  })
+  await check('重进工作台回到上次打开的流程详情', () => {
+    const text = flat(second.toJSON())
+    assert.ok(text.includes('流程详情'), text)
+    assert.ok(text.includes('会话过期检测'), text)
+  })
+  await click(buttonByText(second.toJSON(), '收起'))
+  second.unmount()
+
+  const third = await render(HubPanel, {
+    useHubWorkspaces: useWorkspacesOf([]),
+    hubActions: hubActionsWith(),
+  })
+  await check('收起详情后重进停在上次的工作区页', () => {
+    const text = flat(third.toJSON())
+    assert.ok(!text.includes('添加第一个工作区'), text)
+    assert.ok(text.includes('D:/repo/alpha'), text)
+    assert.ok(!text.includes('流程详情'), '收起后不该再展开详情')
+  })
+  await click(buttonByText(third.toJSON(), '工作区列表'))
+  third.unmount()
+
+  const fourth = await render(HubPanel, {
+    useHubWorkspaces: useWorkspacesOf([]),
+    hubActions: hubActionsWith(),
+  })
+  await check('主动回到工作区列表后记忆也跟着回到首页', () => {
+    const text = flat(fourth.toJSON())
+    // 名单非空时首页是工作区列表，不是空状态引导。
+    assert.ok(text.includes('已添加的工作区'), text)
+    assert.ok(!text.includes('工作区列表'), '不该还停在某个工作区页上')
+    assert.ok(!text.includes('流程详情'), text)
+  })
+  fourth.unmount()
+}
+
+{
+  // 记忆里的工作区已经从名单移除：重进必须回首页，不能停在「目录不可用」。
+  resetHub([])
+  memoryStore.set('dsh-flowgate.hub.memory.v1', JSON.stringify({ workspace: 'D:/repo/gone', sessionId: null, page: 1 }))
+  const renderer = await render(HubPanel, {
+    useHubWorkspaces: useWorkspacesOf([]),
+    hubActions: hubActionsWith(),
+  })
+  await check('记忆里的工作区不在名单时回首页', () => {
+    const text = flat(renderer.toJSON())
+    assert.ok(text.includes('添加第一个工作区'), text)
+  })
+}
+
+{
+  // 存储不可用（隐私模式、被策略禁用）：工作台照常工作，异常不冒到界面。
+  resetHub([alphaMember])
+  const brokenStore = {
+    getItem() { throw new Error('storage disabled') },
+    setItem() { throw new Error('storage disabled') },
+  }
+  const savedWindowStore = globalThis.window.localStorage
+  const hasGlobalStore = typeof globalThis.localStorage !== 'undefined'
+  const savedGlobalStore = hasGlobalStore ? globalThis.localStorage : null
+  if (hasGlobalStore) globalThis.localStorage = brokenStore
+  globalThis.window.localStorage = brokenStore
+  let text = ''
+  try {
+    const renderer = await render(HubPanel, {
+      useHubWorkspaces: useWorkspacesOf([]),
+      hubActions: hubActionsWith(),
+    })
+    text = flat(renderer.toJSON())
+  } finally {
+    globalThis.window.localStorage = savedWindowStore
+    if (hasGlobalStore) globalThis.localStorage = savedGlobalStore
+  }
+  await check('存储不可用时工作台照常显示，只是不记忆', () => {
+    assert.ok(text.includes('已添加的工作区'), text)
+    assert.ok(!text.includes('storage disabled'), '存储异常不能冒到界面上')
   })
 }
 
