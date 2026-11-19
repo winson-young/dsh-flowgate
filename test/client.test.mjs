@@ -816,6 +816,41 @@ const HubPanelIcon = componentOf('sidebar.panellist')
   })
 }
 
+// P0-4：批准前必须能看到「这次将允许改哪些文件」，否则等于盲签。
+{
+  currentView = baseView('S1', {
+    doc: {
+      html: '<html><body>需求文档</body></html>',
+      recommendedPreset: 'fast',
+      reason: '只改两个文件',
+      at: '2026-11-17T09:20:00Z',
+      pending: true,
+      pendingScope: {
+        files_expected_to_change: ['src/auth/session.ts', 'src/auth/store.ts'],
+        capabilities: ['会话过期检测'],
+        out_of_scope_explicitly: ['OAuth 第三方登录'],
+        acceptance_criteria: [{ id: 'AC-1', when: '会话超过 30 分钟未活动', then: '返回 401' }],
+      },
+      droppedScopeEntries: ['../outside/evil.ts', 'D:/absolute/evil.ts'],
+    },
+    waiting: false,
+    waitingKind: null,
+  })
+  const tree = (await render(FlowDetail, {})).toJSON()
+  const text = flat(tree)
+  await check('S1 批准前展示待冻结 scope 的白名单', () => {
+    assert.ok(text.includes('待冻结 scope'))
+    assert.ok(text.includes('src/auth/session.ts'))
+    assert.ok(text.includes('src/auth/store.ts'))
+    assert.ok(text.includes('会话过期检测'))
+  })
+  await check('S1 展示被剔除的越界条目', () => {
+    assert.ok(text.includes('已剔除的越界条目'))
+    assert.ok(text.includes('../outside/evil.ts'))
+    assert.ok(text.includes('D:/absolute/evil.ts'))
+  })
+}
+
 {
   currentView = baseView('S1', {
     doc: {
@@ -874,6 +909,59 @@ const HubPanelIcon = componentOf('sidebar.panellist')
 
   await check('S2 提供回到需求分析调整 scope 的入口', () => {
     assert.ok(buttonByText(renderer.toJSON(), '回到需求分析调整 scope'))
+  })
+}
+
+// S2 的命令授权：默认关闭，勾选后才允许变更性 shell。
+{
+  posted = []
+  currentView = baseView('S2', {
+    devChanges: { files: ['src/auth/session.ts'], added: 42, removed: 7, at: '2026-11-17T09:40:00Z' },
+    shellGrant: false,
+    waiting: true,
+    waitingKind: 'gate',
+  })
+  const renderer = await render(FlowDetail, {})
+  const tree = renderer.toJSON()
+  const boxes = checkboxNodes(tree)
+  await check('S2 默认关闭命令授权并说明只允许只读 shell', () => {
+    assert.ok(flat(tree).includes('允许执行构建/测试命令'))
+    assert.ok(flat(tree).includes('默认关闭'))
+    const grant = boxes.find((node) => node.props.checked === false)
+    assert.ok(grant, 'S2 必须有命令授权勾选框')
+  })
+  await check('S2 勾选命令授权提交 toggleShellGrant', async () => {
+    const grant = checkboxNodes(renderer.toJSON()).find((node) => node.props.checked === false)
+    await act(async () => {
+      grant.props.onChange({ target: { checked: true } })
+      await new Promise((resolve) => setTimeout(resolve, 40))
+    })
+    const call = posted.find((item) => item.action === 'toggleShellGrant')
+    assert.ok(call, '必须提交 toggleShellGrant')
+    assert.equal(call.payload.enabled, true)
+  })
+}
+
+// S4 要跑测试命令：授权入口必须和测试阶段同屏，否则用户只能手改 scope。
+{
+  posted = []
+  currentView = baseView('S4', { shellGrant: false })
+  const renderer = await render(FlowDetail, {})
+  const tree = renderer.toJSON()
+  await check('S4 主区提供命令授权开关', () => {
+    assert.ok(flat(tree).includes('允许执行构建/测试命令'))
+    assert.ok(flat(tree).includes('默认关闭：S4 只允许只读 shell 命令'))
+  })
+  await check('S4 勾选命令授权提交 toggleShellGrant', async () => {
+    const grant = checkboxNodes(renderer.toJSON()).find((node) => node.props.checked === false)
+    assert.ok(grant, 'S4 必须有命令授权勾选框')
+    await act(async () => {
+      grant.props.onChange({ target: { checked: true } })
+      await new Promise((resolve) => setTimeout(resolve, 40))
+    })
+    const call = posted.find((item) => item.action === 'toggleShellGrant')
+    assert.ok(call, '必须提交 toggleShellGrant')
+    assert.equal(call.payload.enabled, true)
   })
 }
 
@@ -1399,11 +1487,13 @@ await check('点「修改需求」后回到追问流程并说明下一步', asyn
 
 await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
     assert.ok(text.includes('授权执行变更性命令'))
-    const grant = boxes.find((node) => node.props.disabled === false && node.props.checked === false)
-    assert.ok(grant, 'S4 下必须有一个可用的授权勾选框')
+    // 按文案定位：S4 主区的「允许执行构建/测试命令」是另一个开关，不能靠「第一个可用勾选框」猜。
+    const grant = ruleCheckbox(modalTree, '授权执行变更性命令')
+    assert.equal(grant.props.disabled, false)
+    assert.equal(grant.props.checked, false)
   })
   await check('D2 勾选授权提交 toggleWriteGrant', async () => {
-    const grant = boxes.find((node) => node.props.disabled === false && node.props.checked === false)
+    const grant = ruleCheckbox(modalTree, '授权执行变更性命令')
     await act(async () => {
       grant.props.onChange({ target: { checked: true } })
       await new Promise((resolve) => setTimeout(resolve, 40))
