@@ -269,9 +269,12 @@ await check('D2 非 S4 的手工写权限标志仍拒绝变更性 shell', async 
   }
 })
 
-await check('AC-4 子会话解绑后回到父流程的 scope 判定', async () => {
+// 解绑之后不再按「只读子代理」处理，但它还在同一个项目里干活：
+// 按 cwd 兜底找到运行中的流程，仍然要过 scope（P1-5）。此时流程在 S1，写代码必须被拒。
+await check('AC-4 子会话解绑后仍按同项目运行中的流程判 scope', async () => {
   const d = await guard('write', { path: 'src/auth/session.ts' }, 'sess-review')
-  assert.equal(d.kind, 'allow', '没有流程归属的会话不应被只读守卫拦住')
+  assert.equal(d.kind, 'deny', '同项目里有运行中的流程时，未登记的会话不能写代码')
+  assert.match(d.reason, /S1|需求分析/)
 })
 
 await check('追问卡片挂起，用户点选项后工具返回答案', async () => {
@@ -331,9 +334,13 @@ await check('S2 越界写被拒绝并给出回退指引', async () => {
   assert.match(d.reason, /回到需求分析阶段更新 scope\.json/)
 })
 
-await check('S2 内部台账文件不受 scope 限制', async () => {
+// P0-2：数据目录由插件自己维护。以前是无条件放行，等于让 Agent 改自己的 scope 与状态快照。
+await check('数据目录不接受工具写入（含 S2 内部台账）', async () => {
   const d = await guard('write', { path: '.dsh-flowgate/notes.md' })
-  assert.equal(d.kind, 'allow')
+  assert.equal(d.kind, 'deny')
+  assert.match(d.reason, /由插件自身维护/)
+  const snapshot = await guard('write', { path: '.dsh-flowgate/flows/f_x.json' })
+  assert.equal(snapshot.kind, 'deny')
 })
 
 await check('「完成开发」门禁自动采集变更摘要并进入 S3', async () => {

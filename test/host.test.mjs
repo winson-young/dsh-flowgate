@@ -4,7 +4,7 @@ import { syncBuiltinESMExports } from 'node:module'
 import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply, scopeDenial, currentService } from '../lib/index.js'
+import { apply, scopeDenial, currentService, parseChanges } from '../lib/index.js'
 import { prepareRequirement } from '../lib/requirements.js'
 
 // ---------------------------------------------------------------------------
@@ -247,9 +247,96 @@ const customAnswer = await postAction('answer', { choiceIndex: -1, customText: '
 check('自定义文本可提交', () => assert.equal(customAnswer.status, 200))
 await askPending2
 
+// 追问内容会随快照全量落盘：空问题与超长问题都要在提交前挡住。
+{
+  const opts = [{ label: 'A', tradeoff: 'a' }, { label: 'B', tradeoff: 'b' }]
+  const emptyQuestion = await runTool('flowgate_ask', { question: '   ', options: opts }).catch((error) => error)
+  const longQuestion = await runTool('flowgate_ask', { question: '问'.repeat(501), options: opts }).catch((error) => error)
+  const oneOption = await runTool('flowgate_ask', { question: '只有一个选项？', options: [{ label: 'A', tradeoff: 'a' }] }).catch((error) => error)
+  const blankOptions = await runTool('flowgate_ask', { question: '选项都是空的？', options: [{ label: '  ', tradeoff: 'a' }, { label: '', tradeoff: 'b' }] }).catch((error) => error)
+  check('追问的空内容与超长内容被拒', () => {
+    assert.match(String(emptyQuestion?.message ?? emptyQuestion), /不能为空/)
+    assert.match(String(longQuestion?.message ?? longQuestion), /500/)
+    assert.match(String(oneOption?.message ?? oneOption), /至少给出 2 个选项/)
+    // 空白选项被剔除后不足两个，同样要拒：界面上点不到有效选项。
+    assert.match(String(blankOptions?.message ?? blankOptions), /至少给出 2 个选项/)
+  })
+}
+
+// 只读白名单里漏登记的工具会被整体拒绝。skill 只把说明文本读进上下文，必须登记。
+const allowSkill = await guard('skill', { name: 'office-docx' })
+check('skill 这类只读工具在流程运行期间照常可用', () => assert.equal(allowSkill.kind, 'allow'))
+// 未登记的工具默认拒绝：宿主新增写工具时是「被挡住」而不是「静默放行」。
+const unknownTool = await guard('some_future_write_tool', { file_path: 'src/auth/session.ts' })
+check('未登记进白名单的工具默认被拒绝', () => {
+  assert.equal(unknownTool.kind, 'deny')
+  assert.match(unknownTool.reason, /只读登记表/)
+})
+
+// P1-5：用户自己 spawn 的普通子代理不会登记进 childOwner，
+// 它在同一个项目里写代码时必须按 cwd 兜底找到运行中的流程再过一次 scope。
+{
+  const siblingCwd = cwd
+  const runSibling = (name, args, id, dir) => host.handlers.get('tools/pre-execute')(
+    { name, arguments: args, agent: { session: { header: { id, cwd: dir } } }, signal: undefined },
+    async () => ({ kind: 'allow' }),
+  )
+  const siblingDenied = await runSibling('write', { file_path: join(siblingCwd, 'src/auth/session.ts'), content: 'x' }, 'sess_sibling', siblingCwd)
+  const siblingNested = await runSibling('write', { file_path: join(siblingCwd, 'src/auth/session.ts'), content: 'x' }, 'sess_nested', join(siblingCwd, 'packages/app'))
+  const unrelated = await runSibling('write', { file_path: join(siblingCwd, 'src/auth/session.ts'), content: 'x' }, 'sess_unrelated', mkdtempSync(join(tmpdir(), 'flowgate-other-')))
+  check('未登记的普通子代理按 cwd 纳入 scope 守卫', () => {
+    assert.equal(siblingDenied.kind, 'deny')
+    assert.match(siblingDenied.reason, /S1|需求分析/)
+    // 子代理把 cwd 指到项目子目录也还在项目里，不能因为路径不同就漏判。
+    assert.equal(siblingNested.kind, 'deny')
+  })
+  check('项目外目录的会话不受这条流程约束', () => assert.equal(unrelated.kind, 'allow', JSON.stringify(unrelated)))
+}
+
+// git branch 有删除与创建模式：通用只读白名单允许尾部任意参数，
+// `git branch -a --delete main` 就能借 -a 混过白名单再删分支。
+{
+  const branchList = await host.guard('ops_bash', { command: 'git branch -a' })
+  const branchPattern = await host.guard('ops_bash', { command: "git branch --list 'feat*'" })
+  const branchDelete = await host.guard('ops_bash', { command: 'git branch -a --delete main' })
+  const branchCreate = await host.guard('ops_bash', { command: 'git branch feature-x' })
+  check('git branch 只放行列分支，删除与创建照旧被拦', () => {
+    assert.equal(branchList.kind, 'allow', JSON.stringify(branchList))
+    assert.equal(branchPattern.kind, 'allow', JSON.stringify(branchPattern))
+    assert.equal(branchDelete.kind, 'deny', JSON.stringify(branchDelete))
+    assert.equal(branchCreate.kind, 'deny', JSON.stringify(branchCreate))
+  })
+}
+
+// 命令授权只在 S2 / S4 开放：S1 想提前开也不行。
+const earlyShellGrant = await postAction('toggleShellGrant', { enabled: true })
+check('S1 阶段不能授权执行变更性命令', () => assert.equal(earlyShellGrant.status, 409))
+
+// 文档与 scope 都会原样进快照、每次全量写盘：体积不设上限，一次提交就能让流程卡死。
+{
+  const minimalScope = {
+    files_expected_to_change: ['src/auth/session.ts'],
+    capabilities: ['体积校验'],
+    out_of_scope_explicitly: [],
+    acceptance_criteria: [{ id: 'AC-1', when: '体积超限', then: '提交被拒绝' }],
+  }
+  const emptyHtml = await runTool('flowgate_doc', { html: '   ', scope: minimalScope }).catch((error) => error)
+  const bigHtml = await runTool('flowgate_doc', { html: '<p>' + 'x'.repeat(400001) + '</p>', scope: minimalScope }).catch((error) => error)
+  const bigScope = await runTool('flowgate_doc', {
+    html: '<html><body><p>体积</p></body></html>',
+    scope: { ...minimalScope, capabilities: Array.from({ length: 4000 }, () => '能力条目'.repeat(4)) },
+  }).catch((error) => error)
+  check('需求文档与 scope 的体积上限在提交前拦住', () => {
+    assert.match(String(emptyHtml?.message ?? emptyHtml), /不能为空/)
+    assert.match(String(bigHtml?.message ?? bigHtml), /400000/)
+    assert.match(String(bigScope?.message ?? bigScope), /40000/)
+  })
+}
 // 需求文档 → 批准并冻结 scope（AC-2 的对照：这里走正常批准路径）。
 const scopeInput = {
-  files_expected_to_change: ['src/auth/session.ts'],
+  // P0-4：scope 由 Agent 自报。绝对路径与项目根之外的条目必须在提交时就被剔除，
+  // 否则 normalizeTarget 会把绝对路径原样返回，等于给任意文件开通行证。
+  files_expected_to_change: ['src/auth/session.ts', '../outside/evil.ts', 'D:/absolute/evil.ts'],
   capabilities: ['会话过期检测', '过期后返回 401'],
   out_of_scope_explicitly: ['OAuth 第三方登录', '前端 UI 改动'],
   acceptance_criteria: [{ id: 'AC-1', when: 'session 超过 30 分钟未活动', then: '下一次请求返回 401' }],
@@ -265,6 +352,13 @@ const docState = await getState()
 check('文档提交后进入待批准状态', () => {
   assert.equal(docState.body.doc.pending, true)
   assert.equal(docState.body.stage, 'S1')
+})
+// 批准前用户必须看到「这次将允许改哪些文件」，并且越界条目已被剔除（P0-4）。
+check('提交的 scope 里越界条目被剔除并回报给界面', () => {
+  assert.deepEqual(docState.body.doc.pendingScope.files_expected_to_change, ['src/auth/session.ts'])
+  assert.equal(docState.body.doc.droppedScopeEntries.length, 2)
+  assert.ok(docState.body.doc.droppedScopeEntries.includes('../outside/evil.ts'))
+  assert.ok(docState.body.doc.droppedScopeEntries.includes('D:/absolute/evil.ts'))
 })
 const approved = await postAction('doc', { decision: 'approve' })
 check('点「批准并冻结 scope」成功', () => assert.equal(approved.status, 200))
@@ -300,20 +394,149 @@ const allowIn = await guard('edit', { file_path: join(cwd, 'src/auth/session.ts'
 check('scope 内 edit 放行', () => assert.equal(allowIn.kind, 'allow'))
 // 变更性 shell 无法逐条核对 scope，S2 也必须拒绝——放行等于给 scope 边界开后门。
 const denyShell = await guard('bash', { command: 'git checkout -- src/api/middleware.ts' })
-check('变更性 shell 在 S2 被拒并给出回退指引', () => {
+check('变更性 shell 在 S2 被拒并给出授权指引', () => {
   assert.equal(denyShell.kind, 'deny')
-  assert.match(denyShell.reason, /变更性 shell 无法核对冻结 scope/)
-  assert.match(denyShell.reason, /回到需求分析阶段/)
+  assert.match(denyShell.reason, /只允许只读 shell 命令/)
+  assert.match(denyShell.reason, /显式授权/)
 })
 const denyShellOps = await guard('ops_bash', { command: 'rm -rf src/api' })
 check('ops_bash 这类别名 shell 同样被拦（不同 profile 装的 shell 插件不同）', () => {
   assert.equal(denyShellOps.kind, 'deny')
-  assert.match(denyShellOps.reason, /变更性 shell/)
+  assert.match(denyShellOps.reason, /只允许只读 shell 命令/)
 })
 const denyShell2 = await guard('bash', { command: 'echo hello' })
 check('只读 shell 放行', () => assert.equal(denyShell2.kind, 'allow'))
 const allowGitDiff = await guard('ops_bash', { command: 'git diff --stat' })
 check('ops_bash 的只读命令放行', () => assert.equal(allowGitDiff.kind, 'allow'))
+
+// S2 的「允许执行构建/测试命令」：默认关闭，用户显式授权后才放行变更性 shell。
+const shellGranted = await postAction('toggleShellGrant', { enabled: true })
+const afterGrant = await guard('bash', { command: 'npm run build' })
+const afterGrantState = await getState()
+check('S2 用户显式授权后变更性 shell 放行', () => {
+  assert.equal(shellGranted.status, 200)
+  assert.equal(afterGrantState.body.shellGrant, true)
+  assert.equal(afterGrant.kind, 'allow')
+})
+// 授权只放宽「写盘类命令」，解释器内联执行仍然拒绝：那等价于任意代码执行。
+const stillEscape = await guard('bash', { command: 'node -e "require(\'fs\').writeFileSync(\'x\',\'y\')"' })
+check('授权后解释器内联执行仍被拒绝', () => {
+  assert.equal(stillEscape.kind, 'deny')
+  assert.match(stillEscape.reason, /任意代码/)
+})
+const shellRevoked = await postAction('toggleShellGrant', { enabled: false })
+const afterRevoke = await guard('bash', { command: 'npm run build' })
+const afterRevokeState = await getState()
+check('撤销授权后变更性 shell 重新被拒', () => {
+  assert.equal(shellRevoked.status, 200)
+  assert.equal(afterRevokeState.body.shellGrant, false)
+  assert.equal(afterRevoke.kind, 'deny')
+  assert.match(afterRevoke.reason, /只允许只读 shell 命令/)
+})
+
+// 只读白名单本身也有边界：多行命令、能写文件的选项、会改 refs 的子命令。
+const denyMultiline = await guard('bash', { command: 'pwd\nrm -rf src' })
+check('多行 shell 不能借只读前缀夹带变更命令', () => {
+  assert.equal(denyMultiline.kind, 'deny')
+})
+const denyOutput = await guard('bash', { command: 'git diff --output=evil.patch' })
+check('git 的 --output 选项被拒绝（它能把内容写进任意文件）', () => {
+  assert.equal(denyOutput.kind, 'deny')
+  assert.match(denyOutput.reason, /写盘或执行任意代码/)
+})
+const denyBranch = await guard('bash', { command: 'git branch feature-x' })
+check('git branch 建分支被拒绝（会写 .git/refs）', () => {
+  assert.equal(denyBranch.kind, 'deny')
+})
+const allowBranchList = await guard('bash', { command: 'git branch --list' })
+check('git branch --list 放行', () => assert.equal(allowBranchList.kind, 'allow'))
+
+// run_code 是 PTC：程序里能直接 import node:fs 写盘，pre-execute 看不到。
+const denyNodeIo = await guard('run_code', { code: "await import('node:fs')" })
+check('run_code 里直接用 Node IO 被拒绝', () => {
+  assert.equal(denyNodeIo.kind, 'deny')
+  assert.match(denyNodeIo.reason, /绕过 scope 守卫/)
+})
+const denyMultiWrite = await guard('run_code', {
+  code: "const r = await tools.ops_remove({ path: 'src/api/middleware.ts', expectedRevision: 'x' })\nreturn r",
+})
+check('run_code 多语句里夹带写工具被拒绝', () => {
+  assert.equal(denyMultiWrite.kind, 'deny')
+  assert.match(denyMultiWrite.reason, /无法静态取出参数/)
+})
+const denyBracket = await guard('run_code', { code: "return await tools['ops_remove']({ path: 'src/api/middleware.ts' })" })
+check('run_code 用括号访问工具名同样被拒绝', () => {
+  assert.equal(denyBracket.kind, 'deny')
+})
+const denySingleWrite = await guard('run_code', {
+  code: 'return await tools.write({"file_path":"src/api/middleware.ts","content":"x"})',
+})
+check('run_code 单次调用写工具仍按 scope 判定', () => {
+  assert.equal(denySingleWrite.kind, 'deny')
+  assert.match(denySingleWrite.reason, /不在冻结 scope 内/)
+})
+const allowReadOnly = await guard('run_code', {
+  code: 'const a = await tools.ops_grep({ pattern: "x", path: "src" })\nreturn a',
+})
+check('run_code 里组合只读工具照常放行', () => assert.equal(allowReadOnly.kind, 'allow'))
+
+// batching-guidance 这类插件要求在程序第一行写 `// plan: …`。单调用前面带注释时
+// 仍要能解析出参数：解析失败会退化成「提到工具名就拒绝」，Agent 按报错提示改成
+// 单调用也永远过不去，提示与行为自相矛盾（实机踩到）。
+{
+  const annotatedRead = await guard('run_code', {
+    code: '// plan: 读 package.json\nreturn await tools.ops_stat({"path":"package.json"})',
+  })
+  const annotatedWrite = await guard('run_code', {
+    code: '// plan: 写文件\nreturn await tools.write({"file_path":"src/api/middleware.ts","content":"x"})',
+  })
+  check('单次调用带前置注释仍能解析参数并按 scope 判定', () => {
+    assert.equal(annotatedRead.kind, 'allow', JSON.stringify(annotatedRead))
+    assert.equal(annotatedWrite.kind, 'deny')
+    // 解析成功才会走到 scope 判定；解析失败会报「多语句程序无法静态取出参数」。
+    assert.match(annotatedWrite.reason, /S1|需求分析/)
+    assert.doesNotMatch(annotatedWrite.reason, /多语句程序/)
+  })
+}
+
+// 命令文本与文件路径都在字符串里：`rmdir` / `unlink` 这些词出现在 shell 命令或路径里
+// 不代表程序在直接用 Node IO。扫原文会把一条正常的清理命令整条拒掉。
+{
+  const cleanUp = await guard('run_code', {
+    code: 'const r = await tools.ops_bash({ command: "rmdir .tmp-x", description: "清理临时目录" })\nreturn r',
+  })
+  const readPath = await guard('run_code', {
+    code: 'const r = await tools.ops_read_files({ files: [{ path: "docs/unlink-notes.md" }] })\nreturn r',
+  })
+  // 注释里写说明文字同样不该被当成 IO：`// 清理 rmdir 残留` 只是注释。
+  const commentOnly = await guard('run_code', {
+    code: '// 用 rmdir 清理临时目录，别再 unlink 单文件\nconst r = await tools.ops_bash({ command: "pwd", description: "看目录" })\nreturn r',
+  })
+  const blockComment = await guard('run_code', {
+    code: '/* rmdir / unlink / writeFile 都只是注释 */\nconst r = await tools.ops_stat({ path: "package.json" })\nreturn r',
+  })
+  check('run_code 不把字符串与注释里的 rmdir / unlink 当成 Node IO', () => {
+    assert.equal(cleanUp.kind, 'allow', JSON.stringify(cleanUp))
+    assert.equal(readPath.kind, 'allow', JSON.stringify(readPath))
+    assert.equal(commentOnly.kind, 'allow', JSON.stringify(commentOnly))
+    assert.equal(blockComment.kind, 'allow', JSON.stringify(blockComment))
+  })
+  // 真正的 IO 痕迹在字面量之外，剥字符串不能把它一起放过。
+  const realIo = await guard('run_code', {
+    code: 'const fs = await import("node:fs")\nfs.writeFileSync("x", "y")\nreturn 1',
+  })
+  const hiddenIo = await guard('run_code', {
+    code: 'const name = "node:" + "fs"\nconst m = await import(name)\nreturn m',
+  })
+  check('剥掉字符串后仍拦得住真正的 Node IO', () => {
+    assert.equal(realIo.kind, 'deny')
+    assert.equal(hiddenIo.kind, 'deny')
+  })
+}
+
+// 授权只在当阶段有效：S2 开着授权进 S3，必须自动失效。
+const grantBeforeAdvance = await postAction('toggleShellGrant', { enabled: true })
+check('进入阶段推进前重新授权', () => assert.equal(grantBeforeAdvance.status, 200))
 
 // scope 未冻结分支：直接构造 flow 验证守卫文案。
 check('scope 未冻结时 S2 写操作返回「scope 未冻结」', () => {
@@ -332,6 +555,7 @@ check('S2 完成开发后进入 S3', () => {
   assert.match(devResult.message, /不要在阶段交界处停下/)
 })
 const afterDev = await getState()
+check('离开 S2 后命令授权自动失效', () => assert.equal(afterDev.body.shellGrant, false))
 check('S2 记录变更摘要凭据', () => {
   assert.equal(afterDev.body.stages.find((s) => s.id === 'S2').status, 'passed')
   assert.ok(afterDev.body.devChanges.files.includes('src/auth/session.ts'))
@@ -422,6 +646,23 @@ const reviewPending3 = gateRound(
   { decision: 'pass' },
 )
 await reviewPending3
+
+// S4 要跑测试命令，同一个开关必须在这里也能用，否则测试阶段只能手改 scope。
+const s4Grant = await postAction('toggleShellGrant', { enabled: true })
+const s4Shell = await guard('bash', { command: 'npm test' })
+const s4Escape = await guard('bash', { command: 'node -e "process.exit(0)"' })
+const s4Revoke = await postAction('toggleShellGrant', { enabled: false })
+check('S4 阶段同样可以授权执行测试命令', () => {
+  assert.equal(s4Grant.status, 200)
+  assert.equal(s4Shell.kind, 'allow')
+})
+check('S4 授权后解释器内联执行仍被拒绝', () => {
+  assert.equal(s4Escape.kind, 'deny')
+  assert.match(s4Escape.reason, /任意代码/)
+})
+check('S4 撤销授权后测试命令重新被拒', () => {
+  assert.equal(s4Revoke.status, 200)
+})
 
 // D2：v1 唯一的写权限例外——只在 S4、只对声明 needsWrite 的方向、只由用户显式授权。
 const addDir = await postAction('addDirection', {
@@ -810,6 +1051,31 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
   })
   rmSync(repo, { recursive: true, force: true })
   }
+}
+
+// ---------------------------------------------------------------------------
+// 采集解析：git 的报错文本不能变成「改动文件」。非仓库目录下 stderr 会被
+// 某些 shell 实现混进 stdout，逐行解析时 "fatal: not a git repository" 的
+// 前两个字符 'fa' 看起来正好像一个 porcelain 状态码。
+// ---------------------------------------------------------------------------
+{
+  check('采集解析：非仓库的报错文本不会被当成改动文件', () => {
+    const parsed = parseChanges('fatal: not a git repository (or any of the parent directories): .git\n', 'now')
+    assert.deepEqual(parsed.files, [])
+    assert.deepEqual(parsed.tracked, [])
+    assert.deepEqual(parsed.untracked, [])
+    assert.match(String(parsed.error), /变更摘要可能不完整/)
+  })
+
+  check('采集解析：正常输出照旧解析并统计行数', () => {
+    const parsed = parseChanges(' M src/a.ts\n?? src/b.ts\n---numstat---\n3\t1\tsrc/a.ts\n', 'now')
+    assert.deepEqual(parsed.tracked, ['src/a.ts'])
+    assert.deepEqual(parsed.untracked, ['src/b.ts'])
+    assert.deepEqual(parsed.files, ['src/a.ts', 'src/b.ts'])
+    assert.equal(parsed.added, 3)
+    assert.equal(parsed.removed, 1)
+    assert.equal(parsed.error, undefined)
+  })
 }
 // ---------------------------------------------------------------------------
 // 取消：用户放弃流程时必须把流程判死、解冻 scope，并唤醒挂起的门禁工具。
@@ -1934,6 +2200,13 @@ rmSync(cwd, { recursive: true, force: true })
     })
     const brief = '  需求原文含路径 src/a.js 与数字 123\n' + '完整保留需求原文。\n'.repeat(650) + '\n '
     const summary = '整理后的需求\n\n' + '验证整理稿完整恢复。'.repeat(35)
+    const badPreset = await act('start', { preset: 'turbo', brief: '档位写错' })
+    const noFlowYet = await cx.request('/api/flowgate/state?sessionId=' + sid)
+    check('未知档位启动被拒绝，不静默回落到 fast', () => {
+      assert.equal(badPreset.status, 409)
+      assert.match(badPreset.body.error, /未知档位/)
+      assert.equal(noFlowYet.body.active, false)
+    })
     const started = await act('start', { title: '语义标题', brief, summary, preset: 'strict' })
     const duplicate = await act('start', { title: '重复标题', brief: '替换原文', summary: '替换摘要', preset: 'fast' })
     check('流程完整独立保存原文和整理稿，重复启动保持幂等', () => {
@@ -2007,6 +2280,13 @@ rmSync(cwd, { recursive: true, force: true })
       assert.equal(existsSync(join(ws, '.dsh-flowgate', 'scope.json')), false)
       assert.equal(JSON.stringify(JSON.parse(readFileSync(configFile, 'utf8'))).includes('writeGrants'), false)
     })
+    const longTitle = await act('start', { title: '标'.repeat(500), brief: '标题截断' }, 'long-title-start')
+    check('超长标题截断到 120 字符，不写进快照', () => {
+      assert.equal(longTitle.status, 200)
+      assert.equal(longTitle.body.title.length, 120)
+    })
+    // 这条流程只是参数校验的载体，立刻结束，免得抢走后面 Hub 的 currentFlow。
+    await act('cancel', {}, 'long-title-start')
     const tooLong = await act('start', { brief: 'x'.repeat(20001) }, 'overlong-start')
     check('启动明确拒绝超限需求且不静默截断', () => {
       assert.equal(tooLong.status, 409)
@@ -2031,6 +2311,27 @@ rmSync(cwd, { recursive: true, force: true })
       assert.equal(legacyPage.body.currentFlow.summary, brief)
       assert.equal(legacyPage.body.currentFlow.brief, brief)
       assert.deepEqual(legacyPageAgain.body.currentFlow, legacyPage.body.currentFlow)
+    })
+    // 冷恢复兜底：缺字段、坏字段、无法修复的快照都不能让整个工作台的流程功能崩掉。
+    const brokenId = 'f_broken000001'
+    writeFileSync(join(ws, '.dsh-flowgate', 'flows', brokenId + '.json'), JSON.stringify({
+      id: brokenId, sessionId: 'broken-session', cwd: ws, title: '残缺快照',
+      preset: 'turbo', stage: 'S9', finished: false,
+      scope: 'oops', doc: null, writeGrants: 'nope', shellGrant: true,
+    }))
+    writeFileSync(join(ws, '.dsh-flowgate', 'flows', 'f_noid.json'), JSON.stringify({ sessionId: 'x' }))
+    const brokenHost = makeHost(ws, 'broken-session')
+    const brokenState = await brokenHost.request('/api/flowgate/state?sessionId=broken-session')
+    const brokenHub = await brokenHost.request('/api/flowgate/hub/flows', { path: ws })
+    check('残缺快照冷恢复时补齐结构并撤销授权，无法修复的条目直接丢弃', () => {
+      assert.equal(brokenState.status, 200)
+      assert.equal(brokenState.body.active, true)
+      assert.equal(brokenState.body.stage, 'S1')
+      assert.equal(brokenState.body.preset, 'fast')
+      assert.equal(brokenState.body.shellGrant, false)
+      assert.deepEqual(brokenState.body.writeGrants, [])
+      assert.equal(brokenHub.status, 200)
+      assert.equal(brokenHub.body.flows.some((flow) => flow.id === 'f_noid'), false)
     })
   } finally {
     fs.renameSync = originalRename; syncBuiltinESMExports()
@@ -2648,6 +2949,22 @@ rmSync(cwd, { recursive: true, force: true })
     assert.match(doneGate.body.test.directions[0].points[1].excludeReason, /沙箱/)
   })
 }
+}
+
+// ---------------------------------------------------------------------------
+// 需求原文是 S1 唯一的分析依据：类型写错时必须报错，不能静默当空串。
+// 这条校验在 createFlow 里、不在 pre-execute 钩子上，所以要真的调工具。
+// 放在最后单独起一个 host：currentService 是模块级单例，中途再 apply 会顶掉前面的实例。
+// ---------------------------------------------------------------------------
+{
+  const typeCtx = makeHost(cwd, 'sess-typecheck')
+  const startWith = (args) => typeCtx.tool('flowgate_start', args).catch((error) => error)
+  const badBrief = await startWith({ title: '类型校验', brief: 12345 })
+  const badSummary = await startWith({ title: '类型校验', brief: '正常需求', summary: { a: 1 } })
+  check('需求原文与整理稿的类型错误被拒绝', () => {
+    assert.match(String(badBrief?.message ?? badBrief), /需求原文必须是字符串/)
+    assert.match(String(badSummary?.message ?? badSummary), /需求整理稿必须是字符串/)
+  })
 }
 
 console.log('\n全部通过：' + passed.length + ' 项')
