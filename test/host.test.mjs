@@ -2474,6 +2474,118 @@ rmSync(cwd, { recursive: true, force: true })
       }
     })
   }
+
+// ---------------------------------------------------------------------------
+// 部分重跑：回退只重置受影响阶段，已通过的结论留下来复用。
+// ---------------------------------------------------------------------------
+
+{
+  const sid = 'sess-carry'
+  const cx = makeHost(cwd, sid)
+  const act = (action, payload) => cx.request('/api/flowgate/action', { sessionId: sid, action, payload })
+  const state = () => cx.request('/api/flowgate/state?sessionId=' + sid)
+  const round = async (name, args, payload) => {
+    const pending = cx.tool(name, args)
+    await tick()
+    const done = await act('gate', payload)
+    assert.equal(done.status, 200, JSON.stringify(done.body))
+    return pending
+  }
+
+  await cx.tool('flowgate_start', { title: '部分重跑', preset: 'fast' })
+  const doc = cx.tool('flowgate_doc', {
+    html: '<html><body><p>复用</p></body></html>',
+    recommendedPreset: 'fast',
+    reason: '验部分重跑',
+    scope: {
+      files_expected_to_change: ['src/auth/session.ts'],
+      capabilities: ['会话过期检测'],
+      out_of_scope_explicitly: ['OAuth'],
+      acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
+    },
+  })
+  await tick()
+  await act('doc', { decision: 'approve' })
+  await doc
+
+  await round('flowgate_gate', {}, { decision: 'pass' })
+  await round('flowgate_review', {
+    angles: [{ id: 'correctness', name: '正确性', verdict: 'pass', findings: [] }],
+  }, { decision: 'pass' })
+
+  // S4 点「退回开发修复」：只该重置 S2 及之后，评审结论存成可复用产物。
+  const backGate = cx.tool('flowgate_gate', {})
+  await tick()
+  const back = await act('gate', { decision: 'back', to: 'S2' })
+  await backGate
+  const afterBack = await state()
+  check('部分重跑：回退到 S2 后保留上一轮评审结论', () => {
+    assert.equal(back.body.stage, 'S2')
+    // 门禁不能提前可点，所以本轮 review 仍要清空；结论只活在 carryOver 里。
+    assert.equal(afterBack.body.review, null)
+    assert.ok(afterBack.body.carryOver)
+    assert.equal(afterBack.body.carryOver.angles.length, 1)
+    assert.equal(afterBack.body.carryOver.angles[0].id, 'correctness')
+    assert.equal(afterBack.body.carryOver.angles[0].reusable, true)
+  })
+
+  // 重做 S2 后代码没再变：状态摘要要把可复用项点出来。
+  await round('flowgate_gate', {}, { decision: 'pass' })
+  const statusAfterRedo = await cx.tool('flowgate_status', {})
+  check('部分重跑：状态摘要点名可复用的角度', () => {
+    assert.match(statusAfterRedo.summary, /可复用/)
+    assert.match(statusAfterRedo.summary, /correctness/)
+    assert.match(statusAfterRedo.summary, /reusedAngles/)
+  })
+
+  // 直接传 reusedAngles：不重新评审，把上一轮结论并进来。
+  const reuseReview = cx.tool('flowgate_review', { angles: [], reusedAngles: ['correctness'] })
+  await tick()
+  const reusePass = await act('gate', { decision: 'pass' })
+  await reuseReview
+  const afterReuse = await state()
+  check('部分重跑：reusedAngles 直接复用上一轮角度结论', () => {
+    assert.equal(reusePass.status, 200)
+    assert.equal(afterReuse.body.review.angles.length, 1)
+    assert.equal(afterReuse.body.review.angles[0].reused, true)
+    assert.deepEqual(afterReuse.body.review.reused, ['correctness'])
+    // 复用过的条目要从 carryOver 里摘掉，不能拿同一条结论再复用一次。
+    assert.equal(afterReuse.body.carryOver, null)
+  })
+
+  // 环境受限的测试点必须写明原因，否则「排除」就是绕过验收的后门。
+  let exclusionError = null
+  try {
+    await cx.tool('flowgate_test', {
+      directions: [{ id: 'smoke', name: '冒烟验证', points: [{ point: '迁移后回滚可恢复', result: 'excluded' }] }],
+    })
+  } catch (error) {
+    exclusionError = error
+  }
+  check('环境受限的测试点缺原因时被拒', () => {
+    assert.match(String(exclusionError?.message), /必须用 excludeReason 写明环境限制原因/)
+  })
+
+  const excludedTest = cx.tool('flowgate_test', {
+    directions: [{
+      id: 'smoke',
+      name: '冒烟验证',
+      points: [
+        { point: '超过 30 分钟未活动后请求返回 401', result: 'pass' },
+        { point: '迁移后回滚可恢复', result: 'excluded', excludeReason: '沙箱没有数据库，无法执行迁移' },
+      ],
+    }],
+  })
+  await tick()
+  const doneGate = await act('gate', { decision: 'pass' })
+  await excludedTest
+  check('环境受限的点显式排除并单独计数', () => {
+    assert.equal(doneGate.status, 200)
+    assert.equal(doneGate.body.test.excluded, 1)
+    assert.equal(doneGate.body.test.directions[0].points[1].result, 'excluded')
+    assert.match(doneGate.body.test.directions[0].points[1].excludeReason, /沙箱/)
+  })
+}
 }
 
 console.log('\n全部通过：' + passed.length + ' 项')

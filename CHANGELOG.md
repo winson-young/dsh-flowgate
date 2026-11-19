@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **回退支持部分重跑**：此前回退到 S2 会把 S3/S4 的结论一并清空，改动只碰了一处也要整轮重评重测（实测每次 20 分钟以上）。现在回退时把上一轮结论存进 `flow.carryOver`，状态里按本轮改动文件逐条判定「可复用 / 需重跑」：角度看 finding 的 `file` 是否被本轮改到，测试方向按改动文件集合是否与上一轮一致整体判定。复用入口三处——`flowgate_review` 的 `reusedAngles`、`flowgate_test` 的 `reusedDirections`，以及 `flowgate_review_run` / `flowgate_test_run` 的默认自动复用（传 `reuse: false` 强制全量）。复用后该条从清单摘除，同一轮既复用又重报会直接报错，避免重复计入。界面在评审/测试卡片上标「N 项复用上轮」。
+- **测试要点支持显式排除环境受限项**：`flowgate_test` 的结果新增 `excluded`，必须配 `excludeReason`；只标 excluded 不给原因按 `uncovered` 处理。此前这类要点永远停在未覆盖，看起来像漏测。`test/host.test.mjs` 覆盖回退后可复用清单、`reusedAngles` 复用、缺 `excludeReason` 报错与带原因计数四项。
+
 - **S3 评审改为一次性全量边界枚举**：此前评审子代理只写「边界条件与错误路径」，实际容易发现一处就报一处，
   同一函数里其余没被覆盖的分支留在报告外。现在 `anglePrompt` 统一追加「全量枚举协议」：先从变更摘要列出被改函数
   （摘要只有文件时按文件内全部导出函数算），再按固定矩阵逐格判定——输入形态（带引号引用 / 普通引用 / 未引用）、
