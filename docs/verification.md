@@ -48,7 +48,7 @@
 
 实机验证期间发现并修掉的真实缺陷：
 
-- **变更性 shell 在 S2 被放行**：`rm -rf src/api` 真的执行了。现在 S2 也拒绝，并指引改用 `write` / `edit`。
+- **变更性 shell 在 S2 被放行**：`rm -rf src/api` 真的执行了。现在 S2 默认只允许只读 shell，变更性命令需要用户在「开发变更」卡片里显式勾选「允许执行构建/测试命令」；重定向、管道与解释器内联执行在任何阶段都拒绝。
 - **shell 工具名硬编码 `bash`**：本 profile 装的是 dsh-ops，真名 `ops_bash`，守卫对真实 shell 完全失效。
   改为 `SHELL_TOOLS` 集合后 `ops_bash` / `powershell` 等别名同样受管。
 - **升档清空开发规则**：`flow.overrides` 整体重置会把用户勾选的规则一起丢掉，现在只重置角度与方向。
