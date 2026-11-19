@@ -122,34 +122,33 @@ const saveScreenshot = async name => {
 }
 const startWithKeyboard = async theme => {
   const raw = '.fg-start-section textarea[aria-label="需求原文"]'
-  const title = '.fg-start-section input[aria-label="任务标题"]'
-  const summary = '.fg-start-section textarea[aria-label="需求整理稿"]'
+  const title = '.fg-start-title'
+  const summary = '.fg-start-summary .fg-requirement-text'
   const firstBrief = '会话超过 30 分钟未活动时，接口返回 401，并提供重新认证入口。'
   await fill(raw, firstBrief)
-  check('basic title and summary appear immediately', await evaluate('document.querySelector(' + JSON.stringify(title) + ').value.length>0 && document.querySelector(' + JSON.stringify(summary) + ').value===' + JSON.stringify(firstBrief)))
-  await ready('document.querySelector(".fg-start-section [role=status]")?.textContent.includes("已自动整理")')
+  check('generated title and summary appear without extra inputs', await evaluate('document.querySelector(' + JSON.stringify(title) + ').textContent.length>0 && document.querySelector(' + JSON.stringify(summary) + ').textContent===' + JSON.stringify(firstBrief) + ' && document.querySelectorAll(".fg-start-section input").length===0 && document.querySelectorAll(".fg-start-section textarea").length===1'))
+  await ready('document.querySelector(".fg-start-section [role=status]")?.textContent.includes("已自动生成")')
   check('debounced preparation uses raw requirement', await evaluate('window.fixtureRequests.some(r=>r.route.includes("/hub/prepare")&&r.body.brief===' + JSON.stringify(firstBrief) + ')'))
   await inspectLayout('requirement prepared')
+  await evaluate('document.activeElement?.blur()')
   await saveScreenshot('workspace')
   await evaluate('window.fixturePrepare.delay=1500')
   const oldBrief = '旧需求：保留 30 分钟与 401。'
   await fill(raw, oldBrief)
   await ready('window.fixtureRequests.some(r=>r.route.includes("/hub/prepare")&&r.body.brief===' + JSON.stringify(oldBrief) + ')')
-  await fill(title, '手动标题：会话恢复')
-  await fill(summary, '手动整理稿：保留 30 分钟、401 与 C:/Projects/atlas-console。')
   await evaluate('window.fixturePrepare.delay=80')
   const nextBrief = '新需求：超过 30 分钟返回 401，保留 C:/Projects/atlas-console。'
   await fill(raw, nextBrief)
-  await ready('window.fixturePreparePending===0 && window.fixtureRequests.some(r=>r.route.includes("/hub/prepare")&&r.body.brief===' + JSON.stringify(oldBrief) + ')')
-  check('late preparation cannot overwrite manual title and summary', await evaluate('document.querySelector(' + JSON.stringify(title) + ').value==="手动标题：会话恢复" && document.querySelector(' + JSON.stringify(summary) + ').value.startsWith("手动整理稿")'))
+  await ready('window.fixturePreparePending===0 && window.fixtureRequests.some(r=>r.route.includes("/hub/prepare")&&r.body.brief===' + JSON.stringify(nextBrief) + ')')
+  check('late preparation cannot overwrite newest generated content', await evaluate('document.querySelector(' + JSON.stringify(title) + ').textContent.startsWith("新需求") && document.querySelector(' + JSON.stringify(summary) + ').textContent.includes(' + JSON.stringify(nextBrief) + ')'))
   await evaluate('window.fixturePrepare.status="fallback"')
-  await click('重新整理需求')
-  await ready('document.querySelector(".fg-start-section [role=status]")?.textContent.includes("基础整理稿")')
-  check('fallback retains complete requirement and allows start', await evaluate('document.querySelector(' + JSON.stringify(raw) + ').value===' + JSON.stringify(nextBrief) + ' && document.querySelector(' + JSON.stringify(summary) + ').value===' + JSON.stringify(nextBrief) + ' && !' + button('开始需求分析') + '.disabled'))
+  await click('重新生成标题与整理稿')
+  await ready('document.querySelector(".fg-start-section [role=status]")?.textContent.includes("本地整理")')
+  check('fallback retains complete requirement and allows start', await evaluate('document.querySelector(' + JSON.stringify(raw) + ').value===' + JSON.stringify(nextBrief) + ' && document.querySelector(' + JSON.stringify(summary) + ').textContent===' + JSON.stringify(nextBrief) + ' && !' + button('开始需求分析') + '.disabled'))
   await evaluate('window.fixturePrepare.status="ready"')
-  await click('重新整理需求')
-  await ready('document.querySelector(".fg-start-section [role=status]")?.textContent.includes("已自动整理")')
-  check('explicit retry updates only unlocked summary', await evaluate('document.querySelector(' + JSON.stringify(title) + ').value==="手动标题：会话恢复" && document.querySelector(' + JSON.stringify(summary) + ').value.startsWith("目标与要求")'))
+  await click('重新生成标题与整理稿')
+  await ready('document.querySelector(".fg-start-section [role=status]")?.textContent.includes("已自动生成标题与整理稿。")')
+  check('explicit retry refreshes generated summary', await evaluate('document.querySelector(' + JSON.stringify(summary) + ').textContent.startsWith("目标与要求")'))
   if (theme === 'light') {
     await focus(raw); await key('Enter', 2)
   } else {
@@ -157,7 +156,7 @@ const startWithKeyboard = async theme => {
   }
   await ready('window.fixtureActions.some(a=>a.action==="start") && document.querySelector(".fg-current-flow")')
   const actions = await evaluate('window.fixtureActions.filter(a=>a.action==="start")')
-  check(theme === 'light' ? 'Ctrl+Enter starts once with original and summary' : 'Enter starts once with original and summary', actions.length === 1 && actions[0].payload.brief === nextBrief && actions[0].payload.summary.startsWith('目标与要求') && actions[0].payload.title === '手动标题：会话恢复')
+  check(theme === 'light' ? 'Ctrl+Enter starts once with original and summary' : 'Enter starts once with original and summary', actions.length === 1 && actions[0].payload.brief === nextBrief && actions[0].payload.summary.startsWith('目标与要求') && actions[0].payload.title.startsWith('新需求'))
   check('current flow shows summary and expandable original', await evaluate('document.querySelector(".fg-current-flow .fg-requirement-text")?.textContent.startsWith("目标与要求") && document.querySelector(".fg-current-flow .fg-requirement-original")?.textContent.includes("C:/Projects/atlas-console")'))
 }
 const inspectRules = async () => {
@@ -225,13 +224,17 @@ try {
     ws.addEventListener('error', event => { clearTimeout(timer); reject(Error('CDP WebSocket failed: ' + event.message)) }, { once: true })
   })
   await send('Runtime.enable'); await send('Page.enable')
+  // Each fixture starts at its own homepage rather than inheriting another case's navigation.
+  await send('Page.addScriptToEvaluateOnNewDocument', { source: "try { localStorage.removeItem('dsh-flowgate.hub.memory.v1') } catch {}" })
   await send('Page.bringToFront')
   await send('Emulation.setFocusEmulationEnabled', { enabled: true })
   const scenarios = [
     ...['idle', 'active', 'finished', 'cancelled'].map(state => ({ stage: 'workspace', state })),
     ...['home', 'rules', 'empty', 'missing', 'S1', 'S2', 'S3', 'S4', 'doc'].map(stage => ({ stage }))
   ]
-  for (const width of [1280, 768, 390]) for (const theme of ['light', 'dark']) for (const scenario of scenarios) {
+  const widths = [1280, 768, 390, 320, 264]
+  const themes = ['light', 'dark']
+  for (const width of widths) for (const theme of themes) for (const scenario of scenarios) {
     currentCase = { width, theme, ...scenario }
     try {
       await send('Emulation.setDeviceMetricsOverride', { width, height: 1000, deviceScaleFactor: 1, mobile: false })
@@ -280,7 +283,7 @@ try {
     }
   }
   const after = await json('/json/list')
-  const result = { preview: 'file fixtures, not deployed DSH', scenarios: scenarios.length * 6, layoutSnapshots: cases.length, checks: checks.length, failedChecks: checks.filter(item => !item.pass), errors, overflows: cases.filter(item => item.overflow.length), layoutIssues, screenshots, originalTabsPreserved: originalPages.every(page => after.some(item => item.id === page.id && item.url === page.url)) }
+  const result = { preview: 'file fixtures, not deployed DSH', scenarios: scenarios.length * widths.length * themes.length, layoutSnapshots: cases.length, checks: checks.length, failedChecks: checks.filter(item => !item.pass), errors, overflows: cases.filter(item => item.overflow.length), layoutIssues, screenshots, originalTabsPreserved: originalPages.every(page => after.some(item => item.id === page.id && item.url === page.url)) }
   console.log(JSON.stringify(result, null, 2))
   if (errors.length || result.overflows.length || layoutIssues.length) process.exitCode = 1
 } finally {
