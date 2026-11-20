@@ -6,6 +6,34 @@
 
 历史记录中的 `by: 'subagents'` 仅表明调用了子代理聚合入口；聚合报告通过、`blocking: 0` 或流程走完，均不能证明真实子代理成功执行并返回有效报告。下文原有结论保留，其证据范围受此限定。
 
+## 只读边界放宽与例外入口（2026-11-21）
+
+需求：把「命令执行范围限制」放宽到不阻碍评审与测试，同时不放弃默认拒绝。六条：内置测试方向可声明写权限；只读子代理可用只读 Git；scope 命令清单的无效条目在 S1 就报错；已授权命令放行 `2>&1` / `| tail` 这类无害收尾；只读子代理的 `run_code` 允许 `Promise.all` 并行只读；未登记的只读工具可由用户声明豁免。
+
+改动范围：`lib/index.js`（`SHELL_HARMLESS_SUFFIX` 与 `stripHarmlessSuffixes`、`SHELL_READONLY` 的 Git 分支、`readonlyDenial` 的 shell 与 `run_code` 分支、`PARALLEL_CALL` / `parseParallelCalls`、`normalizePendingScope` 的 `commandErrors`、`TOOL_ALLOW_*` / `normalizeToolAllowlist` / `isToolAllowlisted`、`declareDirectionWrite` / `setToolAllowlist` 动作与视图字段 `writeDeclared` / `toolAllowlist`）、`lib/client.js`（内置方向的写权限声明与撤销入口、「只读豁免」设置组）、`test/host.test.mjs`、`test/client.test.mjs`、`test/subagents.test.mjs`、`test/integration.test.mjs`、`README.md`、`docs/development.md`。
+
+| 验收项 | 状态 | 证据与限制 |
+| :--- | :--- | :--- |
+| AC-1 内置方向可声明写权限，撤销时连带撤销授权 | 通过 | `test/host.test.mjs` 的「内置方向也能声明写权限并在撤销时连带撤回授权」：`declareDirectionWrite` 后 `needsWrite === true`，`toggleWriteGrant` 后 `writeGrants` 含该 id，撤销声明后不再包含；未知 id 返回 409。`test/host.test.mjs` 另断言声明同时进入 `stageConfigs.S4.catalog`（设置弹窗读的是这份目录，不是 `directions`，两处不同步时界面看不出声明已生效）。`test/client.test.mjs` 覆盖声明入口是按钮而非勾选框（勾选框的 `checked` 写死会表现为「勾不动」）、点击提交 `enabled: true`、目录滞后时按 `view.directions` 实时状态渲染、面板直接显示流程里的原始声明列表（`directionWriteDeclared`），以及按钮「撤销写权限声明」提交的 `enabled: false` |
+| AC-2 只读子代理可用只读 Git，写 Git 仍拒 | 通过 | `test/subagents.test.mjs` 的「最终守卫默认拒绝未知、写入、任意 JS 与后台任务」断言 `git diff --stat` / `git status` / `git log --oneline -5` 放行；`test/integration.test.mjs` 的 AC-4 用例断言 `git push` / `git commit` / `git checkout` / `git diff \| tee out.txt` / `node -e` 仍拒 |
+| AC-3 scope 命令清单的无效条目在提交时报错 | 通过 | `test/host.test.mjs` 的「无法生效的命令条目在提交时就拒绝，不留待批准文档」：空条目、超 300 字、含解释器内联、超 20 条四类均 `assert.rejects`，且失败后 `stage === 'S1'`、`doc.pending === false` |
+| AC-4 无害输出后缀放行，真管道仍拒 | 通过 | `test/host.test.mjs` 的「无害输出后缀不算逃逸，剥掉后缀后仍按原命令判定」：`npm test 2>&1` / `npm test \| tail -n 20` / `npm test > /dev/null` 放行；`npm publish 2>&1` / `npm test \| rm -rf src` / `npm test 2>&1; touch x` 仍拒 |
+| AC-5 子代理 `run_code` 支持 `Promise.all` 并行只读 | 通过 | `test/subagents.test.mjs` 允许单行与多行两种 `Promise.all` 形状；拒绝夹写工具、夹 `run_code`、非严格 JSON、`.then` 链、先赋值再 `return` 五种形状 |
+| AC-6 未登记只读工具可由用户声明豁免，写工具与 shell 不可豁免 | 通过 | `test/host.test.mjs` 的「未登记工具默认拒，用户声明只读后放行」：`unlag_refresh` 默认拒、声明后放行；`write` 仍按 scope 判（S2 写 scope 内放行、越界拒）；S1 声明 `str_replace_editor` 仍拒；`ops_bash` 带豁免跑 `npm publish` 仍拒。`setToolAllowlist` 对 `write` / `ops_bash` / `run_code` / 非法名字返回 409，重复项去重后存一条。`test/client.test.mjs` 覆盖「只读豁免」面板的文案、初值与按行提交 |
+| AC-7 无回归 | 通过 | 八个测试入口整组退出码 0：内容快照 20、验收账本 24、运行版本 18、宿主 343、子代理 80、集成 33、客户端 223、安装 17，合计 758 项；`scripts/stamp-revisions.mjs --check` 输出 `Module revisions verified (6 modules).`，七个文件 `node --check` 通过 |
+
+### 已知未通过项
+
+无。
+
+### 真实视觉未覆盖
+
+客户端新增的「撤销写权限声明」按钮与「只读豁免」设置组只在 `test/client.test.mjs` 的组件树层面核对文案、初值与提交载荷，未在真实 DSH 工作台加载验证，不构成真实视觉通过证据。宿主侧的六条判定均有直接断言，但未在真实模型驱动的一次完整流程里端到端跑通。
+
+真机反馈一条已修：用户点「声明该方向需要写权限」时看不到任何反应。原因是该入口原本是 `checked: false` 写死的勾选框，提交成功后同一行立刻换成「已声明」状态，视觉上等于勾上就弹回；数据其实已经写入（`directionWriteDeclared` 与 `write.declared` 事件都在）。现改为按钮，并在非 S4 阶段不再摆灰着的「授权执行变更性命令」勾选框，只报「已声明需要写权限」状态。
+
+真机反馈第二条已修（更深的一层）：改完按钮后用户仍报「点了没反应也不消失」。真正原因在读取侧——设置弹窗读的是视图的 `stageConfigs.S4.catalog`，而该字段由裸 `stageConfig` 生成，没有合并 `flow.directionWriteDeclared`；只有 `view.directions` 与 `view.directionCatalog` 走了 `withDirectionWriteDeclared`。于是声明确实写进了流程（`f_08a11e91-55a` 的 `directionWriteDeclared: ["smoke"]` 与 `write.declared` 事件都在），弹窗那一行却永远显示「未声明」。修复：`lib/index.js:2428` 起 S4 的 `catalog` 与 `items` 都套 `withDirectionWriteDeclared`；`lib/client.js` 的目录映射同时合并 `needsWrite` / `writeDeclared`；并在「测试方向」面板顶部直接显示 `directionWriteDeclared` 原始列表，让用户能分清「数据没写进去」与「界面没刷新」。修复后客户端 223 项、全量 758 项通过，仍需用户在重启后的工作台重新点一次确认。
+
 ## dock 阶段流转按钮（2026-11-20）
 
 需求：输入框上方那一行（dock）要按当前阶段给出各自的流转按钮，文案与置灰样式跟左侧栏「流程工作台」一致；需求分析（S1）一旦开始，「开始需求分析」入口必须消失；流程开始后常驻的只能是结束入口；四个阶段可查看与可操作的按钮各不相同。

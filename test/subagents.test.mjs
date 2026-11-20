@@ -524,8 +524,11 @@ await test('最终守卫默认拒绝未知、写入、代理、消息、流程�
     }
     assert.equal((await host.check('ops_result', { action: 'page', sandbox_permissions: 'danger-full-access' }, id, true)).kind, 'deny')
     assert.equal((await host.check('ops_bash', { command: 'pwd' }, id, true)).kind, 'allow')
-    assert.equal((await host.check('ops_bash', { command: 'git diff --stat' }, id, true)).kind, 'deny')
-    assert.equal((await host.check('ops_bash', { command: 'git status' }, id, true)).kind, 'deny')
+    // 评审要核对「实际改了什么」，测试方向要核对工作区有没有多余改动；
+    // 原来只认精确的 pwd，子代理只能按文件正文猜。git 的这三个子命令只读。
+    for (const command of ['git diff --stat', 'git status', 'git log --oneline -5']) {
+      assert.equal((await host.check('ops_bash', { command }, id, true)).kind, 'allow', command)
+    }
     for (const args of [
       { script_path: 'script.sh' }, { command: 'node -e "process.exit(0)"' },
       { command: 'python -c "print(1)"' }, { command: 'pnpm test' },
@@ -550,6 +553,9 @@ await test('run_code 只允许单个严格 JSON 工具转发，嵌套目标受�
       'return await tools.ops_read_files({"files":[{"path":"x"}]})',
       'await tools.ops_stat({"path":"x"});',
       'return await tools.ops_result({"action":"page","id":"ref://fixture"});',
+      // 评审要一次核对十几个文件：并行只读是同一个判定的批量形式。
+      'return await Promise.all([tools.ops_stat({"path":"x"}), tools.ops_grep({"pattern":"a"})]);',
+      'return await Promise.all([\n  tools.ops_stat({"path":"x"}),\n  tools.read({"file_path":"src/auth/session.ts"}),\n]);',
     ]) assert.equal((await host.check('run_code', { code, description: 'fixture' }, id, true)).kind, 'allow', code)
     for (const code of [
       'return await tools.ops_write_file({"path":"x","content":"x","expectedRevision":"absent"});',
@@ -569,6 +575,12 @@ await test('run_code 只允许单个严格 JSON 工具转发，嵌套目标受�
       'return await tools.ops_stat({"path":"x","mode":"write"});',
       'return await tools.ops_stat({"path":"x","sandbox_permissions":"danger-full-access"});',
       'return await tools.ops_stat({"path":"x"});\nreturn 1;',
+      // 并行形状也要逐个过同一套判定：夹一个写工具或非严格 JSON 就整体拒绝。
+      'return await Promise.all([tools.ops_stat({"path":"x"}), tools.ops_write_file({"path":"x","content":"x"})]);',
+      'return await Promise.all([tools.ops_stat({"path":"x"}), tools.run_code({"code":"return 1"})]);',
+      'return await Promise.all([tools.ops_stat({path:"x"})]);',
+      'return await Promise.all([tools.ops_stat({"path":"x"})]).then(() => 1);',
+      'const r = await Promise.all([tools.ops_stat({"path":"x"})]); return r;',
     ]) assert.equal((await host.check('run_code', { code, description: 'fixture' }, id, true)).kind, 'deny', code)
     assert.equal((await host.check('run_code', { code: 'return await tools.ops_stat({"path":"x"});', sandbox_permissions: 'danger-full-access' }, id, true)).kind, 'deny')
     for (let index = 0; index < 2; index++) {

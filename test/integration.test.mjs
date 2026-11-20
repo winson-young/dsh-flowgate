@@ -277,7 +277,14 @@ await check('AC-4 子代理会话的写工具被工具层拒绝', async () => {
     }
     const shell = await guard('bash', { command: 'rm -rf src' }, 'sess-review')
     assert.equal(shell.kind, 'deny')
-    assert.equal((await guard('bash', { command: 'git diff' }, 'sess-review')).kind, 'deny')
+    // 只读 Git 放行：评审子代理要能自己看改了什么，否则只能按文件正文猜。
+    for (const command of ['git diff', 'git status', 'git log --oneline -5', 'git diff --stat']) {
+      assert.equal((await guard('bash', { command }, 'sess-review')).kind, 'allow', command + ' 应放行')
+    }
+    // 写 Git 与解释器内联仍然拒绝，放行范围只到只读子命令。
+    for (const command of ['git push', 'git commit -am x', 'git checkout main', 'git diff | tee out.txt', 'node -e "x"']) {
+      assert.equal((await guard('bash', { command }, 'sess-review')).kind, 'deny', command + ' 应拒绝')
+    }
     const readShell = await guard('bash', { command: 'pwd' }, 'sess-review')
     assert.equal(readShell.kind, 'allow')
     const read = await guard('read', { file_path: 'src/auth/session.ts' }, 'sess-review')

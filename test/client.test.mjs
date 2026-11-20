@@ -404,6 +404,18 @@ function nodeByClass(tree, className) {
   return found
 }
 
+function nodeByTag(tree, tag) {
+  let found = null
+  const walk = (node) => {
+    if (!node || found) return
+    if (Array.isArray(node)) { node.forEach(walk); return }
+    if (node.type === tag) { found = node; return }
+    if (node.children) walk(node.children)
+  }
+  walk(tree)
+  return found
+}
+
 function nodeByRole(tree, role) {
   let found = null
   const walk = (node) => {
@@ -2482,6 +2494,103 @@ await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
 }
 
 {
+  // 内置方向原来在设置面板里只有「启用」，没有任何声明写权限的入口：
+  // S4 想跑迁移脚本只能另建一个自定义方向，界面看不出差别。
+  posted = []
+  currentView = baseView('S4', {
+    directions: [{ id: 'smoke', name: '冒烟验证', points: ['能打开'], writeGranted: false }],
+    directionCatalog: [{ id: 'smoke', name: '冒烟验证', points: ['能打开'] }],
+  })
+  const renderer = await render(FlowDetail, {})
+  const tree = await openSettings(renderer)
+  const text = flat(tree)
+  await check('未声明写权限的方向给出声明入口', () => {
+    assert.ok(text.includes('声明该方向需要写权限'))
+  })
+  await check('声明入口是按钮，不是勾上就弹回去的勾选框', () => {
+    // 曾经这里是 checked 写死为 false 的勾选框：点一下立刻按 false 重渲染，用户只看到「勾不动」。
+    const labels = findTags(tree, 'label').filter((node) => flat(node).includes('声明该方向需要写权限'))
+    assert.equal(labels.length, 0, '声明入口不能是勾选框')
+  })
+  await check('点声明按钮提交 declareDirectionWrite', async () => {
+    await click(buttonByText(tree, '声明该方向需要写权限'))
+    await settle()
+    const call = posted.find((item) => item.action === 'declareDirectionWrite')
+    assert.ok(call, '必须提交 declareDirectionWrite')
+    assert.equal(call.payload.id, 'smoke')
+    assert.equal(call.payload.enabled, true)
+  })
+}
+
+{
+  // 后端曾经只把声明合并进 view.directions，没合并进 stageConfigs.S4.catalog；
+  // 设置弹窗读的是后者，于是点完声明这一行毫无变化，用户读成「点了没反应」。
+  currentView = baseView('S1', {
+    directions: [{ id: 'smoke', name: '冒烟验证', points: ['主路径可用'], needsWrite: true, writeDeclared: true, writeGranted: false }],
+    stageConfigs: {
+      S4: { ids: ['smoke'], catalog: [{ id: 'smoke', name: '冒烟验证', points: ['主路径可用'] }], source: 'flow' },
+    },
+  })
+  const renderer = await render(FlowDetail, {})
+  await openSettings(renderer)
+  const tree = await switchGroup(renderer, '测试方向')
+  await check('目录里的方向没有声明时，仍按流程实时状态显示已声明', () => {
+    const panel = flat(tree)
+    assert.ok(panel.includes('已声明需要写权限'), '必须以 view.directions 的实时状态为准')
+    assert.equal(panel.includes('声明该方向需要写权限'), false, '已声明的方向不能再摆声明入口')
+  })
+}
+
+{
+  // 声明过就永远撤回不了的话，内置方向会一直躺在 S4 授权清单里。
+  posted = []
+  currentView = baseView('S4', {
+    directions: [{ id: 'smoke', name: '冒烟验证', points: ['能打开'], needsWrite: true, writeDeclared: true, writeGranted: true }],
+    directionCatalog: [{ id: 'smoke', name: '冒烟验证', points: ['能打开'], needsWrite: true, writeDeclared: true }],
+  })
+  const renderer = await render(FlowDetail, {})
+  const tree = await openSettings(renderer)
+  await check('用户声明出来的写权限可以撤回', async () => {
+    assert.ok(hasButton(tree, '撤销写权限声明'))
+    await click(buttonByText(tree, '撤销写权限声明'))
+    await settle()
+    const call = posted.find((item) => item.action === 'declareDirectionWrite')
+    assert.ok(call, '必须提交 declareDirectionWrite')
+    assert.equal(call.payload.enabled, false)
+  })
+}
+
+{
+  // 宿主新增的只读工具（实机是刷新入口）默认被拒，界面上必须有个声明出口，
+  // 否则 Agent 只能记一条「未覆盖」，用户也看不出该去哪儿改。
+  posted = []
+  currentView = baseView('S1', { toolAllowlist: ['unlag_refresh'] })
+  const renderer = await render(FlowDetail, {})
+  await openSettings(renderer)
+  const tree = await switchGroup(renderer, '只读豁免')
+  const text = flat(tree)
+  await check('只读豁免面板列出已声明工具并说明边界', () => {
+    assert.ok(text.includes('额外只读工具'))
+    assert.ok(text.includes('写工具、shell 与流程自身的状态工具不能靠这里豁免'))
+    const area = nodeByTag(tree, 'textarea')
+    assert.ok(area, '必须有输入框')
+    assert.equal(area.props.value, 'unlag_refresh')
+  })
+  await check('保存豁免名单提交 setToolAllowlist 并去掉空行', async () => {
+    const area = nodeByTag(tree, 'textarea')
+    await act(async () => {
+      area.props.onChange({ target: { value: 'unlag_refresh\n\n  ops_extra  ' } })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    })
+    await click(buttonByText(renderer.toJSON(), '保存豁免名单'))
+    await settle()
+    const call = posted.find((item) => item.action === 'setToolAllowlist')
+    assert.ok(call, '必须提交 setToolAllowlist')
+    assert.deepEqual(call.payload.tools, ['unlag_refresh', 'ops_extra'])
+  })
+}
+
+{
   currentView = baseView('S2', {
     directions: [{ id: 'mig', name: '迁移回滚', points: ['回滚可恢复'], needsWrite: true, writeGranted: false }],
     directionCatalog: [{ id: 'mig', name: '迁移回滚', points: ['回滚可恢复'], needsWrite: true }],
@@ -2490,8 +2599,33 @@ await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
   await openSettings(renderer)
   // S2 默认组是开发规则，授权说明在测试方向组里。
   const text = flat(await switchGroup(renderer, '测试方向'))
-  await check('D2 非 S4 阶段授权勾选被禁用并说明原因', () => {
-    assert.ok(text.includes('写权限例外只在 S4 测试阶段开放'))
+  await check('D2 非 S4 阶段不摆灰勾选框，只报「已声明」状态', () => {
+    // 灰着的勾选框会被当成「点了没反应」，所以非 S4 阶段干脆不放勾选框。
+    assert.ok(text.includes('已声明需要写权限'))
+    assert.ok(text.includes('授权执行变更性命令只在 S4 测试阶段开放'))
+    assert.equal(text.includes('授权执行变更性命令该方向声明需要写权限'), false, '非 S4 不渲染授权勾选框本体')
+  })
+}
+
+{
+  // 界面渲染出问题时，用户没法判断是「数据没写进去」还是「界面没刷新」。
+  // 把流程里的原始声明列表直接摆出来，点完一眼能分清。
+  currentView = baseView('S1', { directionWriteDeclared: ['smoke', 'functional'] })
+  const renderer = await render(FlowDetail, {})
+  await openSettings(renderer)
+  const text = flat(await switchGroup(renderer, '测试方向'))
+  await check('测试方向面板直接显示流程里的原始声明列表', () => {
+    assert.ok(text.includes('本次流程已声明写权限：smoke、functional'), '要显示原始声明，不能只靠目录推断')
+  })
+}
+
+{
+  currentView = baseView('S1', { directionWriteDeclared: [] })
+  const renderer = await render(FlowDetail, {})
+  await openSettings(renderer)
+  const text = flat(await switchGroup(renderer, '测试方向'))
+  await check('没有任何声明时原始列表显示「无」', () => {
+    assert.ok(text.includes('本次流程已声明写权限：（无）'))
   })
 }
 

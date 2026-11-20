@@ -762,6 +762,58 @@ check('D2 用户显式勾选后授权生效', () => {
 const revoked = await postAction('toggleWriteGrant', { id: customDirId, enabled: false })
 check('D2 取消勾选后授权撤销', () => assert.deepEqual(revoked.body.writeGrants, []))
 
+// 内置方向原来没有写权限入口：S4 想跑迁移脚本只能新建一个自定义方向，
+// 于是「内置方向 + 需要写盘」这件事在界面上根本无法表达。
+const declaredState = await getState()
+const builtinDirId = declaredState.body.directions[0].id
+const declared = await postAction('declareDirectionWrite', { id: builtinDirId, enabled: true })
+check('内置方向可以在 S4 直接声明写权限', () => {
+  assert.equal(declared.status, 200)
+  assert.equal(declared.body.directions.find((d) => d.id === builtinDirId).needsWrite, true)
+})
+// 设置弹窗读的是 stageConfigs.S4.catalog，不是 directions。两处不同步时，
+// 用户点完声明界面毫无变化，按钮一直在，看起来就是「点了没反应」。
+const declaredCatalog = declared.body.stageConfigs.S4.catalog.find((entry) => entry.id === builtinDirId)
+check('声明同时反映到设置弹窗读的目录里', () => {
+  assert.equal(declaredCatalog.needsWrite, true, 'stageConfigs 的目录必须带上写权限声明')
+  assert.equal(declaredCatalog.writeDeclared, true, '界面要靠 writeDeclared 区分用户声明与方向自带')
+})
+const declaredGrant = await postAction('toggleWriteGrant', { id: builtinDirId, enabled: true })
+check('声明后内置方向可以授权，与自定义方向互不影响', () => {
+  assert.equal(declaredGrant.status, 200)
+  assert.ok(declaredGrant.body.writeGrants.includes(builtinDirId))
+})
+const undeclared = await postAction('declareDirectionWrite', { id: builtinDirId, enabled: false })
+check('撤回声明后写授权一起失效，不留悬空授权', () => {
+  assert.equal(undeclared.status, 200)
+  assert.ok(!undeclared.body.writeGrants.includes(builtinDirId))
+  assert.notEqual(undeclared.body.directions.find((d) => d.id === builtinDirId).needsWrite, true)
+})
+const unknownDeclare = await postAction('declareDirectionWrite', { id: 'no-such-direction', enabled: true })
+check('声明不存在方向被拒', () => assert.equal(unknownDeclare.status, 409))
+
+// 只读豁免：插件不认识的只读工具（实机是刷新入口）默认被拒，用户声明后放行。
+const allowBefore = await guard('unlag_refresh', {})
+check('未登记的工具默认被拒并指向豁免入口', () => {
+  assert.equal(allowBefore.kind, 'deny')
+  assert.match(allowBefore.reason, /只读豁免/)
+})
+const allowSet = await postAction('setToolAllowlist', { tools: ['unlag_refresh', 'unlag_refresh', '  '] })
+check('只读豁免名单去重去空并写进视图', () => {
+  assert.equal(allowSet.status, 200)
+  assert.deepEqual(allowSet.body.toolAllowlist, ['unlag_refresh'])
+})
+const allowAfter = await guard('unlag_refresh', {})
+check('声明后的工具被放行', () => assert.equal(allowAfter.kind, 'allow'))
+for (const tools of [['write'], ['ops_bash'], ['run_code'], ['bad name']]) {
+  const denied = await postAction('setToolAllowlist', { tools })
+  check('豁免名单不能声明 ' + tools[0], () => assert.equal(denied.status, 409))
+}
+const allowCleared = await postAction('setToolAllowlist', { tools: [] })
+check('清空豁免名单后恢复默认拒绝', () => {
+  assert.deepEqual(allowCleared.body.toolAllowlist, [])
+})
+
 // 流程结束前把授权打开，验证结束会清掉它（AC6）。
 const beforeFinishGrant = await postAction('toggleShellGrant', { enabled: true })
 check('AC6 前置：结束前命令授权为真', () => assert.equal(beforeFinishGrant.body.shellGrant, true))
@@ -3292,19 +3344,35 @@ for (const [kind, reason, expected] of [
       assert.match(s1Sneak.reason, /任意代码|无法核对/)
     })
 
+    const cmdHtml = '<html><body><p>命令清单</p></body></html>'
+    const cmdScope = (commands) => ({
+      files_expected_to_change: ['src/cmd.ts'],
+      commands,
+      capabilities: ['改 cmd.ts'],
+      out_of_scope_explicitly: [],
+      acceptance_criteria: [{ id: 'AC-1', when: '清单内命令', then: '不需要授权' }],
+    })
+    // 四类无效条目：空、超长、含逃逸、超量。全部在提交时拒绝，不留待批准文档。
+    for (const [commands, marker] of [
+      [['   '], /空命令条目/],
+      [['x'.repeat(400)], /超过 300 字/],
+      [['node -e "process.exit(0)"'], /永远不会被放行/],
+      [Array.from({ length: 25 }, (_, index) => 'cmd-' + index), /超过上限 20 条/],
+    ]) {
+      await assert.rejects(cx.tool('flowgate_doc', { html: cmdHtml, scope: cmdScope(commands) }), marker)
+    }
+    const cmdRejected = await cx.request('/api/flowgate/state?sessionId=sess-scope-cmd')
+    check('无法生效的命令条目在提交时就拒绝，不留待批准文档', () => {
+      assert.equal(cmdRejected.body.stage, 'S1')
+      assert.equal(cmdRejected.body.doc.pending, false)
+    })
     const cmdDoc = cx.tool('flowgate_doc', {
-      html: '<html><body><p>命令清单</p></body></html>',
+      html: cmdHtml,
       scope: {
         files_expected_to_change: ['src/cmd.ts'],
-        // 重复、空白、超长、超量都要在提交时收敛：清单长到没人逐条看就等于又一个空白授权。
-        commands: [
-          '  npm test  ',
-          'npm test',
-          'npm run *',
-          '   ',
-          'x'.repeat(400),
-          ...Array.from({ length: 25 }, (_, index) => 'cmd-' + index),
-        ],
+        // 无效条目必须在 S1 就报错。原来空白与超长会被静默剔掉、`node -e *` 会被安静存下来：
+        // 界面显示「已经授权」，实际每次都被逃逸检查拦掉，用户与 Agent 都以为放行过了。
+        commands: ['  npm test  ', 'npm test', 'npm run *'],
         capabilities: ['改 cmd.ts'],
         out_of_scope_explicitly: [],
         acceptance_criteria: [{ id: 'AC-1', when: '清单内命令', then: '不需要授权' }],
@@ -3313,13 +3381,8 @@ for (const [kind, reason, expected] of [
     await tick()
     const approvedCmd = await act('doc', { decision: 'approve' })
     await cmdDoc
-    check('scope 命令清单规范化：去空、去重、截断到 300 字、最多 20 条', () => {
-      const list = approvedCmd.body.scope.data.in_scope.commands
-      assert.equal(list.length, 20)
-      assert.equal(list[0], 'npm test')
-      assert.equal(list[1], 'npm run *')
-      assert.equal(list[2].length, 300)
-      assert.equal(new Set(list).size, list.length)
+    check('scope 命令清单规范化：去空、去重、保留原顺序', () => {
+      assert.deepEqual(approvedCmd.body.scope.data.in_scope.commands, ['npm test', 'npm run *'])
     })
 
     const listExact = await cx.guard('bash', { command: 'npm test' })
@@ -3385,6 +3448,26 @@ for (const [kind, reason, expected] of [
     check('前缀通配只认开头，空白条目不会放行任何命令', () => {
       assert.ok(shellDenial(s4, { command: 'docker npm run build' }))
       assert.ok(shellDenial(flowOf('S4', ['   ']), { command: 'npm test' }))
+    })
+    // 收尾写法不换执行体、不写盘：卡住它们只会让已授权的测试命令永远跑不了。
+    check('无害输出后缀不算逃逸，剥掉后缀后仍按原命令判定', () => {
+      assert.equal(shellDenial(s4, { command: 'npm test 2>&1' }), null)
+      assert.equal(shellDenial(s4, { command: 'npm test | tail -n 20' }), null)
+      assert.equal(shellDenial(s4, { command: 'npm test > /dev/null' }), null)
+      assert.ok(shellDenial(s4, { command: 'npm publish 2>&1' }), '换了命令体照样拒')
+      assert.ok(shellDenial(s4, { command: 'npm test | rm -rf src' }), '管道接写命令照样拒')
+      assert.ok(shellDenial(s4, { command: 'npm test 2>&1; touch x' }), '分号拼接照样拒')
+    })
+    // 只读豁免：插件不认识的工具默认拒，用户声明后放行。写工具与 shell 不接受这种豁免。
+    check('未登记工具默认拒，用户声明只读后放行', () => {
+      const base = flowOf('S2', ['npm test'])
+      assert.match(scopeDenial(base, 'unlag_refresh', {}), /只读登记表/)
+      assert.equal(scopeDenial({ ...base, toolAllowlist: ['unlag_refresh'] }, 'unlag_refresh', {}), null)
+      // 写工具仍然按 scope 判：S2 里写 scope 内的文件本来就允许，写 scope 外照样拒。
+      assert.equal(scopeDenial({ ...base, toolAllowlist: ['write'] }, 'write', { path: 'src/a.ts' }), null)
+      assert.ok(scopeDenial({ ...base, toolAllowlist: ['write'] }, 'write', { path: 'src/b.ts' }))
+      assert.ok(scopeDenial({ ...flowOf('S1', []), toolAllowlist: ['str_replace_editor'] }, 'str_replace_editor', { path: 'src/a.ts' }))
+      assert.ok(scopeDenial({ ...base, toolAllowlist: ['ops_bash'] }, 'ops_bash', { command: 'npm publish' }))
     })
   } finally {
     rmSync(stageCwd, { recursive: true, force: true })
