@@ -864,6 +864,7 @@ await check('阶段提示：各阶段左侧内容保持两行，右侧独立承�
     const head = nodeByClass(content, 'fg-hint-head')
     assert.ok(nodeByClass(head, 'fg-hint-title'), stage + ' 标题保留在左侧第一行')
     assert.ok(nodeByClass(head, 'fg-hint-elapsed'), stage + ' 时长保留在左侧第一行')
+    assert.deepEqual(head.children.map((node) => node.props.className), ['fg-hint-elapsed', 'fg-hint-title'], stage + ' 计时应贴在标题左侧')
     assert.ok(nodeByClass(content, 'fg-hint-info'), stage + ' 阶段详情保留在左侧第二行')
     assert.equal(nodeByClass(content, 'fg-hint-actions'), null, '按钮不应挤进左侧内容')
     assert.ok(nodeByClass(hint, 'fg-hint-actions'), stage + ' 右侧应有操作按钮')
@@ -881,7 +882,8 @@ function quickDialog(renderer) { return findTags(renderer.toJSON(), 'dialog')[0]
 
 await check('阶段提示：左右列自适应、按钮换排且颜色区分（样式契约）', async () => {
   const css = styleNodes[0].textContent
-  assert.match(css, /\.fg-hint\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*repeat\(auto-fit, minmax\(min\(100%, 340px\), 1fr\)\);[^}]*align-items:\s*center;/)
+  assert.match(css, /\.fg-hint\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(0, 1fr\) fit-content\(65%\);[^}]*align-items:\s*center;/)
+  assert.match(css, /@media \(max-width: 640px\) \{\s*\.fg-hint \{ grid-template-columns: minmax\(0, 1fr\); \}\s*\.fg-hint-actions \{ justify-content: flex-start; \}/)
   assert.match(css, /\.fg-hint-content\s*\{[^}]*flex-direction:\s*column;[^}]*justify-content:\s*center;/)
   assert.match(css, /\.fg-hint-title\s*\{[^}]*min-width:\s*0;[^}]*text-overflow:\s*ellipsis;/)
   assert.match(css, /\.fg-hint-actions\s*\{[^}]*justify-content:\s*flex-end;[^}]*flex-wrap:\s*wrap;/)
