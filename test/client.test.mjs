@@ -755,7 +755,7 @@ await check('阶段提示：没有流程、已结束或已放弃时仅保留快�
 await check('阶段提示：dock 给出本阶段的流转按钮，四个阶段各不相同', async () => {
   const labels = (tree) => buttons(nodeByClass(tree, 'fg-hint-actions') || tree).map((node) => flat(node))
   const cases = [
-    ['S1', { doc: { html: '<p>需求</p>', pending: true } }, ['批准并冻结 scope', '修改需求', '跳过评审，直接开发', '放弃这次流程']],
+    ['S1', { doc: { html: '<p>需求</p>', pending: true } }, ['需求文档', '批准并冻结 scope', '修改需求', '跳过评审，直接开发', '放弃这次流程']],
     ['S2', {}, ['完成开发', '跳过门禁，直接评审', '回到需求分析调整 scope', '放弃这次流程']],
     ['S3', {}, ['通过评审，进入测试', '退回开发修复', '跳过评审，直接测试', '放弃这次流程']],
     ['S4', { acceptance: { items: [{ id: 'AC-1', status: 'pass', evidence: '日志' }], counts: { total: 1, pass: 1, fail: 0, uncovered: 0, pending: 0 } } }, ['验收通过，结束流程', '退回开发修复', '跳过测试门禁', '放弃这次流程']],
@@ -856,6 +856,91 @@ await check('阶段提示：投递失败要留下可诊断的错误行，认不�
 })
 
 function quickDialog(renderer) { return findTags(renderer.toJSON(), 'dialog')[0] || null }
+
+await check('快捷文档：提交后才可点击独立预览，关闭不触发门禁', async () => {
+  currentView = baseView('S1', { doc: { html: '<h1>验收标准</h1>', pending: true } }); posted = []
+  const renderer = await render(stageHint, {})
+  assert.equal(quickDialog(renderer), null, '报告完成后不自动弹窗')
+  await click(buttonByText(renderer.toJSON(), '需求文档'))
+  const dialog = quickDialog(renderer)
+  assert.equal(dialog.props['aria-modal'], 'true')
+  assert.equal(findTags(dialog, 'iframe')[0].props.srcDoc, currentView.doc.html)
+  await click(buttonByText(dialog, '关闭'))
+  assert.equal(quickDialog(renderer), null)
+  assert.equal(posted.length, 0)
+  currentView = baseView('S1')
+  assert.equal(buttons((await render(stageHint, {})).toJSON()).some((node) => flat(node) === '需求文档'), false)
+})
+
+await check('快捷评审：阻塞与建议分别列出，报告存在时才显示入口', async () => {
+  currentView = baseView('S3', { review: { counts: { blocking: 1, advisories: 2 }, angles: [{ findings: [
+    { severity: 'MAJOR', blocking: true, file: 'lib/client.js', ac: 'AC-1', summary: '阻塞问题' },
+    { severity: 'CRITICAL', blocking: false, file: 'elsewhere.js', summary: '范围外建议' },
+    { severity: 'MINOR', blocking: false, file: 'lib/client.js', summary: '次要建议' },
+  ] }] } })
+  const renderer = await render(stageHint, {})
+  assert.equal(quickDialog(renderer), null)
+  await click(buttonByText(renderer.toJSON(), '评审结果 · 1 阻塞 / 2 建议'))
+  const dialog = quickDialog(renderer)
+  assert.match(flat(dialog), /阻塞项 · 1.*阻塞问题.*建议项 · 2.*范围外建议.*次要建议/)
+  assert.equal(findTags(dialog, 'h2')[0].props.id, dialog.props['aria-labelledby'])
+  await click(buttonByText(dialog, '关闭'))
+  assert.equal(quickDialog(renderer), null)
+  assert.equal(buttons((await render(stageHint, {})).toJSON()).some((node) => flat(node).startsWith('测试结果')), false)
+})
+
+await check('快捷测试：区分失败、未覆盖、环境受限并保留原因', async () => {
+  currentView = baseView('S4', {
+    test: { directions: [{ name: '回归', points: [
+      { result: 'fail', point: '提交失败', detail: '返回 500' },
+      { result: 'uncovered', point: '窄屏测量', detail: '宿主未认证' },
+      { result: 'excluded', point: '原生弹窗', excludeReason: '缺少桌面宿主' },
+      { result: 'pass', point: '正常路径' },
+    ] }] },
+    acceptance: { items: [{ id: 'AC-4', status: 'fail', reason: '缺少截图' }] },
+  })
+  const renderer = await render(stageHint, {})
+  assert.equal(quickDialog(renderer), null)
+  await click(buttonByText(renderer.toJSON(), '测试结果 · 1 失败 / 1 未覆盖 / 1 受限'))
+  const text = flat(quickDialog(renderer))
+  for (const value of ['未通过 · 2', '提交失败', '返回 500', 'AC-4', '缺少截图', '未覆盖 · 1', '窄屏测量', '环境受限 · 1', '原生弹窗', '缺少桌面宿主']) assert.ok(text.includes(value), value + ' 未出现：' + text)
+  assert.ok(!text.includes('正常路径'))
+  await click(buttonByText(quickDialog(renderer), '关闭'))
+  assert.equal(quickDialog(renderer), null)
+})
+
+await check('报告弹窗：进入顶层并在 Esc 和关闭按钮后归还触发按钮焦点', async () => {
+  currentView = baseView('S2', { doc: { html: '<p>文档</p>' } })
+  let focused = null, opened = 0
+  const trigger = { focus() { focused = trigger } }
+  const mock = (element) => {
+    if (element.type === 'button' && element.props['aria-haspopup'] === 'dialog' && element.props.className === 'fg-hint-btn') return trigger
+    if (element.type === 'dialog') return { open: false, showModal() { this.open = true; opened += 1 } }
+    if (element.props.className === 'fg-modal-card') return { focus() {} }
+    return null
+  }
+  let renderer
+  await act(async () => { renderer = TestRenderer.create(h(stageHint, { sessionId: 'report-focus' }), { createNodeMock: mock }) })
+  try {
+    await settle()
+    const open = async () => {
+      await act(async () => {
+        buttonByText(renderer.toJSON(), '需求文档').props.onClick({ currentTarget: trigger })
+      })
+      assert.ok(quickDialog(renderer))
+    }
+    await open()
+    assert.equal(opened, 1)
+    await click(buttonByText(quickDialog(renderer), '关闭'))
+    assert.equal(quickDialog(renderer), null)
+    assert.equal(focused, trigger)
+    focused = null
+    await open()
+    await act(async () => { pressEscape() })
+    assert.equal(quickDialog(renderer), null)
+    assert.equal(focused, trigger)
+  } finally { await act(async () => { renderer.unmount() }) }
+})
 
 await check('快捷需求：关闭保留草稿和档位，切会话关闭并隔离草稿', async () => {
   currentView = baseView('S1', { active: false, workspace: { flow: null } })
