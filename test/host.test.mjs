@@ -316,7 +316,7 @@ check('S1 阶段不能授权执行变更性命令', () => assert.equal(earlyShel
 // 文档与 scope 都会原样进快照、每次全量写盘：体积不设上限，一次提交就能让流程卡死。
 {
   const minimalScope = {
-    files_expected_to_change: ['src/auth/session.ts'],
+    commands: [], files_expected_to_change: ['src/auth/session.ts'],
     capabilities: ['体积校验'],
     out_of_scope_explicitly: [],
     acceptance_criteria: [{ id: 'AC-1', when: '体积超限', then: '提交被拒绝' }],
@@ -337,7 +337,7 @@ check('S1 阶段不能授权执行变更性命令', () => assert.equal(earlyShel
 const scopeInput = {
   // P0-4：scope 由 Agent 自报。绝对路径与项目根之外的条目必须在提交时就被剔除，
   // 否则 normalizeTarget 会把绝对路径原样返回，等于给任意文件开通行证。
-  files_expected_to_change: ['src/auth/session.ts', '../outside/evil.ts', 'D:/absolute/evil.ts'],
+  commands: [], files_expected_to_change: ['src/auth/session.ts', '../outside/evil.ts', 'D:/absolute/evil.ts'],
   capabilities: ['会话过期检测', '过期后返回 401'],
   out_of_scope_explicitly: ['OAuth 第三方登录', '前端 UI 改动'],
   acceptance_criteria: [
@@ -784,7 +784,7 @@ const started2 = await runTool('flowgate_start', { title: '第二个任务', pre
 check('新流程从 S1 开始', () => assert.equal(started2.stage, 'S1'))
 const docPending2 = runTool('flowgate_doc', {
   html: '<!doctype html><html><body>跳过路径</body></html>',
-  scope: { ...scopeInput, files_expected_to_change: ['src/auth/session.ts'] },
+  scope: { ...scopeInput, commands: [], files_expected_to_change: ['src/auth/session.ts'] },
 })
 await tick()
 const skipped = await postAction('doc', { decision: 'skip' })
@@ -859,7 +859,7 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
     recommendedPreset: 'fast',
     reason: '只验回退深度',
     scope: {
-      files_expected_to_change: ['src/auth/session.ts'],
+      commands: [], files_expected_to_change: ['src/auth/session.ts'],
       capabilities: ['会话过期检测'],
       out_of_scope_explicitly: ['OAuth'],
       acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
@@ -1081,7 +1081,7 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
   const docNoShell = noShellCtx.tool('flowgate_doc', {
     html: '<!doctype html><html><body><h1>兜底采集</h1></body></html>',
     scope: {
-      files_expected_to_change: ['a.txt'],
+      commands: [], files_expected_to_change: ['a.txt'],
       capabilities: ['改 a.txt'],
       out_of_scope_explicitly: [],
       acceptance_criteria: [{ id: 'AC-1', when: '改完', then: '能采到变更' }],
@@ -1151,7 +1151,7 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
   const pendingDoc = cx.tool('flowgate_doc', {
     html: '<html><body><p>取消</p></body></html>',
     scope: {
-      files_expected_to_change: ['src/a.ts'],
+      commands: [], files_expected_to_change: ['src/a.ts'],
       capabilities: ['改 a.ts'],
       out_of_scope_explicitly: [],
       acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
@@ -1211,7 +1211,7 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
     await cx.tool('flowgate_doc', {
       html: '<html><body><p>作废</p></body></html>',
       scope: {
-        files_expected_to_change: ['src/a.ts'],
+        commands: [], files_expected_to_change: ['src/a.ts'],
         capabilities: ['改 a.ts'],
         out_of_scope_explicitly: [],
         acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
@@ -1268,7 +1268,7 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
   const docGate = gx.tool('flowgate_doc', {
     html: '<html><body><p>取消</p></body></html>',
     scope: {
-      files_expected_to_change: ['src/a.ts'],
+      commands: [], files_expected_to_change: ['src/a.ts'],
       capabilities: ['改 a.ts'],
       out_of_scope_explicitly: [],
       acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
@@ -1309,7 +1309,7 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
     const gxDoc = gx.tool('flowgate_doc', {
       html: '<html><body><p>授权</p></body></html>',
       scope: {
-        files_expected_to_change: ['src/g.ts'],
+        commands: [], files_expected_to_change: ['src/g.ts'],
         capabilities: ['改 g.ts'],
         out_of_scope_explicitly: [],
         acceptance_criteria: [{ id: 'AC-1', when: '授权后放弃', then: '开关清空' }],
@@ -1378,7 +1378,7 @@ rmSync(cwd, { recursive: true, force: true })
   const docPending = cx.tool('flowgate_doc', {
     html: '<html><body><h1>实时进度</h1></body></html>',
     scope: {
-      files_expected_to_change: ['src/auth/session.ts'],
+      commands: [], files_expected_to_change: ['src/auth/session.ts'],
       capabilities: ['会话过期检测'],
       out_of_scope_explicitly: [],
       acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
@@ -1417,7 +1417,7 @@ rmSync(cwd, { recursive: true, force: true })
   const pending = cx.tool('flowgate_doc', {
     html: '<html><body><h1>中断</h1></body></html>',
     scope: {
-      files_expected_to_change: ['src/auth/session.ts'],
+      commands: [], files_expected_to_change: ['src/auth/session.ts'],
       capabilities: ['会话过期检测'],
       out_of_scope_explicitly: [],
       acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
@@ -1460,7 +1460,7 @@ rmSync(cwd, { recursive: true, force: true })
   const first = makeHost(cwd, 'sess-reboot')
   await first.tool('flowgate_start', { title: '重启恢复', preset: 'fast' })
   const scope = {
-    files_expected_to_change: ['src/auth/session.ts'],
+    commands: [], files_expected_to_change: ['src/auth/session.ts'],
     capabilities: ['会话过期检测'],
     out_of_scope_explicitly: [],
     acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
@@ -1509,7 +1509,7 @@ rmSync(cwd, { recursive: true, force: true })
   const cx = makeHost(cwd, 'sess-race')
   await cx.tool('flowgate_start', { title: '等待竞争', preset: 'fast' })
   const scope = {
-    files_expected_to_change: ['src/auth/session.ts'],
+    commands: [], files_expected_to_change: ['src/auth/session.ts'],
     capabilities: ['会话过期检测'],
     out_of_scope_explicitly: [],
     acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
@@ -1549,7 +1549,7 @@ rmSync(cwd, { recursive: true, force: true })
   const cx = makeHost(cwd, 'sess-gate')
   await cx.tool('flowgate_start', { title: '门禁中断', preset: 'fast' })
   const scope = {
-    files_expected_to_change: ['src/auth/session.ts'],
+    commands: [], files_expected_to_change: ['src/auth/session.ts'],
     capabilities: ['会话过期检测'],
     out_of_scope_explicitly: [],
     acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
@@ -1612,7 +1612,7 @@ rmSync(cwd, { recursive: true, force: true })
   const cx = makeHost(cwd, 'sess-skip')
   await cx.tool('flowgate_start', { title: '跳过门禁文案', preset: 'fast' })
   const scope = {
-    files_expected_to_change: ['src/auth/session.ts'],
+    commands: [], files_expected_to_change: ['src/auth/session.ts'],
     capabilities: ['会话过期检测'],
     out_of_scope_explicitly: [],
     acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
@@ -1660,7 +1660,7 @@ rmSync(cwd, { recursive: true, force: true })
   const cx = makeHost(cwd, 'sess-revise')
   await cx.tool('flowgate_start', { title: '修改需求', preset: 'fast' })
   const scope = {
-    files_expected_to_change: ['src/auth/session.ts'],
+    commands: [], files_expected_to_change: ['src/auth/session.ts'],
     capabilities: ['会话过期检测'],
     out_of_scope_explicitly: [],
     acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
@@ -1706,7 +1706,7 @@ rmSync(cwd, { recursive: true, force: true })
   const cx = makeHost(cwd, sid)
   await cx.tool('flowgate_start', { title: '退回唤醒', preset: 'fast' })
   const scope = {
-    files_expected_to_change: ['src/auth/session.ts'],
+    commands: [], files_expected_to_change: ['src/auth/session.ts'],
     capabilities: ['会话过期检测'],
     out_of_scope_explicitly: [],
     acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
@@ -1753,7 +1753,7 @@ rmSync(cwd, { recursive: true, force: true })
   const cx = makeHost(cwd, sid)
   await cx.tool('flowgate_start', { title: '退回不重复', preset: 'fast' })
   const scope = {
-    files_expected_to_change: ['src/auth/session.ts'],
+    commands: [], files_expected_to_change: ['src/auth/session.ts'],
     capabilities: ['会话过期检测'],
     out_of_scope_explicitly: [],
     acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
@@ -1807,7 +1807,7 @@ rmSync(cwd, { recursive: true, force: true })
   const cx = makeHost(cwd, sid)
   await cx.tool('flowgate_start', { title: '结束唤醒', preset: 'fast' })
   const scope = {
-    files_expected_to_change: ['src/auth/session.ts'],
+    commands: [], files_expected_to_change: ['src/auth/session.ts'],
     capabilities: ['会话过期检测'],
     out_of_scope_explicitly: [],
     acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
@@ -2480,7 +2480,7 @@ rmSync(cwd, { recursive: true, force: true })
     for (const id of [sid, foreignSid]) {
       await call('flowgate_start', { title: '授权恢复验证', preset: 'fast' }, id)
       const doc = call('flowgate_doc', { html: '<html><body>授权恢复</body></html>', scope: {
-        files_expected_to_change: ['src/auth/session.ts'], capabilities: ['授权恢复'], out_of_scope_explicitly: [],
+        commands: [], files_expected_to_change: ['src/auth/session.ts'], capabilities: ['授权恢复'], out_of_scope_explicitly: [],
         acceptance_criteria: [{ id: 'AC-1', when: '配置变化', then: '旧授权不会复活' }],
       } }, id)
       await tick(); assert.equal((await act('doc', { decision: 'approve' }, id)).status, 200); await doc
@@ -2990,7 +2990,7 @@ rmSync(cwd, { recursive: true, force: true })
     recommendedPreset: 'fast',
     reason: '验部分重跑',
     scope: {
-      files_expected_to_change: ['src/auth/session.ts'],
+      commands: [], files_expected_to_change: ['src/auth/session.ts'],
       capabilities: ['会话过期检测'],
       out_of_scope_explicitly: ['OAuth'],
       acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
@@ -3115,7 +3115,7 @@ rmSync(cwd, { recursive: true, force: true })
     const s1Doc = sx.tool('flowgate_doc', {
       html: '<html><body><p>回退授权</p></body></html>',
       scope: {
-        files_expected_to_change: ['src/s1.ts'],
+        commands: [], files_expected_to_change: ['src/s1.ts'],
         capabilities: ['改 s1.ts'],
         out_of_scope_explicitly: [],
         acceptance_criteria: [{ id: 'AC-1', when: '退回 S1', then: '变更性命令仍被拒' }],
@@ -3288,7 +3288,7 @@ rmSync(cwd, { recursive: true, force: true })
     const doc = px.tool('flowgate_doc', {
       html: '<html><body><p>归属口径</p></body></html>',
       scope: {
-        files_expected_to_change: ['src/gate.ts'],
+        commands: [], files_expected_to_change: ['src/gate.ts'],
         capabilities: ['改 gate.ts'],
         out_of_scope_explicitly: [],
         acceptance_criteria: [{ id: 'AC-1', when: '并发调用', then: '只刷新一次令牌' }],
@@ -3468,7 +3468,7 @@ async function provenanceFixture(label) {
   const doc = px.tool('flowgate_doc', {
     html: '<html><body><p>按内容与执行证据验收</p></body></html>',
     scope: {
-      files_expected_to_change: ['src/session.mjs', 'src/helper.mjs'],
+      commands: [], files_expected_to_change: ['src/session.mjs', 'src/helper.mjs'],
       capabilities: ['过期请求拒绝'], out_of_scope_explicitly: [],
       acceptance_criteria: [{ id: 'AC-1', when: '会话过期后发请求', then: '返回 401', verification: { method: 'unit', procedure: '调用 response(true) 并断言状态码' } }],
     },
@@ -3687,6 +3687,65 @@ for (const evidenceCase of ['missing', 'empty', 'valid', 'nonpass-point']) {
   } finally {
     rmSync(ws, { recursive: true, force: true })
   }
+}
+
+// S1 清单要在提交时校验，并在冻结前重验旧待批准数据。
+for (const listedCommands of [[], ['node --check lib/index.js']]) {
+  const ws = mkdtempSync(join(tmpdir(), 'flowgate-scope-shape-'))
+  const sid = 'scope-shape-' + listedCommands.length
+  try {
+    const host = makeHost(ws, sid)
+    await host.tool('flowgate_start', { title: '清单结构验证' })
+    const base = { files_expected_to_change: ['src/gate.ts'], commands: listedCommands, capabilities: [],
+      out_of_scope_explicitly: [], acceptance_criteria: [{ id: 'AC-1', when: '提交', then: '冻结正确清单' }] }
+    const html = '<html><body><p>清单校验</p></body></html>'
+    const invalid = [
+      [{ in_scope: { files_expected_to_change: base.files_expected_to_change, commands: listedCommands },
+        capabilities: [], out_of_scope_explicitly: [], acceptance_criteria: base.acceptance_criteria }, /scope.files_expected_to_change/],
+      [{ ...base, files_expected_to_change: undefined }, /scope.files_expected_to_change/],
+      [{ ...base, commands: undefined }, /scope.commands/],
+      [{ ...base, files_expected_to_change: [] }, /没有有效的项目内文件/],
+      [{ ...base, files_expected_to_change: ['../outside.ts'] }, /没有有效的项目内文件/],
+    ]
+    for (const [scope, error] of invalid) {
+      await assert.rejects(host.tool('flowgate_doc', { html, scope }), error)
+      const state = (await host.request('/api/flowgate/state?sessionId=' + sid)).body
+      check('无效清单在提交时拒绝且不留下待批准文档：' + error + '/' + listedCommands.length, () => {
+        assert.equal(state.stage, 'S1')
+        assert.equal(state.doc.pending, false)
+      })
+    }
+    const pending = host.tool('flowgate_doc', { html, scope: base })
+    await tick()
+    const before = (await host.request('/api/flowgate/state?sessionId=' + sid)).body
+    check('合法清单保留显式的命令数组：' + listedCommands.length, () => {
+      assert.deepEqual(before.doc.pendingScope.commands, listedCommands)
+      assert.deepEqual(before.doc.pendingScope.files_expected_to_change, ['src/gate.ts'])
+    })
+    const live = currentService().get(sid)
+    const saved = live.pendingScope
+    live.pendingScope = { ...saved, files_expected_to_change: [] }
+    for (const decision of ['approve', 'skip']) {
+      const denied = await host.request('/api/flowgate/action', { sessionId: sid, action: 'doc', payload: { decision } })
+      check('旧待批准空清单不能在 ' + decision + ' 时冻结：' + listedCommands.length, () => {
+        assert.equal(denied.status, 409)
+        assert.match(denied.body.error, /没有有效的项目内文件/)
+        assert.equal(live.stage, 'S1')
+        assert.equal(live.scope.frozen, false)
+      })
+    }
+    live.pendingScope = saved
+    const approved = await host.request('/api/flowgate/action', { sessionId: sid, action: 'doc', payload: { decision: 'approve' } })
+    await pending
+    const frozen = JSON.parse(readFileSync(join(ws, '.dsh-flowgate', 'scope.json'), 'utf8'))
+    check('修复后可正常冻结并进入 S2：' + listedCommands.length, () => {
+      assert.equal(approved.status, 200)
+      assert.equal(approved.body.stage, 'S2')
+      assert.deepEqual(frozen.in_scope.files_expected_to_change, ['src/gate.ts'])
+      assert.deepEqual(frozen.in_scope.commands, listedCommands)
+    })
+    await host.tool('flowgate_cancel', {})
+  } finally { rmSync(ws, { recursive: true, force: true }) }
 }
 
 console.log('\n全部通过：' + passed.length + ' 项')
