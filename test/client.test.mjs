@@ -485,6 +485,52 @@ function workspaceFlow(patch = {}) {
   }
 }
 
+await check('阶段提示：轮询返回同会话工作区摘要时保留本会话门禁按钮', async () => {
+  const sessionId = 'hint-own-' + (++seq)
+  const originalFetch = globalThis.fetch
+  let pollCount = 0
+  currentView = baseView('S2', {
+    waiting: true, waitingKind: 'gate',
+    progress: { stageIndex: 1, label: '开发' },
+    workspace: { flow: workspaceFlow({ sessionId, stage: 'S4', label: '旧摘要阶段' }) },
+  })
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/state?sessionId=' + sessionId)) pollCount++
+    return originalFetch(url, init)
+  }
+  let renderer
+  try {
+    renderer = await render(stageHint, { session: { sessionId } }, false)
+    let tree = renderer.toJSON()
+    assert.ok(flat(tree).includes('S2 开发'), '阶段与门禁应来自完整视图')
+    assert.ok(!flat(tree).includes('旧摘要阶段'))
+    assert.equal(buttonByText(tree, '完成开发').props.disabled, false)
+    currentView = { ...currentView, elapsedMs: 5000, workspace: { flow: workspaceFlow({ sessionId, stage: 'S4', label: '轮询摘要阶段' }) } }
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 1650)) })
+    tree = renderer.toJSON()
+    assert.ok(pollCount >= 2, '应包含挂载后的初次拉取和后续轮询')
+    assert.ok(flat(tree).includes('S2 开发'))
+    assert.ok(!flat(tree).includes('轮询摘要阶段'))
+    assert.equal(buttonByText(tree, '完成开发').props.disabled, false, '轮询后不能隐藏或置灰按钮')
+    posted = []
+    await click(buttonByText(tree, '完成开发'))
+    assert.equal(posted.at(-1).sessionId, sessionId)
+    assert.equal(posted.at(-1).action, 'gate')
+  } finally {
+    if (renderer) await act(async () => { renderer.unmount() })
+    globalThis.fetch = originalFetch
+  }
+})
+
+await check('阶段提示：归属不明的工作区摘要不提供流转按钮', async () => {
+  for (const value of [undefined, null, '', 0]) {
+    currentView = baseView('S2', { waiting: true, workspace: { flow: workspaceFlow({ sessionId: value }) } })
+    const tree = (await render(stageHint, {})).toJSON()
+    assert.ok(nodeByClass(tree, 'fg-hint-stage'), '摘要仍可显示')
+    assert.equal(buttons(tree).length, 0, '归属不明不能操作门禁：' + String(value))
+  }
+})
+
 await check('阶段提示：工作区摘要优先，本会话已结束或无流程也展示其他会话', async () => {
   for (const patch of [{}, { active: false }, { finished: true }, { cancelled: true }]) {
     currentView = baseView('S1', {
