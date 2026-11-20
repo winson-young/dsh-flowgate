@@ -390,7 +390,7 @@ await check('「完成开发」门禁自动采集变更摘要并进入 S3', asyn
   assert.equal(view.devChanges.added, 3)
 })
 
-await check('评审报告按角度聚合，跳过门禁进入 S4', async () => {
+await check('评审阻塞时仅允许当前报告的显式风险接受进入 S4', async () => {
   const pending = within(call('flowgate_review', {
     angles: [{
       id: 'correctness',
@@ -401,16 +401,59 @@ await check('评审报告按角度聚合，跳过门禁进入 S4', async () => {
   }), 'flowgate_review')
   await tick()
   const mid = await getState()
+  const eventCount = () => readFileSync(join(CWD, '.dsh-flowgate', 'flows.jsonl'), 'utf8').trim().split('\n').filter(Boolean).length
   assert.equal(mid.review.blocking, 1)
   assert.equal(mid.review.angles[0].findings[0].file, 'src/auth/session.ts')
-  const res = await post({ sessionId: SESSION, action: 'gate', payload: { decision: 'skip' } })
+  for (const decision of ['pass', 'skip']) {
+    const denied = await post({ sessionId: SESSION, action: 'gate', payload: { decision } })
+    assert.equal(denied.status, 409, decision + ' must not advance a blocking review')
+  }
+  assert.equal((await getState()).waiting, true)
+  const beforeOldReport = eventCount()
+  const oldReport = await post({ sessionId: SESSION, action: 'gate', payload: { decision: 'accept-risk', reviewId: 'old-report', riskReason: 'accept' } })
+  assert.equal(oldReport.status, 409)
+  assert.equal(eventCount(), beforeOldReport)
+  assert.equal((await getState()).stage, 'S3')
+  const source = join(CWD, 'src/auth/session.ts')
+  const original = readFileSync(source, 'utf8')
+  writeFileSync(source, original + 'changed after review\n')
+  const beforeStale = eventCount()
+  const stale = await post({ sessionId: SESSION, action: 'gate', payload: { decision: 'accept-risk', reviewId: mid.review.id, riskReason: 'accept stale' } })
+  assert.equal(stale.status, 409, '失效报告不能复用风险接受')
+  assert.match(stale.data.error, /快照已失效/)
+  assert.equal((await getState()).stage, 'S3')
+  assert.equal(eventCount(), beforeStale)
+  writeFileSync(source, original)
+  const replaced = within(call('flowgate_review', {
+    angles: [{ id: 'correctness', name: '正确性', verdict: 'blocking',
+      findings: [{ file: 'src/auth/session.ts', line: 42, severity: 'MAJOR', ac: 'AC-1', summary: '重新核对并发刷新' }] }],
+  }), 'flowgate_review replacement')
+  await tick()
+  const fresh = await getState()
+  assert.notEqual(fresh.review.id, mid.review.id, '重交报告应更新例外绑定目标')
+  assert.equal((await pending).decision, 'wait', '旧评审等待器已被新报告取代')
+  const beforeReplay = eventCount()
+  const replay = await post({ sessionId: SESSION, action: 'gate', payload: { decision: 'accept-risk', reviewId: mid.review.id, riskReason: '旧理由' } })
+  assert.equal(replay.status, 409, '旧报告 id 不得沿用')
+  assert.equal((await getState()).stage, 'S3')
+  assert.equal(eventCount(), beforeReplay)
+  const res = await post({ sessionId: SESSION, action: 'gate', payload: { decision: 'accept-risk', reviewId: fresh.review.id } })
   assert.equal(res.status, 200)
-  const value = await pending
-  assert.equal(value.decision, 'skip')
+  const value = await replaced
+  assert.equal(value.decision, 'accept-risk')
   assert.equal(value.next, 'S4')
+  assert.doesNotMatch(value.message, /^评审通过/)
   const view = await getState()
   assert.equal(view.stage, 'S4')
-  assert.equal(view.skippedCount, 1)
+  assert.equal(view.skippedCount, 0)
+  const stage = view.stages.find((item) => item.id === 'S3')
+  assert.equal(stage.status, 'accepted_with_risk')
+  assert.equal(stage.riskAcceptance.reason, undefined)
+  assert.equal(stage.riskAcceptance.reviewId, fresh.review.id)
+  assert.equal(stage.riskAcceptance.version, fresh.review.snapshot.id)
+  const events = readFileSync(join(CWD, '.dsh-flowgate', 'flows.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+  assert.equal(events.filter((event) => event.type === 'gate.risk_accepted' && event.detail.stage === 'S3' && !('reason' in event.detail)).length, 1)
+  assert.ok(!events.some((event) => event.type === 'gate.passed' && event.detail.stage === 'S3'))
 })
 
 await check('测试汇总通过不能替代 AC 证据，明确接受缺口后结束', async () => {
@@ -454,7 +497,7 @@ await check('flows.jsonl 记录完整阶段事件', async () => {
   for (const expected of ['flow.started', 'gate.passed', 'review.submitted', 'test.submitted', 'flow.finished']) {
     assert.ok(kinds.includes(expected), '缺少事件 ' + expected)
   }
-  assert.ok(events.some((e) => e.type === 'gate.skipped'))
+  assert.ok(events.some((e) => e.type === 'gate.risk_accepted' && e.detail.stage === 'S3'))
 })
 
 await check('未知 session 的 state 请求给出非活动视图', async () => {

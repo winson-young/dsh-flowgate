@@ -582,7 +582,7 @@ check('S2 记录变更摘要凭据', () => {
 })
 
 // AC-6 / AC-7：评审阶段升档 + 评审发现问题 → 回退 S2。
-const reviewPending = gateRound(
+const reviewPending = runTool(
   'flowgate_review',
   {
     angles: [
@@ -597,11 +597,29 @@ const reviewPending = gateRound(
       },
     ],
   },
-  { decision: 'pass' },
 )
+await tick()
+const blockedReport = await getState()
+const blockedPass = await postAction('gate', { decision: 'pass' })
+const blockedSkip = await postAction('gate', { decision: 'skip' })
+check('阻塞评审的普通通过和跳过均被拒绝', () => {
+  assert.equal(blockedPass.status, 409)
+  assert.equal(blockedSkip.status, 409)
+  assert.equal(blockedReport.body.review.blocking, 1)
+})
+const acceptedRisk = await postAction('gate', { decision: 'accept-risk', reviewId: blockedReport.body.review.id, riskReason: '接受本轮时区缺陷风险' })
+check('显式例外记录报告与接受原因', () => {
+  assert.equal(acceptedRisk.status, 200)
+  const stage = acceptedRisk.body.stages.find((s) => s.id === 'S3')
+  assert.equal(stage.status, 'accepted_with_risk')
+  assert.equal(stage.riskAcceptance.reviewId, blockedReport.body.review.id)
+  assert.equal(stage.riskAcceptance.reason, '接受本轮时区缺陷风险')
+})
 const reviewResult = await reviewPending
 // AC-6：评审通过后要求立即开始 S4，不停在阶段交界处。
-check('评审通过后进入 S4', () => {
+check('显式带风险继续后进入 S4 且不声称评审通过', () => {
+  assert.equal(reviewResult.decision, 'accept-risk')
+  assert.doesNotMatch(reviewResult.message, /^评审通过/)
   assert.equal(reviewResult.next, 'S4')
   assert.match(reviewResult.message, /现在直接开始 S4 测试/)
   assert.match(reviewResult.message, /不要在阶段交界处停下/)
@@ -696,7 +714,17 @@ const reviewPending3 = gateRound(
   },
   { decision: 'pass' },
 )
-await reviewPending3
+const zeroReviewResult = await reviewPending3
+const zeroReportState = await getState()
+check('零阻塞评审仍按普通通过落状态并写入评审通过事件', () => {
+  assert.equal(zeroReviewResult.decision, 'pass')
+  assert.equal(zeroReviewResult.next, 'S4')
+  assert.match(zeroReviewResult.message, /^评审通过/)
+  assert.equal(zeroReportState.body.review.blocking, 0)
+  assert.equal(zeroReportState.body.stages.find((stage) => stage.id === 'S3').status, 'passed')
+  const events = readFileSync(join(cwd, '.dsh-flowgate', 'flows.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+  assert.ok(events.some((event) => event.type === 'gate.passed' && event.detail.stage === 'S3'))
+})
 
 // S4 要跑测试命令，同一个开关必须在这里也能用，否则测试阶段只能手改 scope。
 const s4Grant = await postAction('toggleShellGrant', { enabled: true })
@@ -1742,6 +1770,95 @@ rmSync(cwd, { recursive: true, force: true })
     assert.match(text, /进入 S2（/)
     // 补发的是状态通知：Agent 收到时若已经在 S2 重做，不能把它当成再来一次回退。
     assert.match(text, /不要再次回退/)
+  })
+}
+
+// 评审报告已经落盘但等待器中断：HTTP 仍必须阻止普通通过，风险例外仍需绑定报告。
+{
+  const sid = 'sess-risk-interrupted'
+  const cwd = join(testRoot, sid)
+  const cx = makeHost(cwd, sid)
+  await cx.tool('flowgate_start', { title: '阻塞评审中断', preset: 'fast' })
+  const scope = { commands: [], files_expected_to_change: ['src/auth/session.ts'], capabilities: ['会话过期检测'],
+    out_of_scope_explicitly: [], acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }] }
+  const docCall = cx.tool('flowgate_doc', { html: '<html><body><p>阻塞评审</p></body></html>', scope })
+  await tick()
+  await cx.request('/api/flowgate/action', { sessionId: sid, action: 'doc', payload: { decision: 'approve' } })
+  await docCall
+  const devCall = cx.tool('flowgate_gate', {})
+  await tick()
+  await cx.request('/api/flowgate/action', { sessionId: sid, action: 'gate', payload: { decision: 'pass' } })
+  await devCall
+  const signal = new AbortController()
+  const reviewCall = cx.tool('flowgate_review', { angles: [{ id: 'correctness', name: '正确性', verdict: 'blocking',
+    findings: [{ file: 'src/auth/session.ts', line: 42, severity: 'MAJOR', ac: 'AC-1', summary: '时区错误' }] }] }, { signal: signal.signal })
+  await tick()
+  const submitted = await cx.request('/api/flowgate/state?sessionId=' + sid)
+  assert.equal(submitted.body.review.blocking, 1)
+  signal.abort()
+  await reviewCall
+  for (const decision of ['pass', 'skip']) {
+    const denied = await cx.request('/api/flowgate/action', { sessionId: sid, action: 'gate', payload: { decision } })
+    assert.equal(denied.status, 409, decision + ' cannot close a blocking review without a waiter')
+  }
+  const still = await cx.request('/api/flowgate/state?sessionId=' + sid)
+  check('无等待器时阻塞报告仍不可普通通过且阶段和事件未变', () => {
+    assert.equal(still.body.stage, 'S3')
+    const events = readFileSync(join(cwd, '.dsh-flowgate', 'flows.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+    assert.ok(!events.some((event) => event.type === 'gate.passed' && event.detail.stage === 'S3'))
+  })
+  const accepted = await cx.request('/api/flowgate/action', { sessionId: sid, action: 'gate',
+    payload: { decision: 'accept-risk', reviewId: submitted.body.review.id } })
+  check('无等待器时无理由也能带风险继续且绑定当前报告', () => {
+    assert.equal(accepted.status, 200)
+    assert.equal(accepted.body.stage, 'S4')
+    const stage = accepted.body.stages.find((item) => item.id === 'S3')
+    assert.equal(stage.status, 'accepted_with_risk')
+    assert.equal(stage.riskAcceptance.reason, undefined)
+    assert.equal(stage.riskAcceptance.reviewId, submitted.body.review.id)
+    assert.equal(accepted.body.skippedCount, 0)
+    const events = readFileSync(join(cwd, '.dsh-flowgate', 'flows.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+    assert.ok(events.some((event) => event.type === 'gate.risk_accepted' && event.detail.stage === 'S3' && !('reason' in event.detail)))
+    assert.ok(!events.some((event) => event.type === 'gate.passed' && event.detail.stage === 'S3'))
+    const text = cx.delivered.at(-1).message.content.map((block) => block.text).join('\n')
+    assert.match(text, /显式接受/)
+  })
+}
+
+for (const [kind, reason, expected] of [
+  ['ascii', 'x'.repeat(2001), 'x'.repeat(2000) + '…（超长已截断）'],
+  ['unicode', 'x'.repeat(1999) + '😀', 'x'.repeat(1999) + '…（超长已截断）'],
+]) {
+  const sid = 'sess-risk-overlong-' + kind
+  const cwd = join(testRoot, sid)
+  const cx = makeHost(cwd, sid)
+  await cx.tool('flowgate_start', { title: '风险理由边界 ' + kind, preset: 'fast' })
+  const scope = { commands: [], files_expected_to_change: ['src/auth/session.ts'], capabilities: ['会话过期检测'],
+    out_of_scope_explicitly: [], acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }] }
+  const docCall = cx.tool('flowgate_doc', { html: '<html><body><p>风险理由边界</p></body></html>', scope })
+  await tick()
+  await cx.request('/api/flowgate/action', { sessionId: sid, action: 'doc', payload: { decision: 'approve' } })
+  await docCall
+  const devCall = cx.tool('flowgate_gate', {})
+  await tick()
+  await cx.request('/api/flowgate/action', { sessionId: sid, action: 'gate', payload: { decision: 'pass' } })
+  await devCall
+  const reviewCall = cx.tool('flowgate_review', { angles: [{ id: 'correctness', name: '正确性', verdict: 'blocking',
+    findings: [{ file: 'src/auth/session.ts', line: 42, severity: 'MAJOR', ac: 'AC-1', summary: '时区错误' }] }] })
+  await tick()
+  const report = await cx.request('/api/flowgate/state?sessionId=' + sid)
+  const accepted = await cx.request('/api/flowgate/action', { sessionId: sid, action: 'gate',
+    payload: { decision: 'accept-risk', reviewId: report.body.review.id, riskReason: reason } })
+  assert.equal(accepted.status, 200, JSON.stringify(accepted.body))
+  const result = await reviewCall
+  check('超长风险理由 ' + kind + ' 不破坏可见字符或独立风险状态', () => {
+    assert.equal(accepted.status, 200)
+    assert.equal(result.decision, 'accept-risk')
+    const stage = accepted.body.stages.find((item) => item.id === 'S3')
+    assert.equal(stage.status, 'accepted_with_risk')
+    assert.equal(stage.riskAcceptance.reason, expected)
+    const events = readFileSync(join(cwd, '.dsh-flowgate', 'flows.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+    assert.ok(events.some((event) => event.type === 'gate.risk_accepted' && event.detail.reason === expected))
   })
 }
 

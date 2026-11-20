@@ -704,7 +704,7 @@ await check('阶段提示：门禁在等时点名要点的按钮，并说明去�
   assert.ok(text.includes('S3 评审'))
   assert.ok(text.includes('等你点「通过评审，进入测试」'), '应点名要点的按钮：' + text)
   assert.ok(text.includes('流程工作台'), '应说明去哪里点：' + text)
-  assert.deepEqual(buttons(tree).map((node) => flat(node)), ['通过评审，进入测试', '退回开发修复', '跳过评审，直接测试', '放弃这次流程'], '等待门禁时给的是本阶段可点的按钮')
+  assert.deepEqual(buttons(tree).map((node) => flat(node)), ['通过评审，进入测试', '退回开发修复', '回到需求分析调整 scope', '跳过评审，直接测试', '放弃这次流程'], '等待门禁时给的是本阶段可点的按钮')
 })
 
 await check('阶段提示：S1 的两种等待各自点名要做的动作', async () => {
@@ -757,7 +757,7 @@ await check('阶段提示：dock 给出本阶段的流转按钮，四个阶段�
   const cases = [
     ['S1', { doc: { html: '<p>需求</p>', pending: true } }, ['需求文档', '批准并冻结 scope', '修改需求', '跳过评审，直接开发', '放弃这次流程']],
     ['S2', {}, ['完成开发', '跳过门禁，直接评审', '回到需求分析调整 scope', '放弃这次流程']],
-    ['S3', {}, ['通过评审，进入测试', '退回开发修复', '跳过评审，直接测试', '放弃这次流程']],
+    ['S3', {}, ['通过评审，进入测试', '退回开发修复', '回到需求分析调整 scope', '跳过评审，直接测试', '放弃这次流程']],
     ['S4', { acceptance: { items: [{ id: 'AC-1', status: 'pass', evidence: '日志' }], counts: { total: 1, pass: 1, fail: 0, uncovered: 0, pending: 0 } } }, ['验收通过，结束流程', '退回开发修复', '跳过测试门禁', '放弃这次流程']],
   ]
   const seen = []
@@ -776,7 +776,7 @@ await check('阶段提示：S1 未交文档只留放弃，S3 有 scope 外发现
   assert.deepEqual(buttons((await render(stageHint, {})).toJSON()).map((node) => flat(node)), ['放弃这次流程'])
   // 有发现落在冻结 scope 之外：退回开发也改不到，要先调 scope，顺序与工作台一致。
   currentView = baseView('S3', { reviewOutsideScope: [{ id: 'f1', file: 'src/other.ts', severity: 'CRITICAL', summary: '跨出 scope' }] })
-  assert.deepEqual(buttons((await render(stageHint, {})).toJSON()).map((node) => flat(node)), ['通过评审，进入测试', '回到需求分析调整 scope', '退回开发修复', '跳过评审，直接测试', '放弃这次流程'])
+  assert.deepEqual(buttons((await render(stageHint, {})).toJSON()).map((node) => flat(node)), ['通过评审，进入测试', '退回开发修复', '回到需求分析调整 scope', '跳过评审，直接测试', '放弃这次流程'])
   // 为什么冒出回 S1 的入口，工作台会用一句话说清，dock 也要说清。
   assert.match(flat((await render(stageHint, {})).toJSON()), /评审有 1 条发现落在冻结 scope 之外/)
 })
@@ -1897,6 +1897,7 @@ const HubPanelIcon = componentOf('sidebar.panellist')
   posted = []
   currentView = baseView('S3', {
     review: {
+      id: 'review-interrupted',
       blocking: 1,
       by: 'subagents',
       at: '2026-11-17T10:10:00Z',
@@ -1918,10 +1919,23 @@ const HubPanelIcon = componentOf('sidebar.panellist')
   const tree = renderer.toJSON()
   await check('S3 评审交上来后门禁按钮可点', async () => {
     assert.ok(flat(tree).includes('上次的门禁请求被中断'))
-    await click(buttonByText(tree, '通过评审，进入测试'))
+    assert.equal(hasButton(tree, '通过评审，进入测试'), false)
+    assert.equal(hasButton(tree, '跳过评审，直接测试'), false)
+    assert.equal(buttonByText(tree, '带风险进入测试').props.disabled, false)
+    assert.equal(findTags(tree, 'textarea').filter((node) => node.props['aria-label'] === '接受风险原因（必填）').length, 0)
+    await click(buttonByText(tree, '带风险进入测试'))
     const last = posted[posted.length - 1]
     assert.equal(last.action, 'gate')
-    assert.equal(last.payload.decision, 'pass')
+    assert.equal(last.payload.decision, 'accept-risk')
+    assert.equal(last.payload.riskReason, undefined)
+    assert.equal(last.payload.reviewId, 'review-interrupted')
+    currentView = { ...currentView, review: { ...currentView.review, id: 'review-interrupted-new' } }
+    await click(buttonByText(renderer.toJSON(), '刷新'))
+    const replaced = renderer.toJSON()
+    assert.equal(buttonByText(replaced, '带风险进入测试').props.disabled, false)
+    await click(buttonByText(replaced, '带风险进入测试'))
+    assert.equal(posted.at(-1).payload.riskReason, undefined)
+    assert.equal(posted.at(-1).payload.reviewId, 'review-interrupted-new')
   })
 }
 
@@ -2053,10 +2067,12 @@ const HubPanelIcon = componentOf('sidebar.panellist')
     assert.ok(text.includes('scope 外文件'))
   })
 
-  await check('S3 门禁给出通过 / 退回 / 跳过', () => {
-    assert.ok(buttonByText(tree, '通过评审，进入测试'))
+  await check('S3 有阻塞项时仅提供带风险进入测试与退回', () => {
+    assert.equal(hasButton(tree, '通过评审，进入测试'), false)
+    assert.ok(buttonByText(tree, '带风险进入测试'))
     assert.ok(buttonByText(tree, '退回开发修复'))
-    assert.ok(buttonByText(tree, '跳过评审，直接测试'))
+    assert.equal(hasButton(tree, '跳过评审，直接测试'), false)
+    assert.ok(flat(tree).includes('更多操作'))
   })
 
   await check('S3 点「退回开发修复」提交 gate/back S2', async () => {
@@ -2071,6 +2087,44 @@ const HubPanelIcon = componentOf('sidebar.panellist')
     assert.ok(!flat(renderer.toJSON()).includes('升档到大需求严格执行'))
   })
 }
+
+await check('快捷操作在阻塞评审时可直接带风险进入测试', async () => {
+  posted = []
+  currentView = baseView('S3', { waiting: true, waitingKind: 'gate', review: { id: 'review-dock', blocking: 2, angles: [] } })
+  const renderer = await render(stageHint, { sessionId: 'risk-dock-reload' }, false)
+  const detail = await render(FlowDetail, { sessionId: 'risk-dock-reload' }, false)
+  let tree = renderer.toJSON()
+  assert.equal(hasButton(tree, '通过评审，进入测试'), false)
+  assert.equal(hasButton(tree, '跳过评审，直接测试'), false)
+  assert.equal(buttonByText(tree, '带风险进入测试').props.disabled, false)
+  assert.ok(buttonByText(tree, '回到需求分析调整 scope'))
+  assert.ok(flat(tree).includes('更多操作'))
+  assert.equal(findTags(tree, 'input').filter((node) => node.props['aria-label'] === '接受风险原因（必填）').length, 0)
+  await click(buttonByText(tree, '带风险进入测试'))
+  assert.equal(posted.at(-1).payload.decision, 'accept-risk')
+  assert.equal(posted.at(-1).payload.riskReason, undefined)
+  assert.equal(posted.at(-1).payload.reviewId, 'review-dock')
+  currentView = { ...currentView, review: { ...currentView.review, id: 'review-dock-new' } }
+  await click(buttonByText(detail.toJSON(), '刷新'))
+  tree = renderer.toJSON()
+  assert.equal(buttonByText(tree, '带风险进入测试').props.disabled, false)
+  await click(buttonByText(tree, '带风险进入测试'))
+  assert.equal(posted.at(-1).payload.riskReason, undefined)
+  assert.equal(posted.at(-1).payload.reviewId, 'review-dock-new')
+})
+
+await check('接受风险阶段标识与接受原因不同于评审通过或跳过', async () => {
+  const stages = stagesFor('S4')
+  stages[2] = { ...stages[2], status: 'accepted_with_risk', riskAcceptance: { reason: '接受剩余并发风险' } }
+  currentView = baseView('S4', { stages })
+  const tree = (await render(FlowDetail, {})).toJSON()
+  assert.match(flat(tree), /带风险继续/)
+  assert.match(flat(tree), /接受原因：接受剩余并发风险/)
+  const css = styleNodes[0].textContent
+  const hidden = css.indexOf('.fg-hub-flow .fg-stage-out, .fg-hub-flow .fg-stage-status { display: none; }')
+  const visible = css.indexOf('.fg-hub-flow .fg-stage.accepted_with_risk .fg-stage-status { display: block;')
+  assert.ok(hidden >= 0 && visible > hidden, '侧栏风险阶段徽标须覆盖通用隐藏规则')
+})
 
 // ---------------------------------------------------------------------------
 // 7. S4：测试报告
@@ -2522,8 +2576,8 @@ await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
     reviewOutsideScope: [],
   })
   const renderer = await render(FlowDetail, {})
-  await check('D4 没有 scope 外发现时 S3 门禁不显示回 S1 按钮', () => {
-    assert.ok(!flat(renderer.toJSON()).includes('回到需求分析调整 scope'))
+  await check('即使没有 scope 外发现 S3 也保留回 S1 调整入口', () => {
+    assert.ok(buttonByText(renderer.toJSON(), '回到需求分析调整 scope'))
   })
 }
 
