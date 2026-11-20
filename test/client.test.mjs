@@ -855,7 +855,45 @@ await check('阶段提示：投递失败要留下可诊断的错误行，认不�
   assert.deepEqual(buttons(nodeByClass((await render(stageHint, {})).toJSON(), 'fg-hint-actions')).map((node) => flat(node)), ['验收通过，结束流程', '退回开发修复', '跳过测试门禁', '放弃这次流程'])
 })
 
+await check('阶段提示：各阶段左侧内容保持两行，右侧独立承载按钮', async () => {
+  for (const stage of ['S1', 'S2', 'S3', 'S4']) {
+    currentView = baseView(stage, { elapsedMs: 96000 })
+    const tree = (await render(stageHint, {})).toJSON()
+    const hint = nodeByClass(tree, 'fg-hint')
+    const content = nodeByClass(hint, 'fg-hint-content')
+    const head = nodeByClass(content, 'fg-hint-head')
+    assert.ok(nodeByClass(head, 'fg-hint-title'), stage + ' 标题保留在左侧第一行')
+    assert.ok(nodeByClass(head, 'fg-hint-elapsed'), stage + ' 时长保留在左侧第一行')
+    assert.ok(nodeByClass(content, 'fg-hint-info'), stage + ' 阶段详情保留在左侧第二行')
+    assert.equal(nodeByClass(content, 'fg-hint-actions'), null, '按钮不应挤进左侧内容')
+    assert.ok(nodeByClass(hint, 'fg-hint-actions'), stage + ' 右侧应有操作按钮')
+  }
+  currentView = baseView('S2', { active: false })
+  const empty = (await render(stageHint, {})).toJSON()
+  const content = nodeByClass(empty, 'fg-hint-content')
+  assert.equal(flat(nodeByClass(content, 'fg-hint-info')), '从需求分析开始新流程')
+  assert.equal(nodeByClass(content, 'fg-hint-start'), null)
+  assert.ok(nodeByClass(empty, 'fg-hint-start'), '空态右侧保留开始入口')
+  assert.equal(nodeByClass(empty, 'fg-hint-elapsed'), null)
+})
+
 function quickDialog(renderer) { return findTags(renderer.toJSON(), 'dialog')[0] || null }
+
+await check('阶段提示：左右列自适应、按钮换排且颜色区分（样式契约）', async () => {
+  const css = styleNodes[0].textContent
+  assert.match(css, /\.fg-hint\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*repeat\(auto-fit, minmax\(min\(100%, 340px\), 1fr\)\);[^}]*align-items:\s*center;/)
+  assert.match(css, /\.fg-hint-content\s*\{[^}]*flex-direction:\s*column;[^}]*justify-content:\s*center;/)
+  assert.match(css, /\.fg-hint-title\s*\{[^}]*min-width:\s*0;[^}]*text-overflow:\s*ellipsis;/)
+  assert.match(css, /\.fg-hint-actions\s*\{[^}]*justify-content:\s*flex-end;[^}]*flex-wrap:\s*wrap;/)
+  assert.match(css, /\.fg-hint-btn-primary:not\(:disabled\)\s*\{[^}]*background:\s*var\(--dsw-alias-brand-primary\);/)
+  assert.match(css, /\.fg-hint-btn-danger:not\(:disabled\)\s*\{[^}]*color:\s*var\(--dsw-alias-state-error-primary\);/)
+  assert.match(css, /\.fg-hint-start\s*\{[^}]*justify-self:\s*end;[^}]*background:\s*var\(--dsw-alias-brand-primary\);/)
+  currentView = baseView('S2', { title: '超长需求标题'.repeat(30) })
+  const tree = (await render(stageHint, {})).toJSON()
+  const title = nodeByClass(tree, 'fg-hint-title')
+  assert.equal(title.props.title, currentView.title)
+  assert.equal(flat(title), currentView.title)
+})
 
 await check('快捷文档：提交后才可点击独立预览，关闭不触发门禁', async () => {
   currentView = baseView('S1', { doc: { html: '<h1>验收标准</h1>', pending: true } }); posted = []
