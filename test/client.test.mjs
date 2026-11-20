@@ -741,8 +741,10 @@ await check('快捷需求：关闭保留草稿和档位，切会话关闭并隔�
 
 await check('快捷需求：按钮和Ctrl/Cmd+Enter正确提交当前会话、原文与档位，成功清草稿', async () => {
   for (const mode of ['click', 'ctrl', 'meta']) {
-    currentView = baseView('S1', { active: false, workspace: { flow: null } }); posted = []
+    currentView = baseView('S1', { active: false, workspace: { flow: null } }); posted = []; prepareCalls.length = 0
     const sessionId = 'quick-success-' + mode
+    const originalPrepare = prepareHandler
+    prepareHandler = () => response({ title: '模型整理后的明确标题', summary: '目标：新需求 "@file" 中文；约束：保留空格。', status: 'ready' })
     const renderer = await render(stageHint, { sessionId }, false)
     try {
       await click(buttonByText(renderer.toJSON(), '开始需求分析'))
@@ -759,11 +761,50 @@ await check('快捷需求：按钮和Ctrl/Cmd+Enter正确提交当前会话、�
       assert.equal(starts[0].sessionId, sessionId)
       assert.equal(starts[0].payload.brief, raw)
       assert.equal(starts[0].payload.preset, 'strict')
+      assert.deepEqual(prepareCalls, [{ sessionId, brief: raw }])
+      assert.equal(starts[0].payload.title, '模型整理后的明确标题')
+      assert.equal(starts[0].payload.summary, '目标：新需求 "@file" 中文；约束：保留空格。')
       assert.equal(quickDialog(renderer), null, '成功应关闭弹窗')
       await click(buttonByText(renderer.toJSON(), '开始需求分析'))
       assert.equal(fieldByAria(quickDialog(renderer), '需求原文').props.value, '')
       assert.equal(buttonByText(quickDialog(renderer), '小功能快速开发').props['aria-pressed'], true)
-    } finally { await act(async () => { renderer.unmount() }) }
+    } finally { prepareHandler = originalPrepare; await act(async () => { renderer.unmount() }) }
+  }
+})
+
+await check('快捷需求：模型整理失败静默降级，保留原文并继续启动', async () => {
+  currentView = baseView('S1', { active: false, workspace: { flow: null } }); posted = []; prepareCalls.length = 0
+  const originalPrepare = prepareHandler
+  const originalWarn = console.warn
+  const warnings = []
+  prepareHandler = () => response({ error: '临时不可用' }, 503)
+  console.warn = (message) => warnings.push(message)
+  const renderer = await render(stageHint, { sessionId: 'quick-fallback' }, false)
+  try {
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    const brief = '  记录原文约束\n不能丢失  '
+    await changeValue(fieldByAria(quickDialog(renderer), '需求原文'), brief)
+    await click(buttonByText(quickDialog(renderer), '开始需求分析'))
+    assert.deepEqual(prepareCalls, [{ sessionId: 'quick-fallback', brief }])
+    assert.equal(posted.length, 1)
+    assert.equal(posted[0].payload.brief, brief)
+    assert.match(posted[0].payload.title, /记录原文约束/)
+    assert.match(posted[0].payload.summary, /不能丢失/)
+    assert.equal(quickDialog(renderer), null)
+    assert.ok(warnings.some((message) => message.includes('unavailable')))
+    prepareHandler = () => response({ title: '本地标题', summary: '本地整理稿', status: 'fallback' })
+    posted = []; prepareCalls.length = 0; warnings.length = 0
+    await click(buttonByText(renderer.toJSON(), '开始需求分析'))
+    await changeValue(fieldByAria(quickDialog(renderer), '需求原文'), '再次提交')
+    await click(buttonByText(quickDialog(renderer), '开始需求分析'))
+    assert.deepEqual(prepareCalls, [{ sessionId: 'quick-fallback', brief: '再次提交' }])
+    assert.equal(posted[0].payload.title, '本地标题')
+    assert.equal(posted[0].payload.summary, '本地整理稿')
+    assert.equal(quickDialog(renderer), null)
+    assert.ok(warnings.some((message) => message.includes('model-fallback')))
+  } finally {
+    prepareHandler = originalPrepare; console.warn = originalWarn
+    await act(async () => { renderer.unmount() })
   }
 })
 

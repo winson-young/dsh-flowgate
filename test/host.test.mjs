@@ -2725,6 +2725,27 @@ rmSync(cwd, { recursive: true, force: true })
         assert.equal(result.body.summary, result.body.status === 'ready' ? summary : brief)
       })
     }
+    modelResult = { title: '会话模型标题', summary: '整理目标，保留全部需求。' }
+    const sessionBrief = '目标：保留全部需求。'
+    const bySession = await post('prepare', { sessionId: 'foreign', brief: sessionBrief })
+    check('会话入口按真实会话选择模型，无须先登记工作区', () => {
+      assert.equal(bySession.status, 200)
+      assert.equal(bySession.body.status, 'ready')
+      assert.equal(bySession.body.title, '会话模型标题')
+      assert.equal(streams.at(-1).sessionId, 'foreign')
+      assert.equal(JSON.parse(streams.at(-1).messages[0].content[0].text).brief, sessionBrief)
+    })
+    const beforeInvalid = calls.length
+    for (const invalid of [undefined, '', 'not-a-session']) {
+      const rejected = await post('prepare', { sessionId: invalid, brief: sessionBrief })
+      assert.equal(rejected.status, 400)
+    }
+    assert.equal((await post('prepare', { sessionId: 'foreign', path: foreign, brief: sessionBrief })).status, 400)
+    check('无效会话和未登记的显式路径不得触发模型或流程', () => {
+      assert.equal(calls.length, beforeInvalid)
+      assert.equal(created, 0)
+      assert.equal(delivered, 0)
+    })
     modelFails = true
     const fallback = await post('prepare', { path: ws, brief: '  # 本地标题。\n\n\n保留原文 456  ' })
     check('模型不可用时本地规范排版并安全降级，原始错误不进用户消息', () => {
