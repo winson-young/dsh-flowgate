@@ -500,8 +500,8 @@ await check('阶段提示：工作区摘要优先，本会话已结束或无流�
     assert.ok(text.includes('已用 2 分 5 秒'), text)
     assert.ok(!text.includes('旧会话') && !text.includes('批准并冻结'), text)
     assert.ok(nodeByClass(tree, 'fg-hint'), '不得继承本会话等待态')
-    assert.equal(buttons(tree).length, 1)
-    assert.ok(buttonByText(tree, '开始需求分析'))
+    assert.equal(buttons(tree).length, 0, '跨会话摘要判不了门禁就绪，不给流转按钮')
+    assert.ok(!hasButton(tree, '开始需求分析'), '流程进行中不能再从 dock 开新流程')
   }
 })
 
@@ -623,7 +623,7 @@ await check('阶段提示：一行说清第几步、在做什么、已用多久'
   assert.ok(text.includes('S2 开发'), '应写明第几步与阶段名：' + text)
   assert.ok(text.includes('正在编辑 lib/client.js'), '应显示当前动作：' + text)
   assert.ok(text.includes('已用 1 分 36 秒'), '应显示已用时：' + text)
-  assert.equal(buttons(tree).length, 1, '阶段信息旁提供快捷启动入口')
+  assert.deepEqual(buttons(tree).map((node) => flat(node)), ['完成开发', '跳过门禁，直接评审', '回到需求分析调整 scope', '放弃这次流程'], 'S2 阶段信息旁给本阶段的流转按钮')
 })
 
 await check('阶段提示：宿主真实挂载形态（InputZone 的 session.sessionId）也渲染', async () => {
@@ -658,7 +658,7 @@ await check('阶段提示：门禁在等时点名要点的按钮，并说明去�
   assert.ok(text.includes('S3 评审'))
   assert.ok(text.includes('等你点「通过评审，进入测试」'), '应点名要点的按钮：' + text)
   assert.ok(text.includes('流程工作台'), '应说明去哪里点：' + text)
-  assert.equal(buttons(tree).length, 1, '等待门禁时也保留快捷入口')
+  assert.deepEqual(buttons(tree).map((node) => flat(node)), ['通过评审，进入测试', '退回开发修复', '跳过评审，直接测试', '放弃这次流程'], '等待门禁时给的是本阶段可点的按钮')
 })
 
 await check('阶段提示：S1 的两种等待各自点名要做的动作', async () => {
@@ -704,6 +704,109 @@ await check('阶段提示：没有流程、已结束或已放弃时仅保留快�
     assert.ok(buttonByText(tree, '开始需求分析'))
     assert.equal(nodeByClass(tree, 'fg-hint-stage'), null, JSON.stringify(patch))
   }
+})
+
+await check('阶段提示：dock 给出本阶段的流转按钮，四个阶段各不相同', async () => {
+  const labels = (tree) => buttons(nodeByClass(tree, 'fg-hint-actions') || tree).map((node) => flat(node))
+  const cases = [
+    ['S1', { doc: { html: '<p>需求</p>', pending: true } }, ['批准并冻结 scope', '修改需求', '跳过评审，直接开发', '放弃这次流程']],
+    ['S2', {}, ['完成开发', '跳过门禁，直接评审', '回到需求分析调整 scope', '放弃这次流程']],
+    ['S3', {}, ['通过评审，进入测试', '退回开发修复', '跳过评审，直接测试', '放弃这次流程']],
+    ['S4', { acceptance: { items: [{ id: 'AC-1', status: 'pass', evidence: '日志' }], counts: { total: 1, pass: 1, fail: 0, uncovered: 0, pending: 0 } } }, ['验收通过，结束流程', '退回开发修复', '跳过测试门禁', '放弃这次流程']],
+  ]
+  const seen = []
+  for (const [stage, patch, expected] of cases) {
+    currentView = baseView(stage, patch)
+    const got = labels((await render(stageHint, {})).toJSON())
+    assert.deepEqual(got, expected, stage + ' 的流转按钮')
+    seen.push(got.join('|'))
+  }
+  assert.equal(new Set(seen).size, cases.length, '四个阶段的按钮集合两两不同')
+})
+
+await check('阶段提示：S1 未交文档只留放弃，S3 有 scope 外发现时先让回需求分析', async () => {
+  // 文档还没交：工作台此时也不给决策按钮，dock 保持一致。
+  currentView = baseView('S1', { waiting: true, waitingKind: 'answer' })
+  assert.deepEqual(buttons((await render(stageHint, {})).toJSON()).map((node) => flat(node)), ['放弃这次流程'])
+  // 有发现落在冻结 scope 之外：退回开发也改不到，要先调 scope，顺序与工作台一致。
+  currentView = baseView('S3', { reviewOutsideScope: [{ id: 'f1', file: 'src/other.ts', severity: 'CRITICAL', summary: '跨出 scope' }] })
+  assert.deepEqual(buttons((await render(stageHint, {})).toJSON()).map((node) => flat(node)), ['通过评审，进入测试', '回到需求分析调整 scope', '退回开发修复', '跳过评审，直接测试', '放弃这次流程'])
+  // 为什么冒出回 S1 的入口，工作台会用一句话说清，dock 也要说清。
+  assert.match(flat((await render(stageHint, {})).toJSON()), /评审有 1 条发现落在冻结 scope 之外/)
+})
+
+await check('阶段提示：流转按钮的置灰与门禁就绪同源', async () => {
+  // 宿主没在等、门禁产物也还没交：点了不会发生任何事，跟工作台一样置灰。
+  currentView = baseView('S2')
+  let tree = (await render(stageHint, {})).toJSON()
+  for (const label of ['完成开发', '跳过门禁，直接评审', '回到需求分析调整 scope']) {
+    assert.equal(buttonByText(tree, label).props.disabled, true, label + ' 在门禁就绪前应置灰')
+  }
+  assert.equal(buttonByText(tree, '放弃这次流程').props.disabled, false, '放弃不受门禁限制')
+  // 样式与工作台同源：S2 的「回到需求分析调整 scope」在工作台是危险色，主按钮是主色。
+  assert.ok(buttonByText(tree, '回到需求分析调整 scope').props.className.includes('fg-hint-btn-danger'), '回 scope 要与工作台一样用危险色')
+  assert.ok(buttonByText(tree, '完成开发').props.className.includes('fg-hint-btn-primary'), '主按钮要与工作台一样用主色')
+  // 宿主正在等：就绪。
+  currentView = baseView('S2', { waiting: true, waitingKind: 'gate' })
+  tree = (await render(stageHint, {})).toJSON()
+  assert.equal(buttonByText(tree, '完成开发').props.disabled, false, '宿主在等时可点')
+  // 门禁产物已交（gate.pending）同样算就绪。
+  currentView = baseView('S2', { gate: { pending: true } })
+  tree = (await render(stageHint, {})).toJSON()
+  assert.equal(buttonByText(tree, '完成开发').props.disabled, false, '门禁产物已交时可点')
+})
+
+await check('阶段提示：放弃要两次确认，S4 的例外项随 gate 一起提交', async () => {
+  currentView = baseView('S4', {
+    waiting: true,
+    waitingKind: 'gate',
+    acceptance: { items: [{ id: 'AC-1', status: 'fail', reason: '返回 500' }], counts: { total: 1, pass: 0, fail: 1, uncovered: 0, pending: 0 } },
+  })
+  const renderer = await render(stageHint, {})
+  posted = []
+  await click(buttonByText(renderer.toJSON(), '放弃这次流程'))
+  assert.equal(posted.length, 0, '第一次点击只是换按钮，不投递请求')
+  assert.ok(buttonByText(renderer.toJSON(), '确认放弃'))
+  await click(buttonByText(renderer.toJSON(), '再想想'))
+  assert.ok(buttonByText(renderer.toJSON(), '放弃这次流程'), '反悔后回到原按钮')
+  assert.equal(posted.length, 0)
+  // 有未通过项时主按钮是例外验收，点下去要带上接受声明。
+  const main = buttonByText(renderer.toJSON(), '接受未通过项并结束')
+  assert.equal(main.props.disabled, false)
+  await click(main)
+  const gate = posted[posted.length - 1]
+  assert.equal(gate.action, 'gate')
+  assert.equal(gate.payload.decision, 'pass')
+  assert.equal(gate.payload.acceptUncovered, true, '有例外项时要一并提交接受声明')
+  // 放弃：两次确认后才真的投递 cancel。
+  await click(buttonByText(renderer.toJSON(), '放弃这次流程'))
+  await click(buttonByText(renderer.toJSON(), '确认放弃'))
+  const cancel = posted[posted.length - 1]
+  assert.equal(cancel.action, 'cancel')
+  assert.ok(cancel.payload.reason, '放弃要留下原因')
+})
+
+await check('阶段提示：投递失败要留下可诊断的错误行，认不出的阶段落到最后一档', async () => {
+  currentView = baseView('S2', { waiting: true, waitingKind: 'gate' })
+  const renderer = await render(stageHint, {})
+  posted = []
+  // 只让这一次投递失败，其它请求照旧交给默认 mock。
+  const realFetch = globalThis.fetch
+  globalThis.fetch = async (url, init) => String(url).includes('/action')
+    ? { ok: false, status: 500, json: async () => ({ ok: false, error: '宿主拒绝了这次操作' }) }
+    : realFetch(url, init)
+  try {
+    await click(buttonByText(renderer.toJSON(), '完成开发'))
+    const err = nodeByClass(renderer.toJSON(), 'fg-hint-err')
+    assert.ok(err, '投递失败要显示错误行，不能静默吞掉')
+    assert.equal(err.props.role, 'alert')
+    assert.match(flat(err), /宿主拒绝了这次操作/)
+  } finally {
+    globalThis.fetch = realFetch
+  }
+  // stage 认不出来时工作台落到最后一档，dock 给出同一组按钮。
+  currentView = baseView('S9', { waiting: true, waitingKind: 'gate' })
+  assert.deepEqual(buttons(nodeByClass((await render(stageHint, {})).toJSON(), 'fg-hint-actions')).map((node) => flat(node)), ['验收通过，结束流程', '退回开发修复', '跳过测试门禁', '放弃这次流程'])
 })
 
 function quickDialog(renderer) { return findTags(renderer.toJSON(), 'dialog')[0] || null }
@@ -943,16 +1046,13 @@ await check('快捷需求：切走返回后的延迟失败持续保留原文档�
   }
 })
 
-await check('快捷需求：同会话/跨会话运行流程都只允许写草稿，加载失败禁止提交', async () => {
+await check('快捷需求：拿不到工作区流程状态时只允许写草稿，加载失败禁止提交', async () => {
   for (const patch of [
-    { workspace: { flow: workspaceFlow({ sessionId: 'quick-guard' }) } },
-    { workspace: { flow: workspaceFlow() } },
     { active: false, workspace: {} },
     { active: false, workspace: null },
-    {},
   ]) {
     currentView = baseView('S2', patch); posted = []; prepareCalls.length = 0
-    const sessionId = patch.workspace?.flow?.sessionId === 'quick-guard' ? 'quick-guard' : 'quick-guard-' + (++seq)
+    const sessionId = 'quick-guard-' + (++seq)
     const renderer = await render(stageHint, { sessionId }, false)
     try {
       await click(buttonByText(renderer.toJSON(), '开始需求分析'))

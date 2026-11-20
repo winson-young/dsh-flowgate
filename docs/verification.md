@@ -6,6 +6,32 @@
 
 历史记录中的 `by: 'subagents'` 仅表明调用了子代理聚合入口；聚合报告通过、`blocking: 0` 或流程走完，均不能证明真实子代理成功执行并返回有效报告。下文原有结论保留，其证据范围受此限定。
 
+## dock 阶段流转按钮（2026-11-20）
+
+需求：输入框上方那一行（dock）要按当前阶段给出各自的流转按钮，文案与置灰样式跟左侧栏「流程工作台」一致；需求分析（S1）一旦开始，「开始需求分析」入口必须消失；流程开始后常驻的只能是结束入口；四个阶段可查看与可操作的按钮各不相同。
+
+改动范围：`lib/client.js`（新增 `HintActions` 组件与 `.fg-hint-actions` / `.fg-hint-btn` 系列样式，dock 渲染段改为按流程状态分流）、`test/client.test.mjs`（改写与新行为冲突的旧断言，新增五条）。`lib/index.js` 未改：dock 只复用了既有的 `act()` 与 `finalGateLabel()`，没有新增宿主接口。
+
+| 验收项 | 状态 | 证据与限制 |
+| :--- | :--- | :--- |
+| AC-1 活动流程时不再出现启动入口 | 通过 | `test/client.test.mjs` 的「阶段提示：工作区摘要优先…」断言按钮数 0 且没有「开始需求分析」；「阶段提示：没有流程、已结束或已放弃时仅保留快捷入口」保证无流程时入口仍在 |
+| AC-2 S1 只在文档待裁决时给三键 | 通过 | 「阶段提示：dock 给出本阶段的流转按钮，四个阶段各不相同」断言 S1 为「批准并冻结 scope / 修改需求 / 跳过评审，直接开发 / 放弃这次流程」；「S1 未交文档只留放弃」覆盖 `doc.pending` 为假的情形 |
+| AC-3 S2 三键与就绪态 | 通过 | 同上用例断言 S2 按钮集合；「流转按钮的置灰与门禁就绪同源」分别覆盖未就绪（disabled 为真）、`waiting` 为真、`gate.pending` 为真三种情形，并断言「回到需求分析调整 scope」带危险色 class、主按钮带主色 class |
+| AC-4 S3 有 scope 外发现时先让回需求分析 | 通过 | 「S1 未交文档只留放弃，S3 有 scope 外发现时先让回需求分析」断言追加按钮的位置在「退回开发修复」之前，且同时显示越界原因和数量 |
+| AC-5 S4 主按钮取 `finalGateLabel` 并随例外项提交接受声明 | 通过 | 「放弃要两次确认，S4 的例外项随 gate 一起提交」断言按钮文案为「接受未通过项并结束」，点击后 `payload.acceptUncovered === true` |
+| AC-6 结束流程入口常驻且需两次确认 | 通过 | 同一用例断言首次点击不发请求、`再想想` 回到原按钮、确认后投递 `cancel` 且带 `reason`；「投递失败要留下可诊断的错误行」验证 HTTP 500 时出现 `role=alert` 与宿主错误文案 |
+| AC-7 四阶段按钮集合两两不同 | 通过 | 「dock 给出本阶段的流转按钮，四个阶段各不相同」用 `Set` 比对四组文案；无效 stage 的按钮兜底与工作台一致 |
+| AC-8 新增按钮不破坏 dock 宽度契约 | 未覆盖真实视觉 | `.fg-hint` 的 `width` / `max-width` 公式未改，既有「阶段提示样式：沿用宿主宽度变量和居中规则」仍通过；按钮组自带 `flex-wrap: wrap` 与 `min-width: 0`，文字可换行 |
+| AC-9 无回归 | 部分通过 | `node test/client.test.mjs` 203 项全通过；`npm run check`（六模块版本标记 + 七个文件语法检查）退出码 0；`npm test` 在 `test/provenance.test.mjs` 的既有用例 14「external directory junction is rejected before reading its target」上失败，见下 |
+
+### 已知未通过项
+
+`npm test` 三次均在 `test/provenance.test.mjs:211` 失败，首轮报错 `ENOTEMPTY: directory not empty, rmdir 'C:\\Users\\lonsdor\\AppData\\Local\\Temp\\dsh-U05QNJ\\flowgate-provenance-jemCK5\\workspace'`，抛出点在 `test/provenance.test.mjs:32` 的 `fixture` 收尾 `fs.rmSync(home, { recursive: true, force: true })`。该文件与本轮 dock 改动无关（`lib/client.js` 未被它引入），是 junction 用例清理临时目录时的 Windows 竞态；其余 19 项在该文件内通过，后续七组测试因 `npm test` 用 `&&` 串联而未执行。本轮未修该文件（不在冻结 scope 内），如实记为未通过。
+
+### 真实视觉未覆盖
+
+当前验证环境没有可用的已认证桌面页面接入或 CDP，无法采集真实参照矩形，未启动浏览器或新服务，也未用 file 预览代替。AC-8 的宽度契约只按静态 CSS 断言与既有用例核对，不构成真实视觉通过证据。
+
 ## 本轮证据契约与布局脚本验证（2026-11-19）
 
 本轮分别记录实现、验证、运行生效，不能用其中一项替代另一项。已使用捆绑 Node 的绝对路径执行标准测试清单的全部八组测试：内容快照 20、验收账本 24、运行版本 18、宿主 299、子代理 71、集成 33、客户端 190、安装契约 17，合计 672 项通过；另有七个生产与诊断文件语法检查、六模块版本标记核验及下表脚本自检通过。标准包管理器入口因宿主 Windows 子进程 PATH 找不到 `node` 未能直接运行，以上结果来自同一清单逐组执行，未把启动失败计作通过。最终差异复核补上的硬上限省略项严重度边界回归已纳入宿主 299 项并通过，以下记录布局脚本的具体范围。
