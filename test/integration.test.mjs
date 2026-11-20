@@ -8,6 +8,8 @@ import { join } from 'node:path'
 const CWD = join(process.cwd(), '.tmp-it')
 rmSync(CWD, { recursive: true, force: true })
 mkdirSync(CWD, { recursive: true })
+mkdirSync(join(CWD, 'src', 'auth'), { recursive: true })
+writeFileSync(join(CWD, 'src', 'auth', 'session.ts'), 'fixture source\n')
 const PREVIOUS_HUB_HOME = process.env.DSH_FLOWGATE_HOME
 process.env.DSH_FLOWGATE_HOME = join(CWD, 'hub-home')
 
@@ -28,6 +30,16 @@ function makeHost() {
       spawns.push(entry)
       const write = execFor(request.childId, 'ops_write_file', { path: 'src/auth/session.ts' })
       assert.ok(guards.some((guard) => guard(write)), '启动返回前真实 childId 已受最终守卫保护')
+      const sdk = {
+        read: async ({ file_path }) => {
+          const read = execFor(request.childId, 'read', { file_path })
+          assert.ok(guards.every((guard) => !guard(read)), '默认读取工具须获只读守卫授权')
+          return { lines: [{ number: 1, text: readFileSync(join(CWD, file_path), 'utf8').trim() }] }
+        },
+      }
+      assert.equal(sdk.ops_read_files, undefined, '初始 SDK 不预加载 ops_read_files')
+      const checkedFiles = request.prompt[0].text.includes('checkedFiles') ? ['src/auth/session.ts'] : []
+      const readContent = checkedFiles.length ? (await sdk.read({ file_path: checkedFiles[0] })).lines[0].text : null
       return {
         childId: request.childId,
         name: 'child-' + spawns.length,
@@ -39,6 +51,9 @@ function makeHost() {
             text: JSON.stringify({
               verdict: 'advisory',
               suggestUpgrade: false,
+              ...(checkedFiles.length ? { checkedFiles, readEvidence: [
+                { file: checkedFiles[0], firstLine: readContent, lastLine: readContent },
+              ] } : {}),
               findings: [{ file: 'src/auth/session.ts', line: 42, severity: 'MINOR', summary: '缺少失败路径的注释' }],
             }),
           }],
@@ -319,6 +334,7 @@ await check('需求文档门禁：批准后 scope 冻结并进入 S2', async () 
     reason: '只改一个中间件，范围可控',
     scope: {
       files_expected_to_change: ['src/auth/session.ts'],
+      commands: [],
       capabilities: ['会话过期检测'],
       out_of_scope_explicitly: ['OAuth 第三方登录'],
       acceptance_criteria: [{ id: 'AC-1', when: '会话超过 30 分钟未活动', then: '返回 401' }],
@@ -465,7 +481,7 @@ await check('当前版本的逐 AC 实际执行证据才可正常验收通过', 
   await call('flowgate_start', { title: '证据闭环', preset: 'fast' }, S)
   const doc = within(call('flowgate_doc', {
     html: '<html><body>验证实际样例读取</body></html>',
-    scope: { files_expected_to_change: ['proof.txt'], capabilities: [], out_of_scope_explicitly: [],
+    scope: { files_expected_to_change: ['proof.txt'], commands: [], capabilities: [], out_of_scope_explicitly: [],
       acceptance_criteria: [{ id: 'AC-1', when: '读取本轮样例文件', then: '得到本轮写入的精确文本',
         verification: { method: 'integration', procedure: '在集成测试中读取 proof.txt 并断言精确文本' } }] },
   }, S), '证据文档')
@@ -517,7 +533,7 @@ await check('布局采集回执绑定内容、页面实例和视口，视口变�
   const S = 'sess-layout-proof'
   await call('flowgate_start', { title: '布局回执契约', preset: 'fast' }, S)
   const doc = within(call('flowgate_doc', { html: '<html><body>对齐采集契约</body></html>',
-    scope: { files_expected_to_change: ['proof.txt'], capabilities: [], out_of_scope_explicitly: [],
+    scope: { files_expected_to_change: ['proof.txt'], commands: [], capabilities: [], out_of_scope_explicitly: [],
       acceptance_criteria: [{ id: 'AC-1', when: '显示样例行', then: '与参照左右对齐',
         verification: { method: 'visual', procedure: '从已核对页面采集实际左右边界' } }] },
   }, S), '布局回执文档')
@@ -570,6 +586,7 @@ await check('flowgate_review_run 为每个角度 spawn 只读子代理并带上�
     html: '<!doctype html><html><body>子代理评审</body></html>',
     scope: {
       files_expected_to_change: ['src/auth/session.ts'],
+      commands: [],
       capabilities: ['会话过期检测'],
       out_of_scope_explicitly: [],
       acceptance_criteria: [{ id: 'AC-1', when: '会话过期', then: '返回 401' }],
@@ -600,7 +617,7 @@ await check('flowgate_review_run 为每个角度 spawn 只读子代理并带上�
   assert.ok(reviewSpawn.request.childId, '必须预留真实 childId')
   assert.equal(reviewSpawn.request.toolFilter, undefined, '新协议不发送旧 toolFilter')
   assert.equal(reviewSpawn.request.parent.session.header.id, S)
-  assert.ok(host.spawns.every((item) => item.released), '每次 activation 都应释放')
+  assert.ok(host.spawns.every((item) => item.released), '每次 activation 都应释放：' + JSON.stringify(view.review.angles))
   assert.equal(mod.currentService().childOwner.size, 0, '停止成功后解绑只读会话')
   assert.equal(view.review.angles[0].findings[0].file, 'src/auth/session.ts', '必须实际采用子代理报告')
   // PRD 4.5：正确性角度会逐条核对用户定义的开发规则。

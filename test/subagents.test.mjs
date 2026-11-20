@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -41,19 +41,26 @@ function observe(promise) {
   )
   return state
 }
-function reportFor(spec, expectedPoints = []) {
+function reportFor(spec, expectedPoints = [], checkedFiles = [], readEvidence = []) {
   const report = spec.label.startsWith('测试')
     ? { points: expectedPoints.map((point, index) => ({
       point, result: ['pass', 'fail', 'uncovered'][index % 3], detail: 'fixture evidence',
     })) }
-    : { verdict: 'advisory', suggestUpgrade: false, findings: [
+    : { verdict: 'advisory', suggestUpgrade: false, checkedFiles,
+      readEvidence, findings: [
       { file: 'src/auth/session.ts', line: 17, severity: 'MINOR', summary: 'fixture finding' },
     ] }
   return { stopReason: 'completed', output: [{ type: 'text', text: JSON.stringify(report) }] }
 }
 
+function reportForActivation(activation) {
+  return reportFor(activation.spec, activation.points, activation.checkedFiles, activation.readEvidence)
+}
+
 function makeHost(options = {}) {
   const cwd = mkdtempSync(join(tmpdir(), 'flowgate-subagents-'))
+  mkdirSync(join(cwd, 'src', 'auth'), { recursive: true })
+  writeFileSync(join(cwd, 'src', 'auth', 'session.ts'), 'fixture source\n')
   const sessionId = 'parent-' + cwd.split(/[\\/]/).pop()
   const parent = { session: { header: { id: sessionId, cwd } } }
   const shutdown = new AbortController()
@@ -74,7 +81,7 @@ function makeHost(options = {}) {
     }
   }
   const visible = new Set([
-    'read', 'ops_read_files', 'ops_stat', 'ops_diff', 'ops_grep', 'ops_glob',
+    'read', 'ops_stat', 'ops_diff', 'ops_grep', 'ops_glob',
     'write', 'edit', 'str_replace_editor', 'ops_write_file', 'ops_edit_file', 'ops_remove',
     'ops_batch', 'ops_copy', 'ops_move', 'ops_replace', 'bash', 'ops_bash', 'run_code',
     'subagent', 'subagent_fork', 'send_message', 'schedule_create', 'schedule_edit',
@@ -100,11 +107,20 @@ function makeHost(options = {}) {
           activation.points = direction.points
         }
         if (options.onStart) await options.onStart(activation, host)
+        if (spec.label.startsWith('评审') && !options.skipRead) {
+          try {
+            const file = 'src/auth/session.ts'
+            const response = await host.childSdk(spec.childId).read({ file_path: file })
+            const content = response.content.trim()
+            activation.checkedFiles = [file]
+            activation.readEvidence = [{ file, firstLine: content, lastLine: content }]
+          } catch { activation.checkedFiles = []; activation.readEvidence = [] }
+        }
         if (options.startFails) throw new Error('fixture start failed')
         if (options.receiptGate) await options.receiptGate.promise
         if (!options.manualResult) {
           if (options.executionFails) activation.result.reject(new Error('fixture execution failed'))
-          else activation.result.resolve(options.response ? options.response(activation) : reportFor(spec, activation.points))
+          else activation.result.resolve(options.response ? options.response(activation) : reportFor(spec, activation.points, activation.checkedFiles, activation.readEvidence))
         }
         return {
           childId: spec.childId,
@@ -188,6 +204,29 @@ function makeHost(options = {}) {
   }
   host = {
     cwd, sessionId, parent, activations, guards, oldCalls, providerLookups, fixtureErrors,
+    childSdk(id) {
+      let loaded = false
+      const access = async (name, args) => {
+        if (name === 'ops_read_files' && !loaded) throw new TypeError('tools.ops_read_files is not a function')
+        const verdict = await host.check(name, args, id, true)
+        if (verdict.kind !== 'allow') throw new Error(verdict.reason)
+        if (options.readFails) throw new Error('fixture read failed')
+        const path = args.file_path ?? args.files?.[0]?.path
+        return { path, content: readFileSync(join(cwd, path), 'utf8') }
+      }
+      const sdk = {
+        read: (args) => access('read', args),
+        async ops_load_sdk(args) {
+          const verdict = await host.check('ops_load_sdk', args, id, true)
+          if (verdict.kind !== 'allow') throw new Error(verdict.reason)
+          if (args.tools.includes('read_files')) {
+            loaded = true
+            sdk.ops_read_files = (args) => access('ops_read_files', args)
+          }
+        },
+      }
+      return sdk
+    },
     check(name, args = {}, id = sessionId, finalOnly = false) {
       return checkExec(execFor(name, args, id, undefined), finalOnly)
     },
@@ -235,7 +274,7 @@ function makeHost(options = {}) {
       const doc = host.call('flowgate_doc', {
         html: '<!doctype html><html><body>fixture requirements</body></html>',
         scope: {
-          files_expected_to_change: ['src/auth/session.ts'], capabilities: ['fixture'],
+          files_expected_to_change: ['src/auth/session.ts'], commands: [], capabilities: ['fixture'],
           out_of_scope_explicitly: [], acceptance_criteria: criteria ?? [{ id: 'AC-1', when: '运行', then: '可验证' }],
         },
       })
@@ -329,6 +368,77 @@ await test('新版 review：预留真实 childId，执行前已有最终只读�
   })
 })
 
+await test('初始 SDK 未加载 ops_read_files：默认 read 与按需加载均通过只读守卫', async () => {
+  await fixture({ onStart: async (activation, host) => {
+    if (!activation.spec.label.startsWith('评审')) return
+    const sdk = host.childSdk(activation.childId)
+    assert.equal(sdk.ops_read_files, undefined)
+    assert.match(activation.spec.prompt[0].text, /默认可用的 read/)
+    assert.doesNotMatch(activation.spec.prompt[0].text, /直接调用 tools\.ops_read_files/)
+    assert.equal((await host.check('ops_load_sdk', { tools: ['write_file'] }, activation.childId, true)).kind, 'deny')
+    await sdk.ops_load_sdk({ tools: ['read_files'] })
+    assert.equal((await sdk.ops_read_files({ files: [{ path: 'src/auth/session.ts' }] })).content, 'fixture source\n')
+    assert.equal((await sdk.read({ file_path: 'src/auth/session.ts' })).content, 'fixture source\n')
+  } }, async (host) => {
+    await host.advance()
+    const { before, value } = await host.complete('review', host.call('flowgate_review_run'))
+    assert.equal(value.next, 'S4')
+    assert.ok(before.review.angles.every((angle) => angle.coverage !== 'uncovered'))
+  })
+})
+
+for (const [name, content] of [['空文件', ''], ['纯空白文件', '  \n\t\n']]) {
+  await test(name + '成功读取后不误标未覆盖', async () => {
+    await fixture({}, async (host) => {
+      await host.advance()
+      writeFileSync(join(host.cwd, 'src/auth/session.ts'), content)
+      const { before, value } = await host.complete('review', host.call('flowgate_review_run'))
+      assert.equal(value.next, 'S4')
+      assert.ok(before.review.angles.every((angle) => angle.coverage !== 'uncovered'))
+    })
+  })
+}
+
+for (const [name, options] of [
+  ['读取失败', { readFails: true }],
+  ['读取失败且报告谎称已读', { readFails: true, response: () => ({
+    stopReason: 'completed', output: [{ type: 'text', text: JSON.stringify({
+      verdict: 'pass', checkedFiles: ['src/auth/session.ts'],
+      readEvidence: [{ file: 'src/auth/session.ts', firstLine: '猜测的内容', lastLine: '猜测的内容' }], findings: [],
+    }) }],
+  }) }],
+  ['读取成功但报告遗漏内容证据', { response: (activation) => ({
+    stopReason: 'completed', output: [{ type: 'text', text: JSON.stringify({
+      verdict: 'pass', checkedFiles: activation.checkedFiles, findings: [],
+    }) }],
+  }) }],
+  ['未读取目标文件', { skipRead: true }],
+  ['子代理主动报告未覆盖', { response: (activation) => ({
+    stopReason: 'completed', output: [{ type: 'text', text: JSON.stringify({ verdict: 'pass', coverage: 'uncovered', checkedFiles: activation.checkedFiles, findings: [] }) }],
+  }) }],
+  ['报告伪称已读取但无调用', { skipRead: true, response: () => ({
+    stopReason: 'completed', output: [{ type: 'text', text: JSON.stringify({
+      verdict: 'pass', checkedFiles: ['src/auth/session.ts'],
+      readEvidence: [{ file: 'src/auth/session.ts', firstLine: 'fixture source', lastLine: 'fixture source' }], findings: [],
+    }) }],
+  }) }],
+]) {
+  await test(name + '：聚合标未覆盖并拒绝评审通过', async () => {
+    await fixture(options, async (host) => {
+      await host.advance()
+      const pending = host.call('flowgate_review_run')
+      await eventually(async () => Boolean((await host.state()).review) && (await host.state()).waitingKind === 'gate', '待处理评审报告')
+      const report = (await host.state()).review
+      assert.ok(report.angles.every((angle) => angle.coverage === 'uncovered' && angle.verdict !== 'pass'))
+      const rejected = await host.requestAction('gate', { decision: 'pass' })
+      assert.equal(rejected.status, 409)
+      assert.match(rejected.body.error, /读取失败|未检查/)
+      assert.equal((await host.state()).stage, 'S3')
+      await host.complete('review', pending, { decision: 'skip' })
+    })
+  })
+}
+
 await test('新版 test：按方向聚合通过、失败与未覆盖，清理后才进入门禁', async () => {
   await fixture({}, async (host) => {
     await host.advance('S4', { reviewDecision: 'skip' })
@@ -339,6 +449,8 @@ await test('新版 test：按方向聚合通过、失败与未覆盖，清理后
     }
     const { before, value } = await host.complete('test', host.call('flowgate_test_run'))
     assert.equal(host.activations.length, before.directions.length)
+    assert.match(host.activations[0].spec.prompt[0].text, /默认可用的 read/)
+    assert.doesNotMatch(host.activations[0].spec.prompt[0].text, /直接调用 tools\.ops_read_files/)
     assert.equal(before.test.failed, 1)
     assert.equal(before.test.by, 'subagents')
     assert.deepEqual(before.test.directions[0].points.map((point) => point.result), ['pass', 'fail', 'uncovered'])
@@ -361,7 +473,7 @@ for (const [name, options, explanation] of [
     await fixture(options, async (host) => {
       await host.advance()
       assert.equal((await host.state()).canSpawn, false)
-      const { before } = await host.complete('review', host.call('flowgate_review_run'))
+      const { before } = await host.complete('review', host.call('flowgate_review_run'), { decision: 'skip' })
       assert.equal(host.activations.length, 0)
       assert.deepEqual(host.oldCalls, [])
       assert.ok(before.review.angles.every((angle) => angle.verdict === 'advisory'))
@@ -379,11 +491,11 @@ await test('异步 result：第一子代理未完成时不提前聚合或启动�
     assert.equal((await host.state()).review, null)
     assert.equal((await host.state()).stageSummary.execution.status, 'running', 'receipt 任务 ID 不能证明 result 已完成')
     assert.equal(pending.settled, false)
-    host.activations[0].result.resolve(reportFor(host.activations[0].spec))
+    host.activations[0].result.resolve(reportForActivation(host.activations[0]))
     await eventually(() => host.activations.length === 2, '第二个 activation')
     assert.equal(host.activations[0].disposeCalls, 1)
     assert.equal((await host.state()).review, null)
-    host.activations[1].result.resolve(reportFor(host.activations[1].spec))
+    host.activations[1].result.resolve(reportForActivation(host.activations[1]))
     const { before } = await host.complete('review', pending.promise)
     assert.equal(before.review.angles.length, 2)
     assert.equal(before.stageSummary.execution.status, 'completed')
@@ -424,7 +536,7 @@ await test('最终守卫默认拒绝未知、写入、代理、消息、流程�
       await eventually(() => host.activations.length > index, 'activation ' + index)
       host.activations[index].result.resolve(reportFor(host.activations[index].spec))
     }
-    await host.complete('review', pending)
+    await host.complete('review', pending, { decision: 'skip' })
   })
 })
 
@@ -463,7 +575,7 @@ await test('run_code 只允许单个严格 JSON 工具转发，嵌套目标受�
       await eventually(() => host.activations.length > index, 'activation ' + index)
       host.activations[index].result.resolve(reportFor(host.activations[index].spec))
     }
-    await host.complete('review', pending)
+    await host.complete('review', pending, { decision: 'skip' })
   })
 })
 
@@ -500,7 +612,7 @@ for (const [name, options, marker] of [
     await test(kind + ' 的' + name + '可见降级且不悬挂', async () => {
       await fixture(options, async (host) => {
         await host.advance(kind === 'review' ? 'S3' : 'S4')
-        const { before } = await host.complete(kind, host.call('flowgate_' + kind + '_run'))
+        const { before } = await host.complete(kind, host.call('flowgate_' + kind + '_run'), { decision: 'skip' })
         const report = before[kind]
         assert.equal(before.stageSummary.execution.status, 'failed', '降级报告不能掩盖实际执行失败')
         assert.match(JSON.stringify(report), marker)
@@ -614,7 +726,7 @@ for (const failure of ['startFails', 'cleanupFails']) {
 await test('夹具内断言不能被生产降级逻辑吞掉', async () => {
   await assert.rejects(fixture({ onStart: () => assert.fail('fixture assertion sentinel') }, async (host) => {
     await host.advance()
-    await host.complete('review', host.call('flowgate_review_run'))
+    await host.complete('review', host.call('flowgate_review_run'), { decision: 'skip' })
   }), /fixture assertion sentinel/)
 })
 
@@ -622,7 +734,7 @@ for (const kind of ['review', 'test']) {
   await test(kind + ' 接收 structured 报告，不依赖文本 JSON', async () => {
     await fixture({ response: (activation) => ({
       stopReason: 'completed',
-      structured: JSON.parse(reportFor(activation.spec, activation.points).output[0].text),
+      structured: JSON.parse(reportForActivation(activation).output[0].text),
       output: [{ type: 'text', text: '这段文本不是 JSON' }],
     }) }, async (host) => {
       await host.advance(kind === 'review' ? 'S3' : 'S4')
@@ -647,7 +759,7 @@ for (const [name, report] of [
   await test('合法 JSON 的坏评审结构也降级：' + name, async () => {
     await fixture({ response: () => ({ stopReason: 'completed', output: [{ type: 'text', text: JSON.stringify(report) }] }) }, async (host) => {
       await host.advance()
-      const { before } = await host.complete('review', host.call('flowgate_review_run'))
+      const { before } = await host.complete('review', host.call('flowgate_review_run'), { decision: 'skip' })
       assert.ok(before.review.angles.every((angle) => angle.verdict === 'advisory'))
       assert.ok(before.review.angles.every((angle) => angle.findings[0].severity === 'MINOR'))
       assert.match(JSON.stringify(before.review), /有效的 JSON 评审报告/)
@@ -983,7 +1095,7 @@ for (const kind of ['review', 'test']) for (const stale of [false, true]) {
       },
       response: (activation) => ({
         stopReason: 'completed',
-        structured: { ...JSON.parse(reportFor(activation.spec, activation.points).output[0].text), acceptance: activation.acceptance ?? [] },
+        structured: { ...JSON.parse(reportForActivation(activation).output[0].text), acceptance: activation.acceptance ?? [] },
         output: [],
       }),
     }, async (host) => {
