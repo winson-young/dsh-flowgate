@@ -47,6 +47,8 @@ S2 的 shell 默认只允许只读命令（`pwd`、`ls`、`cat`、`git status/di
 
 评审与默认测试子代理在执行前按预留的 `childId` 登记到父流程，并由 `tools.guard` 最终工具守卫强制只读。写入 / 编辑工具及未知的变更工具默认拒绝；未经写授权的 shell 走同一套只读白名单：`pwd`、`ls`、`cat`、`git status/diff/log/show/rev-parse/ls-files`、`git branch --list` 与 `node --check`、`tsc --noEmit` 放行。只读 Git 是特意开的——子代理核不了 diff 时，评审只能按文件正文猜改了什么，测试也查不出工作区多出多余改动。`git push`、`git commit`、`git checkout` 这类改变仓库状态的命令仍然拒绝，管道与解释器内联同样拒绝。`script_path`、解释器和包测试脚本默认拒绝。读取通过结构化工具完成，`run_code` 只接受一个工具调用或 `Promise.all` 里的一批只读调用（参数必须是严格 JSON），不能执行任意 JavaScript；并行只读是为了让子代理一次取回多个文件或多次检索，而不是逐条等一轮。需要修复代码时，回退到 S2 由开发阶段处理；这层守卫仍需配合宿主文件系统沙箱。
 
+评审角度的读取痕迹按同一口径记账：单次读取与 `Promise.all` 里的每一路读取都算「读过这个文件」，目标文件少一条痕迹、读取失败、或者报告里的首尾行与磁盘内容对不上，该角度一律标成未覆盖（`verdict` 也不会是 `pass`），S3 门禁随后拒绝通过评审。提示词让子代理优先用默认可用的 `read`，并写明 `ops_*` 系列默认没有加载、需要时先调 `ops_load_sdk({"tools":["read_files"]})` 下一轮才能用——否则子代理会照提示直接调用未加载的 `tools.ops_read_files`，报 `not a function`，然后在没读到源码的情况下交一份空 findings 的「通过」。
+
 ### 测试方向的写权限例外
 
 迁移后回滚等测试可能需要执行变更性命令。授权要满足以下条件：

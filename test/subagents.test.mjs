@@ -375,6 +375,9 @@ await test('初始 SDK 未加载 ops_read_files：默认 read 与按需加载均
     assert.equal(sdk.ops_read_files, undefined)
     assert.match(activation.spec.prompt[0].text, /默认可用的 read/)
     assert.doesNotMatch(activation.spec.prompt[0].text, /直接调用 tools\.ops_read_files/)
+    // 提示要给出自救路径：ops_* 默认未加载，先 ops_load_sdk 下一轮才可用。
+    assert.match(activation.spec.prompt[0].text, /先调 ops_load_sdk/)
+    assert.match(activation.spec.prompt[0].text, /下一轮才能用/)
     assert.equal((await host.check('ops_load_sdk', { tools: ['write_file'] }, activation.childId, true)).kind, 'deny')
     await sdk.ops_load_sdk({ tools: ['read_files'] })
     assert.equal((await sdk.ops_read_files({ files: [{ path: 'src/auth/session.ts' }] })).content, 'fixture source\n')
@@ -398,6 +401,48 @@ for (const [name, content] of [['空文件', ''], ['纯空白文件', '  \n\t\n'
     })
   })
 }
+
+await test('并行读取也算读过：Promise.all 读到目标文件后不判未覆盖', async () => {
+  await fixture({
+    skipRead: true,
+    onStart: async (activation, host) => {
+      if (!activation.spec.label.startsWith('评审')) return
+      const code = 'return await Promise.all([tools.read({"file_path":"src/auth/session.ts"}), tools.read({"file_path":"src/auth/other.ts"})])'
+      const verdict = await host.check('run_code', { code }, activation.childId, true)
+      assert.equal(verdict.kind, 'allow', '并行只读应放行')
+      activation.checkedFiles = ['src/auth/session.ts']
+      activation.readEvidence = [{ file: 'src/auth/session.ts', firstLine: 'fixture source', lastLine: 'fixture source' }]
+    },
+  }, async (host) => {
+    await host.advance()
+    const { before, value } = await host.complete('review', host.call('flowgate_review_run'))
+    assert.equal(value.next, 'S4')
+    assert.ok(before.review.angles.every((angle) => angle.coverage !== 'uncovered'), JSON.stringify(before.review.angles))
+  })
+})
+
+await test('并行读取没碰到目标文件时仍判未覆盖', async () => {
+  await fixture({
+    skipRead: true,
+    onStart: async (activation, host) => {
+      if (!activation.spec.label.startsWith('评审')) return
+      const code = 'return await Promise.all([tools.read({"file_path":"src/auth/other.ts"}), tools.read({"file_path":"src/auth/third.ts"})])'
+      await host.check('run_code', { code }, activation.childId, true)
+      activation.checkedFiles = ['src/auth/session.ts']
+      activation.readEvidence = [{ file: 'src/auth/session.ts', firstLine: 'fixture source', lastLine: 'fixture source' }]
+    },
+  }, async (host) => {
+    await host.advance()
+    const pending = host.call('flowgate_review_run')
+    await eventually(async () => Boolean((await host.state()).review) && (await host.state()).waitingKind === 'gate', '待处理评审报告')
+    const report = (await host.state()).review
+    assert.ok(report.angles.every((angle) => angle.coverage === 'uncovered' && angle.verdict !== 'pass'), JSON.stringify(report.angles))
+    const rejected = await host.requestAction('gate', { decision: 'pass' })
+    assert.equal(rejected.status, 409)
+    assert.match(rejected.body.error, /读取失败|未检查/)
+    await host.complete('review', pending, { decision: 'skip' })
+  })
+})
 
 for (const [name, options] of [
   ['读取失败', { readFails: true }],

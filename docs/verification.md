@@ -6,6 +6,31 @@
 
 历史记录中的 `by: 'subagents'` 仅表明调用了子代理聚合入口；聚合报告通过、`blocking: 0` 或流程走完，均不能证明真实子代理成功执行并返回有效报告。下文原有结论保留，其证据范围受此限定。
 
+## 评审子代理读取口径与并行读取记账（2026-11-21）
+
+需求：核查「评审子代理读取能力与提示不一致」——提示要求子代理直接调用 `tools.ops_read_files`，但该工具在按需 SDK 环境里可能尚未加载；历史评审报告记录过 `TypeError: tools.ops_read_files is not a function`，子代理没读源码却提交 `verdict: pass`、空 findings；测试夹具预置了该工具，没有模拟真实加载。要求提示改用默认可用的读取工具或给出按需加载路径，保持只读守卫边界，读取失败或未检查目标文件时角度必须标未完成 / 未覆盖，不得因 findings 为空判通过。
+
+核查结论：提示与降级路径已由提交 `ad26580`（2026-11-21 01:19）修掉——提示改为「优先直接使用默认可用的 `read`」，`readAttempts` 采集实际读过的路径，`runAngle` 在读取失败、缺痕迹、内容证据对不上时一律降级成 `uncovered`，S3 门禁随之拒绝通过。本轮补的是同一族里的一个残留缺陷：`childDenial` 记录读取痕迹时只调 `parseSingleToolCall`，`Promise.all` 并行读取（提示词明确鼓励的写法）不会被记账，`runAngle` 的 `attempted.has(file)` 校验会把「并行读到了」误判成「没尝试读」，把本该通过的角度降级成未覆盖。
+
+改动范围：`lib/index.js`（新增 `recordReadAttempts`，同时处理单调用与 `Promise.all` 并行调用；`childDenial` 改为调用它；`anglePrompt` / `directionPrompt` 补 `ops_*` 默认未加载与 `ops_load_sdk` 的自救路径；`shellDenial` 与 `runCodeDenial` 的拒绝文案把 `ops_read_files` 改成 `read`）、`test/subagents.test.mjs`、`docs/development.md`。
+
+| 验收项 | 状态 | 证据与限制 |
+| :--- | :--- | :--- |
+| AC-1 `Promise.all` 并行读取也计入读取痕迹 | 通过 | `test/subagents.test.mjs` 的「并行读取也算读过：Promise.all 读到目标文件后不判未覆盖」：子代理用 `return await Promise.all([tools.read({...session.ts}), tools.read({...other.ts})])` 读取，断言该角度 `coverage !== 'uncovered'` 且评审门禁能推进到 S4。反向验证：把 `recordReadAttempts` 里的 `parseParallelCalls` 分支临时改成 `null`，该用例立刻失败，说明新用例真的卡住了这个缺陷 |
+| AC-2 并行读取没碰到目标文件时仍判未覆盖 | 通过 | 同文件「并行读取没碰到目标文件时仍判未覆盖」：并行只读 `other.ts` 与 `third.ts`，报告却声称检查了 `session.ts`，断言角度 `coverage === 'uncovered'` 且 `verdict !== 'pass'`，门禁 `pass` 请求返回 409 并匹配 `/读取失败|未检查/`。记账放宽不等于放水：读过的文件才算读过 |
+| AC-3 提示给出按需加载路径 | 通过 | 「初始 SDK 未加载 ops_read_files：默认 read 与按需加载均通过只读守卫」新增两条断言 `/先调 ops_load_sdk/` 与 `/下一轮才能用/`；同一用例还断言 `ops_load_sdk({tools:['write_file']})` 被拒、加载后 `ops_read_files` 可用 |
+| AC-4 提示不再要求直接调用未加载的工具 | 通过 | 既有断言 `doesNotMatch(/直接调用 tools\.ops_read_files/)`；`lib/index.js` 全文 grep 不到「直接调用 tools.ops_read_files」，两处拒绝文案也不再点名 `ops_read_files` |
+| AC-5 读取失败或未检查目标文件不得生成评审通过 | 通过 | 既有六种失败形态（读取失败、读取失败且报告谎称已读、读取成功但报告遗漏内容证据、未读取目标文件、子代理主动报告未覆盖、报告伪称已读取但无调用）全部断言 `coverage === 'uncovered'` 且 `verdict !== 'pass'`，门禁 `pass` 返回 409 |
+| AC-6 初始 SDK 不含 `ops_read_files` 时仍能完成授权读取 | 通过 | `test/integration.test.mjs` 断言 `sdk.ops_read_files === undefined`（初始不预加载）；`test/subagents.test.mjs` 的夹具在未加载时抛 `TypeError('tools.ops_read_files is not a function')`，复现真实失败形态而不是预置成功 |
+| AC-7 无回归 | 通过 | 八个测试入口整组通过：内容快照 20、验收账本 24、运行版本 18、宿主 343、子代理 82、集成 33、客户端 226、安装 17，合计 763 项；`scripts/stamp-revisions.mjs --check` 输出 `Module revisions verified (6 modules).` |
+
+### 已知未通过项
+
+无。
+
+### 真实视觉未覆盖
+
+本轮改动集中在提示词与守卫判定，没有界面改动。未在真实模型驱动下端到端跑通「并行读取 → 角度通过 → S3 门禁通过」这条路径，验证只到组件与宿主黑盒层面。本机 `.dsh-flowgate/flows` 里 7 个有评审记录的流程，每个角度的 `checkedFiles` 都是 0，且评审时间全部早于 `ad26580`（2026-11-21 01:19），无法用真实数据证明修复后的读取痕迹确实落盘；唯一一条读取相关痕迹是 `f_b838f9eb-b9a` 的「正确性」角度记录了 `子代理未正常结束（error）`，它被降级成 `advisory` 而没有变成 `pass`，说明降级路径在真实数据里生效过一次。
 ## 例外结项与正常验收的状态语义分离（2026-11-21）
 
 需求：最近多次流程以「带缺口」方式结束，AC 大量未覆盖、几乎没有通过，但结项逻辑仍然写 `gate.passed` 与 `flow.finished`；工作台门禁按钮与 dock 快捷按钮点击时自动附带 `acceptUncovered: true`，接受说明可以为空；另有流程测试提交 `failed: 0`，而 AC 实际是 0 通过 / 3 未覆盖（`failed` 只统计测试要点里的失败项）。要求把「测试要点失败数」「AC 通过/失败/未覆盖数」「流程结束方式」分开统计与展示，带缺口结项要独立确认、列出缺口、记录接受原因，不得在汇总、按钮或对外状态中等同于全部验收通过，同时保留用户接受风险并结束流程的能力。
