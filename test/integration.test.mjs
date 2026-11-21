@@ -216,7 +216,6 @@ await check('Hub 无流程时保存规则，不建立流程或 scope 授权', as
 })
 
 const REQUIREMENT_BRIEF = '  原文需求 src/auth/session.ts\n约束 123 保持完整。  '
-const REQUIREMENT_SUMMARY = '整理后的需求：会话过期时返回 401。'
 
 await check('prepare 在没有模型能力时降级，不启动流程也不改变配置', async () => {
   const file = join(CWD, '.dsh-flowgate', 'config.json')
@@ -225,14 +224,14 @@ await check('prepare 在没有模型能力时降级，不启动流程也不改�
   assert.equal(prepared.status, 200)
   assert.equal(prepared.data.status, 'fallback')
   assert.equal(prepared.data.title, '原文需求 src/auth/session.ts')
-  assert.equal(prepared.data.summary, REQUIREMENT_BRIEF.trim())
+  assert.equal('summary' in prepared.data, false, 'prepare 只返回标题，不再返回整理稿')
   assert.equal((await getState()).active, false)
   assert.equal(readFileSync(file, 'utf8'), before)
   assert.equal(existsSync(join(CWD, '.dsh-flowgate', 'scope.json')), false)
 })
 
 await check('flowgate_start 启动流程并进入 S1', async () => {
-  const value = await call('flowgate_start', { title: '会话过期检测', preset: 'fast', brief: REQUIREMENT_BRIEF, summary: REQUIREMENT_SUMMARY })
+  const value = await call('flowgate_start', { title: '会话过期检测', preset: 'fast', brief: REQUIREMENT_BRIEF })
   assert.equal(value.stage, 'S1')
   const view = await getState()
   assert.equal(view.active, true)
@@ -241,7 +240,7 @@ await check('flowgate_start 启动流程并进入 S1', async () => {
   assert.equal(view.ruleSource, 'workspace')
   assert.deepEqual(view.ruleIds, ['scope-only', 'integration-rule'])
   assert.equal(view.brief, REQUIREMENT_BRIEF)
-  assert.equal(view.summary, REQUIREMENT_SUMMARY)
+  assert.equal(view.summary, undefined, '状态里不再带整理稿，需求依据只有原文')
   for (const stage of ['S1', 'S2', 'S3', 'S4']) assert.equal(view.stageConfigs[stage].source, 'workspace')
   assert.match((await call('flowgate_status', {})).summary, /集成工作区规则 S1/)
 })
@@ -738,7 +737,7 @@ await check('hub 按工作区返回流程摘要与待确认数', async () => {
   assert.equal(typeof workspace.waitingCount, 'number')
   assert.equal(workspace.activeCount, workspace.flows.filter((item) => !item.finished && !item.cancelled).length)
   assert.ok(flow.brief.length <= 200, 'brief 要截断，别把长需求整段塞进面板')
-  assert.equal(flow.summary, REQUIREMENT_SUMMARY)
+  assert.equal(flow.summary, undefined, 'Hub 列表也不再带整理稿')
 })
 
 await check('hub 带上重复路径时不重复计入', async () => {

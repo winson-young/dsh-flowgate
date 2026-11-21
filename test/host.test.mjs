@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply, scopeDenial, shellDenial, currentService, parseChanges } from '../lib/index.js'
-import { prepareRequirement } from '../lib/requirements.js'
+import { prepareRequirement, SYSTEM_PROMPT, TIMEOUT_MS } from '../lib/requirements.js'
 
 // ---------------------------------------------------------------------------
 // 宿主端 mock：只实现插件实际用到的 ctx 成员。
@@ -1123,8 +1123,18 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
     action: 'start',
     payload: { brief: '一'.repeat(60) },
   })
-  check('过长的需求第一行会被截断成标题', () => {
-    assert.equal(longTitle.body.title, '一'.repeat(40) + '…')
+  check('过长的需求第一行按 24 字截断成标题', () => {
+    assert.equal(longTitle.body.title, '一'.repeat(24))
+  })
+  const rewritten = await makeHost(join(cwd, 'brief-rewritten'), 'sess-brief-rewritten').request('/api/flowgate/action', {
+    sessionId: 'sess-brief-rewritten',
+    action: 'start',
+    payload: { title: '模型改写的标题', brief: '  原文不许动：路径 src/a.js 与 123\n第二行  ' },
+  })
+  check('标题被改写时需求原文逐字保留，快照里没有第二份需求文本', () => {
+    assert.equal(rewritten.body.title, '模型改写的标题')
+    assert.equal(rewritten.body.brief, '  原文不许动：路径 src/a.js 与 123\n第二行  ')
+    assert.equal('summary' in rewritten.body, false)
   })
   const noCwd = await uiCtx.request('/api/flowgate/action', {
     sessionId: 'sess-no-cwd',
@@ -1785,7 +1795,7 @@ rmSync(cwd, { recursive: true, force: true })
   const revised = await cx.request('/api/flowgate/action', {
     sessionId: 'sess-revise',
     action: 'doc',
-    payload: { decision: 'revise' },
+    payload: { decision: 'revise', revisionNote: '把 AC-2 的测量方式写清楚，并补上失败分支' },
   })
   check('修改需求后仍停在 S1', () => {
     assert.equal(revised.status, 200)
@@ -1799,6 +1809,95 @@ rmSync(cwd, { recursive: true, force: true })
     assert.match(text, /重新提交 flowgate_doc/)
     assert.doesNotMatch(text, /scope 已冻结/)
   })
+  check('修改意见原文原样进入唤醒消息', () => {
+    const last = cx.delivered[cx.delivered.length - 1]
+    const text = last.message.content.map((block) => block.text).join('\n')
+    assert.match(text, /把 AC-2 的测量方式写清楚，并补上失败分支/)
+  })
+  const revisedState = await cx.request('/api/flowgate/state?sessionId=sess-revise')
+  check('修改意见原文落盘到快照与事件日志', () => {
+    assert.equal(revisedState.body.doc.revisionNote, '把 AC-2 的测量方式写清楚，并补上失败分支')
+    const events = readFileSync(join(cwd, '.dsh-flowgate', 'flows.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+    const revisedEvent = events.filter((event) => event.type === 'doc.revised').at(-1)
+    assert.equal(revisedEvent.detail.note, '把 AC-2 的测量方式写清楚，并补上失败分支')
+  })
+}
+
+// 文档工具还挂在等待器上时点「修改需求」：这句意见必须原样回到工具返回值里。
+// 只有补发唤醒消息这条支路带备注是不够的 —— 用户大多数时候并不会中断工具再点按钮。
+{
+  const sid = 'sess-revise-live'
+  const cwd = join(testRoot, sid)
+  const cx = makeHost(cwd, sid)
+  await cx.tool('flowgate_start', { title: '意见直达', preset: 'fast' })
+  const scope = {
+    commands: [],
+    files_expected_to_change: ['src/auth/session.ts'],
+    capabilities: ['会话过期检测'],
+    out_of_scope_explicitly: [],
+    acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
+  }
+  const liveCall = cx.tool('flowgate_doc', { html: '<html><body><p>待改</p></body></html>', scope })
+  await tick()
+  const liveNote = '  把 AC-1 的失败分支补上，并写明退出码  '
+  await cx.request('/api/flowgate/action', { sessionId: sid, action: 'doc', payload: { decision: 'revise', revisionNote: liveNote } })
+  const liveResult = await liveCall
+  check('AC-11 文档工具在途时点修改需求，意见原文直接回到工具返回值', () => {
+    assert.equal(liveResult.decision, 'revise')
+    assert.match(liveResult.message, /把 AC-1 的失败分支补上，并写明退出码/)
+    assert.match(liveResult.message, /进入 S1/)
+    assert.doesNotMatch(liveResult.message, /补齐未决项/)
+  })
+  await cx.tool('flowgate_cancel', {})
+}
+
+// 空着意见点提交：工具值不能假装有意见，必须明确告诉 Agent 先问清要改什么。
+{
+  const sid = 'sess-revise-empty'
+  const cwd = join(testRoot, sid)
+  const cx = makeHost(cwd, sid)
+  await cx.tool('flowgate_start', { title: '空白意见', preset: 'fast' })
+  const scope = {
+    commands: [],
+    files_expected_to_change: ['src/auth/session.ts'],
+    capabilities: ['会话过期检测'],
+    out_of_scope_explicitly: [],
+    acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
+  }
+  const emptyCall = cx.tool('flowgate_doc', { html: '<html><body><p>待改</p></body></html>', scope })
+  await tick()
+  await cx.request('/api/flowgate/action', { sessionId: sid, action: 'doc', payload: { decision: 'revise', revisionNote: '   ' } })
+  const emptyResult = await emptyCall
+  check('AC-11 没填修改意见时，工具返回值要求先问清要改什么', () => {
+    assert.equal(emptyResult.decision, 'revise')
+    assert.match(emptyResult.message, /没有填写修改意见/)
+    assert.doesNotMatch(emptyResult.message, /修改意见原文/)
+  })
+  await cx.tool('flowgate_cancel', {})
+}
+
+// 2000 字是备注的硬上限：超出的部分不进快照，长度断言就是这条边界的证据。
+{
+  const sid = 'sess-revise-long'
+  const cwd = join(testRoot, sid)
+  const cx = makeHost(cwd, sid)
+  await cx.tool('flowgate_start', { title: '超长意见', preset: 'fast' })
+  const scope = {
+    commands: [],
+    files_expected_to_change: ['src/auth/session.ts'],
+    capabilities: ['会话过期检测'],
+    out_of_scope_explicitly: [],
+    acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
+  }
+  const longCall = cx.tool('flowgate_doc', { html: '<html><body><p>待改</p></body></html>', scope })
+  await tick()
+  await cx.request('/api/flowgate/action', { sessionId: sid, action: 'doc', payload: { decision: 'revise', revisionNote: '改'.repeat(2500) } })
+  await longCall
+  const longState = await cx.request('/api/flowgate/state?sessionId=' + sid)
+  check('AC-11 修改意见按 2000 字上限收口后落盘', () => {
+    assert.equal(longState.body.doc.revisionNote.length, 2000)
+  })
+  await cx.tool('flowgate_cancel', {})
 }
 
 // 门禁被中断后点「退回开发修复」：Agent 必须被告知回到 S2 重做，否则它会停在 S3。
@@ -2493,7 +2592,6 @@ for (const [kind, reason, expected] of [
       assert.deepEqual(afterFailure, saved.body.rules.stages)
     })
     const brief = '  需求原文含路径 src/a.js 与数字 123\n' + '完整保留需求原文。\n'.repeat(650) + '\n '
-    const summary = '整理后的需求\n\n' + '验证整理稿完整恢复。'.repeat(35)
     const badPreset = await act('start', { preset: 'turbo', brief: '档位写错' })
     const noFlowYet = await cx.request('/api/flowgate/state?sessionId=' + sid)
     check('未知档位启动被拒绝，不静默回落到 fast', () => {
@@ -2501,19 +2599,20 @@ for (const [kind, reason, expected] of [
       assert.match(badPreset.body.error, /未知档位/)
       assert.equal(noFlowYet.body.active, false)
     })
-    const started = await act('start', { title: '语义标题', brief, summary, preset: 'strict' })
-    const duplicate = await act('start', { title: '重复标题', brief: '替换原文', summary: '替换摘要', preset: 'fast' })
+    const started = await act('start', { title: '语义标题', brief, preset: 'strict' })
+    const duplicate = await act('start', { title: '重复标题', brief: '替换原文', preset: 'fast' })
     const afterDuplicate = await cx.request('/api/flowgate/state?sessionId=' + sid)
-    check('流程完整独立保存原文和整理稿，重复启动被拒绝', () => {
+    check('流程完整独立保存原文，重复启动被拒绝', () => {
       assert.equal(started.status, 200)
       assert.equal(started.body.title, '语义标题')
       assert.equal(started.body.brief, brief)
-      assert.equal(started.body.summary, summary)
+      // 需求整理稿已废弃：快照里不能再带这个字段，需求依据只有 brief。
+      assert.equal('summary' in started.body, false)
       assert.equal(duplicate.status, 409)
       assert.match(duplicate.body.error, /已有流程在进行/)
       assert.equal(afterDuplicate.body.id, started.body.id)
       assert.equal(afterDuplicate.body.brief, brief)
-      assert.equal(afterDuplicate.body.summary, summary)
+      assert.equal('summary' in afterDuplicate.body, false)
       assert.equal(afterDuplicate.body.preset, 'strict')
       assert.equal(started.body.scope.frozen, false)
       assert.deepEqual(started.body.writeGrants, [])
@@ -2521,16 +2620,21 @@ for (const [kind, reason, expected] of [
       assert.deepEqual(started.body.stageConfigs.S1.ids, defaults.S1.defaults.strict)
       assert.ok(started.body.directions.every((item) => !item.writeGranted))
       assert.match(cx.delivered[0].message.content.map((item) => item.text).join('\n'), /执行标记 S1/)
-      assert.match(cx.delivered[0].message.content.map((item) => item.text).join('\n'), /整理后的需求/)
+      assert.match(cx.delivered[0].message.content.map((item) => item.text).join('\n'), /完整保留需求原文/)
+      // 需求依据只能来自原文：唤醒消息里出现 brief 首行，而不是把标题当成需求描述。
+      const wake = cx.delivered[0].message.content.map((item) => item.text).join('\n')
+      assert.match(wake, /需求原文含路径 src\/a\.js 与数字 123/)
+      assert.match(wake, /需求分析以「需求原文」为唯一依据/)
+      assert.equal(wake.includes('需求整理稿'), false)
     })
     const status = await cx.tool('flowgate_status', {})
     const page = await post('flows', { path: ws })
     check('S1 消费工作区需求规则，当前流程全文与历史短摘要独立', () => {
       assert.match(status.summary, /执行标记 S1/)
-      assert.equal(page.body.currentFlow.summary, summary)
       assert.equal(page.body.currentFlow.brief, brief)
-      assert.equal(page.body.flows.find((flow) => flow.id === started.body.id).summary, summary.slice(0, 200))
+      assert.equal(page.body.currentFlow.summary, undefined)
       assert.equal(page.body.flows.find((flow) => flow.id === started.body.id).brief, brief.slice(0, 200))
+      assert.equal(page.body.flows.find((flow) => flow.id === started.body.id).summary, undefined)
       assert.equal(started.body.stage, 'S1')
     })
     for (const [stage, id] of Object.entries(chosen)) {
@@ -2579,9 +2683,9 @@ for (const [kind, reason, expected] of [
     })
     const titleHost = makeHost(other, 'long-title-start')
     const longTitle = await titleHost.request('/api/flowgate/action', { sessionId: 'long-title-start', action: 'start', payload: { title: '标'.repeat(500), brief: '标题截断' } })
-    check('超长标题截断到 120 字符，不写进快照', () => {
+    check('超长标题按 24 字截断，不写进快照', () => {
       assert.equal(longTitle.status, 200)
-      assert.equal(longTitle.body.title.length, 120)
+      assert.equal(longTitle.body.title.length, 24)
     })
     // 这条流程只是参数校验的载体，立刻结束，免得抢走后面 Hub 的 currentFlow。
     await titleHost.tool('flowgate_cancel', {})
@@ -2593,20 +2697,22 @@ for (const [kind, reason, expected] of [
     const file = join(ws, '.dsh-flowgate', 'flows', started.body.id + '.json')
     const restarted = makeHost(ws, sid)
     const loaded = await restarted.request('/api/flowgate/state?sessionId=' + sid)
-    check('重启恢复需求原文和整理稿全文', () => {
+    check('重启恢复需求原文', () => {
       assert.equal(loaded.body.brief, brief)
-      assert.equal(loaded.body.summary, summary)
+      assert.equal(loaded.body.summary, undefined)
     })
-    const old = JSON.parse(readFileSync(file, 'utf8')); delete old.summary
+    // 旧快照可能还带着已废弃的整理稿字段：读盘时一律丢掉，不能让界面或提示词再用到它。
+    const old = JSON.parse(readFileSync(file, 'utf8')); old.summary = '旧版整理稿残留'
     writeFileSync(file, JSON.stringify(old))
     const legacyHost = makeHost(ws, sid)
     const legacyPage = await legacyHost.request('/api/flowgate/hub/flows', { path: ws })
     const legacyPageAgain = await legacyHost.request('/api/flowgate/hub/flows', { path: ws, pageSize: 1 })
     const legacyState = await legacyHost.request('/api/flowgate/state?sessionId=' + sid)
-    check('旧流程没有 summary 时详情和 Hub 都回落原文', () => {
-      assert.equal(legacyState.body.summary, brief)
-      assert.equal(legacyPage.body.flows.find((flow) => flow.id === old.id).summary, brief.slice(0, 200))
-      assert.equal(legacyPage.body.currentFlow.summary, brief)
+    check('旧流程的整理稿字段被忽略，详情和 Hub 只给原文', () => {
+      assert.equal(legacyState.body.brief, brief)
+      assert.equal(legacyState.body.summary, undefined)
+      assert.equal(legacyPage.body.flows.find((flow) => flow.id === old.id).summary, undefined)
+      assert.equal(legacyPage.body.currentFlow.summary, undefined)
       assert.equal(legacyPage.body.currentFlow.brief, brief)
       assert.deepEqual(legacyPageAgain.body.currentFlow, legacyPage.body.currentFlow)
     })
@@ -2798,7 +2904,7 @@ for (const [kind, reason, expected] of [
   ]
   const calls = [], streams = []
   let created = 0, delivered = 0, modelFails = false
-  let modelResult = { title: '工作区模型生成标题', summary: '目标\n\n完整整理后的需求：src/a.js，保留 123 与约束。' }
+  let modelResult = { title: '工作区模型生成标题' }
   const services = {
     sessions: { list: () => live, get: (id) => live.find((session) => session.header.id === id), create() { created++; throw new Error('不许创建会话') } },
     agents: { get: (id) => ({ model: { current: () => id === 'missing-model' ? undefined : { provider: 'fixture-provider', model: 'fixture-' + id } }, followup() { delivered++ } }) },
@@ -2823,18 +2929,27 @@ for (const [kind, reason, expected] of [
     const page = await post('flows', { path: ws })
     check('prepare 优先当前工作区已有模型，跳过其他工作区和子会话且不创建流程', () => {
       assert.equal(prepared.status, 200)
-      assert.deepEqual(prepared.body, { title: '工作区模型生成标题', summary: '目标\n\n完整整理后的需求：src/a.js，保留 123 与约束。', status: 'ready' })
+      assert.deepEqual(prepared.body, { title: '工作区模型生成标题', status: 'ready' })
       assert.equal(calls.length, 1)
       assert.equal(calls[0].config.model, 'fixture-same-workspace')
       assert.equal(streams[0].sessionId, 'same-workspace')
       assert.deepEqual(streams[0].tools, [])
       assert.equal(streams[0].maxTokens, 2048)
       assert.equal(JSON.parse(streams[0].messages[0].content[0].text).brief, brief)
+      // 提示词本身必须带上会话标题的口径，否则模型只会照着原文首句复述。
+      assert.equal(streams[0].system, SYSTEM_PROMPT)
+      assert.match(streams[0].system, /会话标题/)
+      assert.match(streams[0].system, /名词短语/)
+      assert.match(streams[0].system, /4 到 12 个字/)
+      assert.match(streams[0].system, /只输出一个 JSON 对象/)
       assert.equal(state.body.active, false)
       assert.equal(page.body.total, 0)
       assert.equal(created, 0)
       assert.equal(delivered, 0)
       assert.equal(existsSync(join(ws, '.dsh-flowgate')), false)
+    })
+    check('标题生成期限固定为 6000ms', () => {
+      assert.equal(TIMEOUT_MS, 6_000)
     })
     for (const value of [null, [], {}, 1, false]) assert.equal((await post('prepare', { path: ws, brief: value })).status, 400)
     assert.equal((await post('prepare', { path: ws, brief: 'x'.repeat(20001) })).status, 400)
@@ -2847,81 +2962,25 @@ for (const [kind, reason, expected] of [
       assert.equal(calls.length, 2)
       assert.equal(JSON.parse(streams[1].messages[0].content[0].text).brief, maxInput)
     })
-    const criticalBrief = '最大 20000 字符；文件 src/flow.ts；参考 https://example.com/spec?v=3 。'
-    for (const [label, summary, title] of [
-      ['缺少数字', '文件 src/flow.ts；参考 https://example.com/spec?v=3 。'],
-      ['修改路径', '最大 20000 字符；文件 src/other.ts；参考 https://example.com/spec?v=3 。'],
-      ['修改 URL', '最大 20000 字符；文件 src/flow.ts；参考 https://example.com/other?v=3 。'],
-      ['仅标题保留', '只调整了排版。', '20000 src/flow.ts https://example.com/spec?v=3'],
+    // 标题只做形式收敛：带标点、带编号、超长时按同一规则清洗；空标题或带「整理稿」
+    // 字样的答案整次降级，绝不让脏标题进快照。
+    for (const [label, value, expected, status] of [
+      ['带句末标点', '会话过期检测。', '会话过期检测', 'ready'],
+      ['带 Markdown 前缀与引号', '## 「导出报表」', '导出报表', 'ready'],
+      ['超长标题截断', '会'.repeat(40), '会'.repeat(24), 'ready'],
+      ['空标题降级', '   ', '', 'fallback'],
+      ['整理稿字样降级', '需求整理稿', '', 'fallback'],
+      ['非字符串标题降级', 42, '', 'fallback'],
     ]) {
-      modelResult = { title: title ?? '整理标题', summary }
-      const result = await post('prepare', { path: ws, brief: criticalBrief })
-      check('模型整理稿关键字保真失败自动降级：' + label, () => {
+      modelResult = { title: value }
+      const result = await post('prepare', { path: ws, brief: '会话过期后请求返回 401。' })
+      check('标题形式收敛：' + label, () => {
         assert.equal(result.status, 200)
-        assert.equal(result.body.status, 'fallback')
-        assert.equal(result.body.summary, criticalBrief)
-        assert.match(result.body.message, /原文信息保留校验/)
+        assert.equal(result.body.status, status)
+        assert.equal(result.body.title, status === 'ready' ? expected : '会话过期后请求返回 401')
       })
     }
-    modelResult = { title: '保留错误处理要求', summary: '文件 src/flow.ts 错误后返回可诊断信息。' }
-    const errorBrief = '文件 src/flow.ts 的错误码 INVALID_BRIEF 与 ENOENT 必须保留。'
-    const missingCode = await post('prepare', { path: ws, brief: errorBrief })
-    check('模型不能省掉原文的明确错误码', () => {
-      assert.equal(missingCode.body.status, 'fallback')
-      assert.equal(missingCode.body.summary, errorBrief)
-    })
-    modelResult = { title: '保留关键约束', summary: '文件 src/flow.ts；参考 https://example.com/spec?v=3 。最大 20,000 字符。' }
-    const faithful = await post('prepare', { path: ws, brief: criticalBrief })
-    check('模型保留路径URL和等值数字时可返回整理稿', () => {
-      assert.equal(faithful.status, 200)
-      assert.equal(faithful.body.status, 'ready')
-      assert.equal(faithful.body.summary, modelResult.summary)
-    })
-    for (const [label, brief, summary, expected] of [
-      ['感叹号不能省略', '参考 "https://example.com/run!"。', '参考 https://example.com/run 。', 'fallback'],
-      ['中文路径不能省略', '参考 "https://example.com/需求"。', '参考 https://example.com/ 。', 'fallback'],
-      ['带引号的 URL 原样保留', '参考 "https://example.com/run!"。', '参考 "https://example.com/run!"。', 'ready'],
-      ['去引号保留完整 URL', '参考 "https://example.com/需求"。', '参考 https://example.com/需求 。', 'ready'],
-      ['普通引号 URL 删除', '参考文档要求：“请参照 https://example.com/spec”。', '请参考文档。', 'fallback'],
-      ['普通引号 URL 替换', '参考文档要求：“请参照 https://example.com/spec”。', '请参照 https://example.com/other 。', 'fallback'],
-      ['普通引号 URL 保留', '参考文档要求：“请参照 https://example.com/spec”。', '参考文档要求：“请参照 https://example.com/spec”。', 'ready'],
-      ['普通引号 URL 去引号', '参考文档要求：“请参照 https://example.com/spec”。', '请参照 https://example.com/spec 。', 'ready'],
-      ['普通引号路径删除', '参考文档要求：“修改 src/client.js”。', '请参考文档。', 'fallback'],
-      ['普通引号路径替换', '参考文档要求：“修改 src/client.js”。', '修改 src/other.js 。', 'fallback'],
-      ['普通引号路径保留', '参考文档要求：“修改 src/client.js”。', '参考文档要求：“修改 src/client.js”。', 'ready'],
-      ['普通引号路径去引号', '参考文档要求：“修改 src/client.js”。', '修改 src/client.js 。', 'ready'],
-      ['普通引号 Unicode 路径删除', '参考文档要求：“修改 D:/项目/需求.md”。', '完成修改。', 'fallback'],
-      ['普通引号 Unicode 路径替换', '参考文档要求：“修改 D:/项目/需求.md”。', '修改 D:/项目/其他.md 。', 'fallback'],
-      ['普通引号 Unicode 路径原样安全保留', '参考文档要求：“修改 D:/项目/需求.md”。', '参考文档要求：“修改 D:/项目/需求.md”。', 'ready'],
-      ['普通引号 Unicode 路径去引号安全保留', '参考文档要求：“修改 D:/项目/需求.md”。', '修改 D:/项目/需求.md 。', 'ready'],
-      ['普通引号内空格路径删除保守降级', '参考文档要求：“修改 D:/项目/需求 说明.md”。', '完成修改。', 'fallback'],
-      ['普通引号内空格路径原样保守降级', '参考文档要求：“修改 D:/项目/需求 说明.md”。', '参考文档要求：“修改 D:/项目/需求 说明.md”。', 'fallback'],
-      ['完整literal Unicode路径原样保留', '修改 "D:/项目/需求.md"。', '修改 "D:/项目/需求.md"。', 'ready'],
-      ['完整literal Unicode路径去引号', '修改 "D:/项目/需求.md"。', '修改 D:/项目/需求.md 。', 'ready'],
-      ['整理稿普通句引号中含空格歧义路径应降级', '修改 "D:/项目/需求.md"。', '“修改 D:/项目/需求.md 说明.md”。', 'fallback'],
-      ['整理稿普通句引号中完整无歧义路径可保留', '修改 "D:/项目/需求.md"。', '“修改 D:/项目/需求.md”。', 'ready'],
-      ['未知冒号 ASCII 路径不能漏检', '修改 foo:src/x.md。', '完成修改。', 'fallback'],
-      ['未知冒号 Unicode 路径不能截成绝对路径', '修改 foo:中文/x.md。', '修改 /x.md。', 'fallback'],
-      ['未知冒号 Unicode 路径不能截成相对路径', '修改 foo:中文/x.md。', '修改 文/x.md。', 'fallback'],
-      ['整理稿未知冒号路径不能补偿原路径', '修改 "文/x.md"。', '修改 foo:中文/x.md。', 'fallback'],
-      ['完整 Unicode 相对路径可去引号保留', '修改 "foo/中文/x.md"。', '修改 foo/中文/x.md 。', 'ready'],
-      ['完整盘符 Unicode 路径可去引号保留', '修改 "D:/项目/需求.md"。', '修改 D:/项目/需求.md 。', 'ready'],
-      ['未加引号盘根反斜杠路径删除应降级', '修改 \\资料\\测试.md。', '完成修改。', 'fallback'],
-      ['未加引号盘根反斜杠路径替换应降级', '修改 \\资料\\测试.md。', '修改 \\资料\\其他.md。', 'fallback'],
-      ['未加引号盘根反斜杠路径原样保留', '修改 \\资料\\测试.md。', '修改 \\资料\\测试.md。', 'ready'],
-      ['盘根反斜杠丢失开头反斜杠应降级', '修改 \\资料\\测试.md。', '修改 资料\\测试.md。', 'fallback'],
-      ['盘根反斜杠与正斜杠根路径视为等价', '修改 \\资料\\测试.md。', '修改 /资料/测试.md。', 'ready'],
-      ['带引号盘根反斜杠单段文件删除应降级', '修改 "\\测试.md"。', '完成修改。', 'fallback'],
-    ]) {
-      modelResult = { title: '保留参考地址', summary }
-      const result = await post('prepare', { path: ws, brief })
-      check('quoted URL 字面保真：' + label, () => {
-        assert.equal(result.status, 200)
-        assert.equal(result.body.status, expected)
-        assert.equal(result.body.summary, result.body.status === 'ready' ? summary : brief)
-      })
-    }
-    modelResult = { title: '会话模型标题', summary: '整理目标，保留全部需求。' }
+    modelResult = { title: '会话模型标题' }
     const sessionBrief = '目标：保留全部需求。'
     const bySession = await post('prepare', { sessionId: 'foreign', brief: sessionBrief })
     check('会话入口按真实会话选择模型，无须先登记工作区', () => {
@@ -2944,11 +3003,11 @@ for (const [kind, reason, expected] of [
     })
     modelFails = true
     const fallback = await post('prepare', { path: ws, brief: '  # 本地标题。\n\n\n保留原文 456  ' })
-    check('模型不可用时本地规范排版并安全降级，原始错误不进用户消息', () => {
+    check('模型不可用时标题回落到原文首个非空行，原始错误不进用户消息', () => {
       assert.equal(fallback.status, 200)
       assert.equal(fallback.body.status, 'fallback')
       assert.equal(fallback.body.title, '本地标题')
-      assert.equal(fallback.body.summary, '# 本地标题。\n\n保留原文 456')
+      assert.equal(fallback.body.summary, undefined)
       assert.equal(JSON.stringify(fallback.body).includes('secret-forbidden'), false)
       assert.equal(created, 0)
       assert.equal(delivered, 0)
@@ -2964,15 +3023,14 @@ for (const [kind, reason, expected] of [
 // 直接调用公开 helper，避免期限替身经过 Hub 的文件或 JSON 请求链路。
 {
   const realNow = performance.now.bind(performance)
-  const pad = (length, tail) => '中'.repeat(length - tail.length) + tail
-  const immediateContext = (summary) => ({
+  const immediateContext = (title) => ({
     agentDefaultModel: { currentSelection: () => ({ provider: 'fixture', model: 'fixture' }) },
     llm: {
       async prepareCall(config) {
         return {
           config,
           async *stream() {
-            yield { type: 'text-delta', index: 0, text: JSON.stringify({ title: '需求标题', summary }) }
+            yield { type: 'text-delta', index: 0, text: JSON.stringify({ title }) }
             yield { type: 'finish', reason: { kind: 'stop' } }
           },
         }
@@ -2980,20 +3038,21 @@ for (const [kind, reason, expected] of [
     },
   })
 
-  for (const [label, brief, summary] of [
-    ['中文原文与整理稿均达合法上限', '中'.repeat(20_000), '中'.repeat(32_000)],
-    ['32k中文附未完成路径尾部', '需求。', '中'.repeat(31_999) + '/'],
-    ['最大中文文本附真实相对路径', pad(20_000, ' src/x.md'), pad(32_000, ' src/x.md')],
-    ['近32k完整引用多目录无扩展名', '需求。', '"' + '中/'.repeat(15_997) + '尾"'],
-    ['32k完整引用多目录含扩展名', '需求。', '"' + '中/'.repeat(15_997) + '尾.md"'],
+  // 标题只解析一个字段：两万字的原文也必须在一瞬间走完，不能因为体积卡在解析或截断上。
+  for (const [label, brief, title] of [
+    ['中文原文达到合法上限', '中'.repeat(20_000), '会话过期检测'],
+    // 19991 + ' src/x.md' 正好 20000：卡在合法上限，不再是 20004 那种越界请求。
+    ['最大中文文本附真实相对路径', '中'.repeat(19_991) + ' src/x.md', '修复路径解析'],
+    ['超长标题按 24 字截断', '需求。', '会'.repeat(40)],
+    ['英文需求给英文标题', 'Add session expiry detection.', 'Session expiry'],
   ]) {
-    const ctx = immediateContext(summary)
+    const ctx = immediateContext(title)
     const started = realNow()
     const result = await prepareRequirement(ctx, { brief })
     const elapsed = realNow() - started
-    check('需求整理性能：' + label, () => {
+    check('标题生成性能：' + label, () => {
       assert.equal(result.status, 'ready')
-      assert.equal(result.summary, summary)
+      assert.equal(result.title, title.length > 24 ? title.slice(0, 24) : title)
       assert.ok(elapsed < 2_000, label + ' 用时 ' + elapsed.toFixed(2) + 'ms，必须低于2000ms')
     })
     console.log('       性能耗时：' + elapsed.toFixed(2) + 'ms')
@@ -3001,8 +3060,7 @@ for (const [kind, reason, expected] of [
 
   async function deadlineProbe(phase, elapsed, { invalidJson = false } = {}) {
     const brief = '原始需求。'
-    const summary = '整理需求。'
-    const payload = invalidJson ? '{' : JSON.stringify({ title: '需求标题', summary })
+    const payload = invalidJson ? '{' : JSON.stringify({ title: '需求标题' })
     const origin = 40_000
     let logicalNow = origin
     let signal
@@ -3015,19 +3073,17 @@ for (const [kind, reason, expected] of [
     const restores = []
     const perf = globalThis.performance
     const originalParse = JSON.parse
-    const originalMatchAll = String.prototype.matchAll
     const properties = [
       [globalThis, 'performance'],
       [perf, 'now'],
       [globalThis, 'setTimeout'],
       [globalThis, 'clearTimeout'],
       [JSON, 'parse'],
-      [String.prototype, 'matchAll'],
     ].map(([object, key]) => ({ object, key, descriptor: Object.getOwnPropertyDescriptor(object, key) }))
 
     function reach(event) {
       events.push(event)
-      if (event === 'prepare') logicalNow = origin + 9_000
+      if (event === 'prepare') logicalNow = origin + 4_500
       if (event === phase) logicalNow = origin + elapsed
     }
 
@@ -3057,16 +3113,6 @@ for (const [kind, reason, expected] of [
           if (text === payload) reach('json')
         }
       })
-      replace(String.prototype, 'matchAll', function (pattern) {
-        const iterator = Reflect.apply(originalMatchAll, this, [pattern])
-        if (String(this) !== summary) return iterator
-        return (function* () {
-          yield* iterator
-          // 以实际扫描对象标记保真工作，不依赖checkTime调用次数。
-          reach('fidelity')
-        })()
-      })
-
       const ctx = {
         agentDefaultModel: { currentSelection: () => ({ provider: 'fixture', model: 'fixture' }) },
         llm: {
@@ -3115,34 +3161,32 @@ for (const [kind, reason, expected] of [
       }
       assert.equal(globalThis.performance, perf)
       assert.equal(JSON.parse, originalParse)
-      assert.equal(String.prototype.matchAll, originalMatchAll)
     }
-    return { result, signal, events, timers, streamCalls, nextCalls, closed, brief, summary }
+    return { result, signal, events, timers, streamCalls, nextCalls, closed, brief }
   }
 
   // 所有替身串行安装、finally恢复，断言与日志在恢复后运行。
   for (const [label, phase, elapsed, invalidJson, expected] of [
-    ['JSON完成11999ms仍成功', 'json', 11_999, false, 'ready'],
-    ['prepare完成12000ms中止且不开始流', 'prepare', 12_000, false, 'fallback'],
-    ['stream返回12000ms中止且不读取', 'stream-open', 12_000, false, 'fallback'],
-    ['中途片段12000ms中止并关闭流', 'chunk', 12_000, false, 'fallback'],
-    ['finish完成12000ms中止并关闭流', 'finish', 12_000, false, 'fallback'],
-    ['JSON成功解析12000ms仍按超时降级', 'json', 12_000, false, 'fallback'],
-    ['JSON抛错12000ms优先超时文案', 'json', 12_000, true, 'fallback'],
-    ['保真扫描12000ms中止并降级', 'fidelity', 12_000, false, 'fallback'],
+    ['JSON完成5999ms仍成功', 'json', 5_999, false, 'ready'],
+    ['prepare完成6000ms中止且不开始流', 'prepare', 6_000, false, 'fallback'],
+    ['stream返回6000ms中止且不读取', 'stream-open', 6_000, false, 'fallback'],
+    ['中途片段6000ms中止并关闭流', 'chunk', 6_000, false, 'fallback'],
+    ['finish完成6000ms中止并关闭流', 'finish', 6_000, false, 'fallback'],
+    ['JSON成功解析6000ms仍按超时降级', 'json', 6_000, false, 'fallback'],
+    ['JSON抛错6000ms优先超时文案', 'json', 6_000, true, 'fallback'],
   ]) {
     const probe = await deadlineProbe(phase, elapsed, { invalidJson })
-    check('需求整理统一期限：' + label, () => {
+    check('标题生成统一期限：' + label, () => {
       assert.equal(probe.result.status, expected)
       assert.ok(probe.events.includes(phase))
       assert.ok(probe.timers.length > 0)
       assert.ok(probe.timers.every((timer) => timer.cleared))
       if (expected === 'ready') {
-        assert.equal(probe.result.summary, probe.summary)
+        assert.equal(probe.result.title, '需求标题')
         assert.equal(probe.signal.aborted, false)
       } else {
-        assert.equal(probe.result.summary, probe.brief)
-        assert.equal(probe.result.message, '需求整理超时，已使用本地整理。')
+        assert.equal(probe.result.title, '原始需求')
+        assert.equal(probe.result.message, '标题生成超时，已回落为本地取值。')
         assert.equal(probe.signal.aborted, true)
         assert.equal(probe.signal.reason?.code, 'timeout')
       }
@@ -3291,11 +3335,18 @@ for (const [kind, reason, expected] of [
   const typeCtx = makeHost(cwd, 'sess-typecheck')
   const startWith = (args) => typeCtx.tool('flowgate_start', args).catch((error) => error)
   const badBrief = await startWith({ title: '类型校验', brief: 12345 })
-  const badSummary = await startWith({ title: '类型校验', brief: '正常需求', summary: { a: 1 } })
-  check('需求原文与整理稿的类型错误被拒绝', () => {
+  // 整理稿参数已废弃：传进来也不会落进快照，需求依据只有 brief。
+  const staleSummary = await startWith({ title: '类型校验', brief: '正常需求', summary: { a: 1 } })
+  const staleState = await typeCtx.request('/api/flowgate/state?sessionId=sess-typecheck')
+  check('需求原文的类型错误被拒绝，整理稿参数不再落进快照', () => {
     assert.match(String(badBrief?.message ?? badBrief), /需求原文必须是字符串/)
-    assert.match(String(badSummary?.message ?? badSummary), /需求整理稿必须是字符串/)
+    // summary 已从 flowgate_start 的入参删掉：真传了也只当多余字段丢掉，
+    // 流程照常启动，快照里只有 brief 原文这一份需求文本。
+    assert.equal(staleSummary.stage, 'S1')
+    assert.equal(staleState.body.brief, '正常需求')
+    assert.equal('summary' in staleState.body, false)
   })
+  await typeCtx.tool('flowgate_cancel', {})
 }
 
 // ---------------------------------------------------------------------------
