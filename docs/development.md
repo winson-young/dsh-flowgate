@@ -133,6 +133,57 @@ S4 出口门禁有三种结束方式，状态、事件与界面文案各不相�
 
 界面会明确标出当前来源（内置默认 / 工作区默认 / 本次流程临时调整），保存后本次流程也改为跟随默认，不会出现「标签说跟随默认、实际还是旧勾选」的不一致。切换档位只重置评审角度与测试方向，不动规则选择。
 
+## 门禁模式：自动通过 / 每步确认
+
+流程级字段 `gateMode` 决定每个阶段出口是自动放行还是等用户点按钮，**任何阶段都能切**，切换立即生效：
+
+| 模式 | 行为 | 默认 |
+| :--- | :--- | :--- |
+| `auto` 自动通过 | 体检没有阻塞项就直接进入下一阶段；有阻塞项就停下来，并在门禁卡上列出原因 | fast 档 |
+| `manual` 每步确认 | 每个阶段出口都等用户点按钮，与旧行为一致 | strict 档 |
+
+自动通过**不放开任何权限**：它只跳过「点通过」这个动作，不代替用户勾选 shell 授权、不代替用户接受验收方案缺口。判定口径与手动通过完全一致（S3/S4 直接复用 `gateValidation`），所以自动通过不可能放过手动通过不允许的东西。
+
+各阶段的阻塞条件：
+
+| 阶段 | 自动放行的条件 |
+| :--- | :--- |
+| S1 | scope 体检的 `blockers` 与 `risks` 都为空；且验收标准不是全部声明为人工核验 |
+| S2 | 开发快照完整（`snapshot.complete`） |
+| S3 | `gateValidation` 通过：无阻塞发现、角度均已覆盖、快照一致 |
+| S4 | `gateValidation` 通过：无失败要点，验收账本无缺口（`excluded` 不算缺口） |
+
+自动放行会记进流程：`autoPassed[阶段] = { at, snapshot }`，并写 `gate.auto_passed` 事件；没自动放行时把原因写进 `gateBlockers`，界面据此回答「这一关为什么没自动过」。模式切换写 `gate.mode.changed`，并唤醒正在等待的门禁重新判定——所以挂起时切到自动通过会当场放行。
+
+## 命令清单要「合适」
+
+`scope.commands` 是 S2 构建、S4 测试的放行依据：命中清单的命令直接执行，不需要再勾「允许执行构建/测试命令」。清单为空时这个开关退化成全局勾选，这正是「每次都要手动授权」的来源。因此 S1 提交 scope 时要求：
+
+- **命令从项目读出来**：`package.json` 的 `scripts`、测试框架配置、`tsconfig`、`Makefile`。凭印象编的脚本名会在 S2 第一次跑构建时炸。
+- **标注来源与对应 AC**：`command_sources: [{ command, from, acs }]`。它不进冻结的 `scope.json`，只用于界面标注和体检依据。
+- **不要过少也不要过多**：过少 → 执行时临时授权；过多 → 批准了一堆用不上的权限。
+
+`scopeReadiness` 现在同时检查过少与过多，风险码如下：
+
+| 风险码 | 含义 | 后果 |
+| :--- | :--- | :--- |
+| `no-test-command` | 有可执行验收标准，但清单里没有测试命令 | 缺口，需显式接受 |
+| `ac-without-command` | 某条可执行 AC 没有任何命令对应（需 `command_sources` 才逐条判） | 缺口，需显式接受 |
+| `integration-without-test-file` | 声明集成验证但没有测试文件 | 缺口，需显式接受 |
+| `procedure-file-outside-scope` | 验证步骤点名了 scope 之外的文件 | 缺口，需显式接受 |
+| `visual-without-measurement` | 视觉验收没写明怎么测 | 缺口，需显式接受 |
+| `over-broad-command` | 出现 `npm *`、`node *`、`*` 这类通配，或条目数超过 `max(8, 可执行 AC 数 × 2)` | 缺口，需显式接受 |
+| `command-not-applicable` | `npm run <script>` 的脚本在 `package.json` 里不存在 | 缺口，需显式接受 |
+| `command-without-ac` | 命令没挂任何 AC（可能用于构建或静态检查） | 只提示，不阻塞 |
+
+`npm run *` 不算超宽：它只能在 `package.json` 的 `scripts` 里选，范围本身有限，插件一直支持这种前缀通配。
+
+## 打回预算
+
+S4 退回只有 S2 一个目标，所以「AC 本身测不了」的缺口回 S2 改代码永远修不好。同一批 AC 以同样状态连续退回超过 2 次时，`rollbackTo` 把目标改成 S1（写 `flow.rollback.redirected` 事件）：要么改 scope 换验证方式，要么显式接受缺口。
+
+缺口指纹是「未通过且未标 excluded 的 AC + 状态」排序后拼接，所以真改了代码、状态变了，指纹就变，预算重新计数。
+
 ## 左侧栏面板（先选工作区）
 
 插件注册三个插槽：`sidebar.panellist` 放一个图标入口、`main` 放对应面板，两者的 id 都必须是 `flowgate-hub`（侧栏条目 id 与 `main` 的 key 同名才会打开面板，这是宿主的导航约定）；第三个是会话输入框卡片上方的 `conversation.input.dock`，见本节末尾。
@@ -206,7 +257,7 @@ S4 出口门禁有三种结束方式，状态、事件与界面文案各不相�
 | `flowgate_start` | 启动流程；`brief` 是分析依据，`title` / `summary` 可省略且只用于界面显示，`preset` 选择档位 |
 | `flowgate_status` | 读取阶段、范围、规则和等待状态 |
 | `flowgate_ask` | S1 提出决策问题，等待用户点选 |
-| `flowgate_doc` | 提交需求 HTML、scope 和档位建议，等待批准 |
+| `flowgate_doc` | 提交需求 HTML、scope 和档位建议，等待批准；`commands` 要从项目里读出来并配 `command_sources` |
 | `flowgate_gate` | 请求当前阶段出口门禁 |
 | `flowgate_review_run` | 宿主按评审角度启动只读子代理并汇总报告 |
 | `flowgate_review` | 当前 Agent 提交结构化评审报告 |
@@ -324,15 +375,16 @@ README 的界面图使用真实插件组件与示例数据；[预览页](ui-prev
 ```bash
 pnpm install --frozen-lockfile
 npm run check             # 宿主与客户端语法检查
-npm test                  # 以下五套测试顺序执行
+npm test                  # 以下各套测试顺序执行
 npm run test:host          # 状态机、scope 守卫、规则与门禁流转
+npm run test:gatemode      # 门禁模式：自动通过、随时切换、阻塞原因
 npm run test:subagents     # 新版 activation、最终守卫、取消与降级的测试替身
 npm run test:integration   # 假宿主运行真实 apply()，检查工具、路由与挂起唤醒
 npm run test:client        # React 渲染与按钮行为、布局契约、主题变量
 npm run test:install       # profile 清单、软链、bundle 与导出契约
 ```
 
-前四套测试不需启动 DSH；子代理测试使用测试替身，不能证明真实宿主执行成功。`test:install` 依赖本地安装环境，默认检查 `~/.dsh/profiles/desktop`。检查其他 profile 时，先设置环境变量 `FLOWGATE_PROFILE_DIR` 为其绝对路径，再运行该命令。自动化通过后仍需在真实 DSH 中确认入口、门禁按钮、回退和窄屏布局。
+以上测试都不需启动 DSH；子代理测试使用测试替身，不能证明真实宿主执行成功。`test:install` 依赖本地安装环境，默认检查 `~/.dsh/profiles/desktop`。检查其他 profile 时，先设置环境变量 `FLOWGATE_PROFILE_DIR` 为其绝对路径，再运行该命令。自动化通过后仍需在真实 DSH 中确认入口、门禁按钮、回退和窄屏布局。
 
 ## 排障
 

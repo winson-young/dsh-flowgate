@@ -107,7 +107,7 @@ test('提交测试之前为 pending，旧测试总数和方向通过不转为 AC
   assert.equal(statusOf(flow), 'pending')
   flow.test = { failed: 0, directions: [{ id: 'functional', points: [{ result: 'pass' }] }] }
   assert.equal(statusOf(flow), 'uncovered')
-  assert.deepEqual(acceptanceLedger(flow, snapshot).counts, { total: 1, pending: 0, pass: 0, fail: 0, uncovered: 1 })
+  assert.deepEqual(acceptanceLedger(flow, snapshot).counts, { total: 1, pending: 0, pass: 0, fail: 0, uncovered: 1, excluded: 0 })
 })
 
 test('只有当前版本的 test 证据可以证明通过，review pass 不算执行', () => {

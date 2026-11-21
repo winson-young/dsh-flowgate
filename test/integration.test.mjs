@@ -110,7 +110,19 @@ const execFor = (sessionId, name, args) => ({
   agent: { session: { header: { id: sessionId, cwd: CWD } } },
 })
 
-const call = (name, args, sessionId = SESSION) => host.tools.get(name).execute(args, execFor(sessionId, name, args))
+const actionRouteRef = () => host.routes.get('/api/flowgate/action')
+// 本文件的用例验证「每一步都停下来等确认」的手动门禁语义：门禁模式默认随档位
+// （fast 档是自动通过），启动后显式切成每步确认。自动通过的行为在 test/gatemode.test.mjs 里覆盖。
+const call = async (name, args, sessionId = SESSION) => {
+  const value = await host.tools.get(name).execute(args, execFor(sessionId, name, args))
+  if (name === 'flowgate_start') {
+    const res = await actionRouteRef().fetch(new Request('http://host/api/flowgate/action', {
+      method: 'POST', body: JSON.stringify({ sessionId, action: 'setGateMode', payload: { mode: 'manual' } }),
+    }))
+    assert.equal(res.status, 200)
+  }
+  return value
+}
 
 const guard = async (name, args, sessionId = SESSION) => {
   const handler = host.listeners.get('tools/pre-execute')

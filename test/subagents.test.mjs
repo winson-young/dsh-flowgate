@@ -271,6 +271,8 @@ function makeHost(options = {}) {
     },
     async advance(stage = 'S3', { reviewDecision = 'pass', criteria } = {}) {
       await host.call('flowgate_start', { title: '新版子代理黑盒回归', preset: 'fast' })
+      // 这套黑盒用例验证每步都要人点的手动门禁；fast 档默认自动通过，这里显式切回来。
+      await host.action('setGateMode', { mode: 'manual' })
       const doc = host.call('flowgate_doc', {
         html: '<!doctype html><html><body>fixture requirements</body></html>',
         scope: {

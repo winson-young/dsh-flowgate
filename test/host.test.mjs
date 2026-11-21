@@ -92,11 +92,22 @@ function makeHost(cwd, sessionId, options = {}) {
   const tool = (name, args, opts = {}) => {
     const definition = tools.get(name)
     assert.ok(definition, '工具未注册：' + name)
-    return definition.execute(args, {
+    const value = definition.execute(args, {
       name,
       arguments: args,
       agent: { session: { header: { id: sessionId, cwd } } },
       signal: opts.signal,
+    })
+    // 本文件的用例全部验证「每一步都停下来等确认」的手动门禁语义。
+    // 门禁模式默认随档位（fast 档是自动通过），夹具里显式切成每步确认；
+    // 自动通过的行为在 test/gatemode.test.mjs 里单独覆盖。
+    if (name !== 'flowgate_start') return value
+    return Promise.resolve(value).then(async (result) => {
+      const switched = await request('/api/flowgate/action', {
+        sessionId, action: 'setGateMode', payload: { mode: 'manual' },
+      })
+      assert.equal(switched.status, 200, JSON.stringify(switched.body))
+      return result
     })
   }
   const request = async (path, body) => {
@@ -138,7 +149,15 @@ const tick = () => new Promise((resolve) => setTimeout(resolve, 5))
 async function runTool(name, args) {
   const definition = host.tools.get(name)
   assert.ok(definition, '工具未注册：' + name)
-  return definition.execute(args, execOf(name, args))
+  const value = await definition.execute(args, execOf(name, args))
+  // 本文件的用例全部验证「每一步都停下来等用户确认」的手动门禁语义。
+  // 门禁模式默认随档位（fast 档是自动通过），夹具里显式切成每步确认；
+  // 自动通过的行为在 test/gatemode.test.mjs 里单独覆盖。
+  if (name === 'flowgate_start') {
+    const switched = await postAction('setGateMode', { mode: 'manual' })
+    assert.equal(switched.status, 200, JSON.stringify(switched.body))
+  }
+  return value
 }
 
 function routeOf(path) {
@@ -2634,9 +2653,14 @@ for (const [kind, reason, expected] of [
   const post = (route, body) => cx.request('/api/flowgate/hub/' + route, body)
   const act = (action, payload, id = sid) => cx.request('/api/flowgate/action', { sessionId: id, action, payload })
   const state = (id = sid) => cx.request('/api/flowgate/state?sessionId=' + encodeURIComponent(id))
-  const call = (name, args, id = sid) => cx.tools.get(name).execute(args, {
-    name, arguments: args, agent: { session: { header: { id, cwd: sessionDirs.get(id) } } },
-  })
+  // 这套用例验证每步都要人点的手动门禁；fast 档默认自动通过，启动后显式切回来。
+  const call = async (name, args, id = sid) => {
+    const value = await cx.tools.get(name).execute(args, {
+      name, arguments: args, agent: { session: { header: { id, cwd: sessionDirs.get(id) } } },
+    })
+    if (name === 'flowgate_start') assert.equal((await act('setGateMode', { mode: 'manual' }, id)).status, 200)
+    return value
+  }
   const stages = { S1: null, S2: null, S3: null, S4: {
     ids: ['smoke'], custom: [], edits: [{ id: 'smoke', name: '授权恢复验证', points: ['当前声明与本次授权一致'], needsWrite: true }],
   } }

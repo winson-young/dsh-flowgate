@@ -6,6 +6,50 @@
 
 历史记录中的 `by: 'subagents'` 仅表明调用了子代理聚合入口；聚合报告通过、`blocking: 0` 或流程走完，均不能证明真实子代理成功执行并返回有效报告。下文原有结论保留，其证据范围受此限定。
 
+## 门禁模式与命令清单（2026-11-21）
+
+需求：用户原文（m00001）「我觉得现在的需求开发的流程有点麻烦了，还要勾选什么权限，这些都不能自动获取权限吗？……最好用户最多点通过就好了」。追问答疑后确认为两部分：门禁能否「没有阻塞项就直接通过」且模式随时可切（m00044）；权限清单应由 S1 分析项目推导，要「适合」而不是过多或过少（m00044）。方案经用户「确认」（m00117）后实施。
+
+方案：
+- 流程级字段 `gateMode: 'auto' | 'manual'`，任何阶段可切，fast 档默认 `auto`、strict 档默认 `manual`。自动通过只跳过「点通过」这个动作，**不放开任何权限**：不代替用户勾 shell 授权、不代替用户接受验收方案缺口，判定口径与手动通过共用 `gateValidation`。
+- 四处门禁统一走 `awaitGate`（`flowgate_doc` / `flowgate_gate` / `waitReviewGate` / `waitTestGate`）：auto 且 `gateBlockers` 为空则放行并记 `autoPassed`，否则把原因写进 `gateBlockers` 后挂起；挂起期间切模式会以 `mode-changed` 唤醒并重判。
+- `scope.commands` 改为从项目推导（`package.json` scripts、测试框架配置、`tsconfig`、`Makefile`），新增可选 `command_sources` 标注来源与对应 AC；`scopeReadiness` 增加过少与过多两侧的检查。
+- S4 缺口分类：`excluded`（环境受限）不再算缺口；`rollbackTo` 加打回预算，同一缺口指纹连续退回超过 2 次改回 S1。
+
+改动范围：`lib/index.js`（`gateBlockers`、`awaitGate`、`gapSignature`、`projectProfile`、`gateValidation` 的缺口口径、`rollbackTo` 预算、`setGateMode` 接口、`view()` 的 `gateMode` / `gateBlockers` / `autoPassed`、`flowgate_doc` 参数描述与 `flowgate_status` 文案）、`lib/acceptance.js`（`excluded` 状态、`scopeReadiness` 的 `options.commandSources` / `options.project` 与七类风险码）、`lib/client.js`（`GateModeToggle`、门禁卡 `modeBar`、命令来源渲染）、`test/gatemode.test.mjs`（新增 10 条）、`test/host.test.mjs` / `test/integration.test.mjs` / `test/subagents.test.mjs`（夹具改为启动后显式切 manual）、`test/acceptance.test.mjs`（`counts` 补 `excluded`）、`package.json`（`test:gatemode` 并入 `test`）、`docs/development.md`、`docs/verification.md`。
+
+| 验收项 | 状态 | 证据与限制 |
+| :--- | :--- | :--- |
+| AC-1 fast 档默认自动通过、strict 档默认每步确认 | 通过 | `test/gatemode.test.mjs`「fast 档默认自动通过」断言 `state.gateMode === 'auto'`；「strict 档默认每步确认」断言 `'manual'` |
+| AC-2 自动通过下 S1 体检干净直接冻结，不等用户 | 通过 | 同文件「自动通过模式下 S1 体检干净就直接冻结，不等用户」：`flowgate_doc` 直接返回 `decision: 'approve'`、`frozen: true`，`state.stage === 'S2'`、`autoPassed.S1` 存在、`gateBlockers` 为 null |
+| AC-3 有阻塞项时停下并说明原因 | 通过 | 同文件「自动通过模式下 S1 有缺口就停下并说明原因」：`commands: []` 时 `gateBlockers.items` 非空且匹配 `/命令\|测试/`，`doc.pending === true`；显式接受缺口后仍可冻结 |
+| AC-4 全部 AC 声明人工核验时自动通过会停下 | 通过 | 同文件「全部 AC 声明人工核验时自动通过会停下」：`gateBlockers.items` 含「人工核验」说明，接受缺口后冻结成功 |
+| AC-5 自动通过下 S2 快照完整直接进入 S3 | 通过 | 同文件「自动通过模式下 S2 快照完整就直接进入 S3」：`flowgate_gate` 返回 `decision: 'pass'`、`next: 'S3'`，`autoPassed.S2` 存在 |
+| AC-6 挂起时切到自动通过当场放行 | 通过 | 同文件「每步确认下挂起，切成自动通过后当场放行」：先切 manual 挂起，`setGateMode auto` 返回 200 后原 `pending` 直接解析为 `frozen: true` |
+| AC-7 自动通过因阻塞停下后切回手动仍然等用户 | 通过 | 同文件「自动通过因阻塞项停下后切回每步确认仍然等用户」：切 manual 后 `doc.pending` 仍为 true，用户点批准才冻结 |
+| AC-8 非法模式被拒绝、重复设置幂等 | 通过 | 同文件「非法门禁模式被拒绝且不改流程」（409 且模式不变）与「同一模式重复设置是幂等的」 |
+| AC-9 缺口口径不再把 excluded 算作缺口 | 通过 | `lib/index.js` 的 `gateValidation` 改为 `unpassedPoints = fail + uncovered`、`gaps = total - pass - excluded`；`lib/acceptance.js` 的 `counts` 增加 `excluded`；`test/acceptance.test.mjs` 断言补 `excluded: 0` |
+| AC-10 打回预算生效 | 通过 | `lib/index.js` 的 `rollbackTo` 按 `gapSignature` 计数，超过 2 次改写目标阶段并记 `flow.rollback.redirected`；既有「S4 退回」用例仍通过（首次退回仍是 S2） |
+| AC-11 无回归 | 通过 | 逐入口实跑：内容快照 20、验收账本 30、运行版本 18、宿主 349、门禁模式 10、子代理 82、集成 33、客户端 240、安装 17，合计 799 项全通过 |
+
+### 执行环境与方式
+
+本机 `PATH` 里没有 `node` / `npm`，实测用运行时自带可执行文件逐个跑入口：
+
+```
+"C:/Users/lenovo/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/node/bin/node.exe" test/<entry>.test.mjs
+```
+
+覆盖 `npm test` 的全部九个入口。`npm run check` 的 `stamp-revisions.mjs --check` 在本机受沙箱限制无法写盘，改为只读计算六个模块的 `moduleSourceRevision`（CRLF→LF 规范化、抹掉 `FLOWGATE_MODULE_REVISION` 字面量后取 sha256）再手工更新字面量，结果与脚本口径一致。
+
+### 已知未通过项
+
+无。过程中修过两处自身写法问题：`test/gatemode.test.mjs` 起初所有用例共用一个工作目录，触发「该工作区已有流程在进行」；S2 用例的 shell 桩返回空输出，被判定为「git 没正常返回」导致快照不完整、自动通过不生效——补上 `---numstat---` 段后通过。另把 `BROAD_COMMAND` 收窄，`npm run *` 不再算超宽（它只能在 `package.json` scripts 里选，且插件一直支持该前缀通配）。
+
+### 真实视觉未覆盖
+
+`GateModeToggle` 与 `gateBlockers` 原因列表只在客户端渲染断言层面核对（按钮文案、`act('setGateMode')` 载荷、样式字符串），没有在真实 DSH 工作台里加载看过：模式切换条在四个阶段卡片里的实际位置、窄屏换行、阻塞原因多行时的撑高都没在真实宿主里量过。本机没有可用 CDP 接入，按既有约定记为未覆盖。
+
 ## 会话内快捷作答 S1 决策问题（2026-11-21）
 
 需求：S1 需求分析阶段 Agent 提问时，会话界面没有快捷回答入口，只能切到左侧栏「流程工作台」的拍板卡片作答。需求原文：「需求分析阶段如果要回答问题，会话界面没有快捷回答的按钮，要加一下，至于怎么加用户体验最好你来决定」。
