@@ -6,6 +6,30 @@
 
 历史记录中的 `by: 'subagents'` 仅表明调用了子代理聚合入口；聚合报告通过、`blocking: 0` 或流程走完，均不能证明真实子代理成功执行并返回有效报告。下文原有结论保留，其证据范围受此限定。
 
+## 例外结项与正常验收的状态语义分离（2026-11-21）
+
+需求：最近多次流程以「带缺口」方式结束，AC 大量未覆盖、几乎没有通过，但结项逻辑仍然写 `gate.passed` 与 `flow.finished`；工作台门禁按钮与 dock 快捷按钮点击时自动附带 `acceptUncovered: true`，接受说明可以为空；另有流程测试提交 `failed: 0`，而 AC 实际是 0 通过 / 3 未覆盖（`failed` 只统计测试要点里的失败项）。要求把「测试要点失败数」「AC 通过/失败/未覆盖数」「流程结束方式」分开统计与展示，带缺口结项要独立确认、列出缺口、记录接受原因，不得在汇总、按钮或对外状态中等同于全部验收通过，同时保留用户接受风险并结束流程的能力。
+
+改动范围：`lib/index.js`（`gateValidation` 的 `acceptUncovered` 与 `acceptanceNote` 双门槛、新增 `countPointResults` / `gapSentence` / `closureSentence`、`passGate` 的三分阶段记录与 `flow.closure`、`gate.accepted_with_gaps` 事件、视图 `closure` 字段、`flowgate_status` 摘要与 `hubFlowSummary`）、`lib/client.js`（新增 `gapLedger` / `CLOSURE_TEXT` / `closureOf`、门禁卡的验收账本行与「例外结项确认」两步流程、结束态徽标与缺口明细、dock 不再一键结束、`.fg-warn` 样式）、`test/host.test.mjs`、`test/client.test.mjs`、`test/integration.test.mjs`、`test/subagents.test.mjs`、`docs/development.md`。
+
+| 验收项 | 状态 | 证据与限制 |
+| :--- | :--- | :--- |
+| AC-1 全部通过时仍是一步结束，且不发送例外许可 | 通过 | `test/client.test.mjs` 的「S4全部通过时沿用原按钮且不发送例外许可」：点「验收通过，结束流程」后 `payload.acceptUncovered === undefined`。`test/host.test.mjs` 的既有门禁用例断言 `acceptanceDecision.status === 'passed'`、`gate.passed` 事件、`flow.closure.kind === 'passed'` |
+| AC-2 存在未覆盖项时不得读作全部通过 | 通过 | 客户端「S4未全通过时使用明确结束文案，两步确认后才提交例外说明」断言没有「验收通过，结束流程」按钮、主按钮为「接受未覆盖并结束（需确认）」；「流程以带缺口方式结束后，门禁卡显示缺口而不是绿色已完成」断言结束态门禁卡文案不含「流程已结束」与「已完成」，只报「带缺口结束」与缺口明细 |
+| AC-3 存在未通过项时缺口逐条列出且原因必填 | 通过 | 「S4 点例外按钮先展开缺口清单，不直接投递」：第一次点击 `posted.length === 0`，展开「这些项目不会被标记为通过」「未通过的测试要点（2 个）」并逐条列出方向 · 要点 · 状态，未填原因时确认按钮 `disabled === true`；「S4 写明接受原因后才提交带缺口结项」断言 `acceptanceNote` 原样提交。宿主侧 `gateValidation` 对空白原因返回 409（`test/host.test.mjs` 的 `acceptanceNote` 相关用例、`test/integration.test.mjs:481`） |
+| AC-4 测试要点 `failed: 0` 但 AC 零通过时两套账分别显示 | 通过 | 「测试要点 failed: 0 但 AC 一条没过时，两套账分别显示」：断言「验收标准：通过 0 · 未通过 0 · 未覆盖 3 · 待验证 0（共 3 条）」与「测试要点：通过 0 · 失败 0 · 未覆盖 1 · 环境受限 0（共 1 个）」同时出现，且不提供「验收通过，结束流程」 |
+| AC-5 快捷入口不能绕开例外确认 | 通过 | 「阶段提示：放弃要两次确认，S4 带缺口时不提供一键结束」：dock 不渲染「接受未通过项并结束」与「接受未覆盖并结束」，只留「退回开发修复」，并给出「验收标准通过 0 / 1」与「带缺口结束要在『出口门禁』里看清缺口并写明原因」，且不投递任何请求 |
+| AC-6 持久化状态与事件区分结束方式 | 通过 | `test/host.test.mjs` 与 `test/integration.test.mjs` 的例外结项用例断言 `acceptanceDecision.status === 'accepted-with-gaps'`、`flow.closure.kind === 'accepted_with_gaps'`、阶段 `gate: 'accepted_with_gaps'` 与 `gate.accepted_with_gaps` 事件；`test/integration.test.mjs` 的 flows.jsonl 事件用例确认事件类型与 `closure` 字段落盘 |
+| AC-7 无回归 | 通过 | 八个测试入口整组退出码 0：内容快照 20、验收账本 24、运行版本 18、宿主 343、子代理 80、集成 33、客户端 226、安装 17，合计 761 项；`scripts/stamp-revisions.mjs --check` 输出 `Module revisions verified (6 modules).`，八个文件 `node --check` 通过 |
+
+### 已知未通过项
+
+无。
+
+### 真实视觉未覆盖
+
+门禁卡的「验收账本」行、「例外结项确认」区块与结束态「带缺口结束」徽标只在 `test/client.test.mjs` 的组件树层面核对文案、置灰与提交载荷，未在真实 DSH 工作台加载确认排版（尤其缺口清单较长时的换行与高度）；`.fg-warn` 只用了主题里已定义的 `state-warn-secondary` / `state-warn-label`，实际观感未取色测量。宿主侧的三分结束方式均有直接断言，但未在真实模型驱动的一次完整流程里端到端跑通「展开缺口 → 填原因 → 结束」这条路径。
+
 ## 只读边界放宽与例外入口（2026-11-21）
 
 需求：把「命令执行范围限制」放宽到不阻碍评审与测试，同时不放弃默认拒绝。六条：内置测试方向可声明写权限；只读子代理可用只读 Git；scope 命令清单的无效条目在 S1 就报错；已授权命令放行 `2>&1` / `| tail` 这类无害收尾；只读子代理的 `run_code` 允许 `Promise.all` 并行只读；未登记的只读工具可由用户声明豁免。
@@ -20,7 +44,7 @@
 | AC-4 无害输出后缀放行，真管道仍拒 | 通过 | `test/host.test.mjs` 的「无害输出后缀不算逃逸，剥掉后缀后仍按原命令判定」：`npm test 2>&1` / `npm test \| tail -n 20` / `npm test > /dev/null` 放行；`npm publish 2>&1` / `npm test \| rm -rf src` / `npm test 2>&1; touch x` 仍拒 |
 | AC-5 子代理 `run_code` 支持 `Promise.all` 并行只读 | 通过 | `test/subagents.test.mjs` 允许单行与多行两种 `Promise.all` 形状；拒绝夹写工具、夹 `run_code`、非严格 JSON、`.then` 链、先赋值再 `return` 五种形状 |
 | AC-6 未登记只读工具可由用户声明豁免，写工具与 shell 不可豁免 | 通过 | `test/host.test.mjs` 的「未登记工具默认拒，用户声明只读后放行」：`unlag_refresh` 默认拒、声明后放行；`write` 仍按 scope 判（S2 写 scope 内放行、越界拒）；S1 声明 `str_replace_editor` 仍拒；`ops_bash` 带豁免跑 `npm publish` 仍拒。`setToolAllowlist` 对 `write` / `ops_bash` / `run_code` / 非法名字返回 409，重复项去重后存一条。`test/client.test.mjs` 覆盖「只读豁免」面板的文案、初值与按行提交 |
-| AC-7 无回归 | 通过 | 八个测试入口整组退出码 0：内容快照 20、验收账本 24、运行版本 18、宿主 343、子代理 80、集成 33、客户端 223、安装 17，合计 758 项；`scripts/stamp-revisions.mjs --check` 输出 `Module revisions verified (6 modules).`，七个文件 `node --check` 通过 |
+| AC-7 无回归 | 通过 | 八个测试入口整组退出码 0：内容快照 20、验收账本 24、运行版本 18、宿主 343、子代理 80、集成 33、客户端 226、安装 17，合计 761 项；`scripts/stamp-revisions.mjs --check` 输出 `Module revisions verified (6 modules).`，八个文件 `node --check` 通过 |
 
 ### 已知未通过项
 
@@ -46,7 +70,7 @@
 | AC-2 S1 只在文档待裁决时给三键 | 通过 | 「阶段提示：dock 给出本阶段的流转按钮，四个阶段各不相同」断言 S1 为「批准并冻结 scope / 修改需求 / 跳过评审，直接开发 / 放弃这次流程」；「S1 未交文档只留放弃」覆盖 `doc.pending` 为假的情形 |
 | AC-3 S2 三键与就绪态 | 通过 | 同上用例断言 S2 按钮集合；「流转按钮的置灰与门禁就绪同源」分别覆盖未就绪（disabled 为真）、`waiting` 为真、`gate.pending` 为真三种情形，并断言「回到需求分析调整 scope」带危险色 class、主按钮带主色 class |
 | AC-4 S3 有 scope 外发现时先让回需求分析 | 通过 | 「S1 未交文档只留放弃，S3 有 scope 外发现时先让回需求分析」断言追加按钮的位置在「退回开发修复」之前，且同时显示越界原因和数量 |
-| AC-5 S4 主按钮取 `finalGateLabel` 并随例外项提交接受声明 | 通过 | 「放弃要两次确认，S4 的例外项随 gate 一起提交」断言按钮文案为「接受未通过项并结束」，点击后 `payload.acceptUncovered === true` |
+| AC-5 S4 主按钮取 `finalGateLabel`；有缺口时 dock 不给一键例外结束 | 通过（口径已更新） | 原断言为「点击『接受未通过项并结束』后 `payload.acceptUncovered === true`」。该行为已按「例外结项与正常验收的状态语义分离」改掉：dock 在有缺口时不再提供例外结束按钮，只保留「退回开发修复」并指向出口门禁。现断言见「阶段提示：放弃要两次确认，S4 带缺口时不提供一键结束」 |
 | AC-6 结束流程入口常驻且需两次确认 | 通过 | 同一用例断言首次点击不发请求、`再想想` 回到原按钮、确认后投递 `cancel` 且带 `reason`；「投递失败要留下可诊断的错误行」验证 HTTP 500 时出现 `role=alert` 与宿主错误文案 |
 | AC-7 四阶段按钮集合两两不同 | 通过 | 「dock 给出本阶段的流转按钮，四个阶段各不相同」用 `Set` 比对四组文案；无效 stage 的按钮兜底与工作台一致 |
 | AC-8 新增按钮不破坏 dock 宽度契约 | 未覆盖真实视觉 | `.fg-hint` 的 `width` / `max-width` 公式未改，既有「阶段提示样式：沿用宿主宽度变量和居中规则」仍通过；按钮组自带 `flex-wrap: wrap` 与 `min-width: 0`，文字可换行 |

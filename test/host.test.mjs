@@ -2007,7 +2007,7 @@ for (const [kind, reason, expected] of [
   const done = await cx.request('/api/flowgate/action', {
     sessionId: sid,
     action: 'gate',
-    payload: { decision: 'pass', acceptUncovered: true },
+    payload: { decision: 'pass', acceptUncovered: true, acceptanceNote: '测试夹具：证据缺口已确认可接受' },
   })
   check('无等待器时显式接受证据缺口后说明流程已结束', () => {
     assert.equal(done.status, 200)
@@ -3243,7 +3243,7 @@ for (const [kind, reason, expected] of [
     assert.equal(uncoveredGate.status, 409)
     assert.match(uncoveredGate.body.error, /acceptUncovered/)
   })
-  const doneGate = await act('gate', { decision: 'pass', acceptUncovered: true })
+  const doneGate = await act('gate', { decision: 'pass', acceptUncovered: true, acceptanceNote: '环境受限项已确认，其余要点通过' })
   await excludedTest
   check('环境受限的点显式排除并单独计数', () => {
     assert.equal(doneGate.status, 200)
