@@ -852,7 +852,8 @@ const testPending = gateRound(
     ],
   },
   // 本夹具只验证授权回收；S4 已改方向规则，显式跳过而不伪造当前验收证据。
-  { decision: 'skip' },
+  // 跳过不再免检：缺口必须由用户显式接受，所以这里带上 acceptUncovered。
+  { decision: 'skip', acceptUncovered: true },
 )
 const testResult = await testPending
 check('S4 显式跳过后流程结束', () => assert.equal(testResult.next, 'done'))
@@ -1286,7 +1287,10 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
     assert.equal(v.cancelReason, '这个需求先不做了')
     assert.ok(v.cancelledAt, '应记录放弃时间')
     assert.equal(v.scope.frozen, false)
+    // 本用例的文档还挂在门禁上、scope 从未冻结，所以 data 本来就是 null：
+    // 这行不证明「放弃保留 scope」，那份证据在下面 AC6 的已冻结用例里。
     assert.equal(v.scope.data, null)
+    assert.equal(v.acceptance.counts.total, 0)
   })
   const afterCancel = await cx.guard('write', { file_path: join(cwd, 'src/a.ts'), content: 'x' })
   check('取消后写操作不再被 scope 拦截', () => assert.equal(afterCancel.kind, 'allow'))
@@ -1435,6 +1439,14 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
       assert.equal(gxGrant.body.shellGrant, true)
       assert.equal(gxCancel.status, 200)
       assert.equal(gxCancel.body.shellGrant, false)
+    })
+    // 这里的 scope 已经冻结过：放弃可以解冻白名单，但不能把验收账本抹成 0 条，
+    // 否则一条缺口流程在放弃后会显示成「0 条 · 全部通过」。
+    check('取消已冻结的流程后验收标准仍在账本里，不归零', () => {
+      assert.equal(gxCancel.body.scope.frozen, false)
+      assert.deepEqual(gxCancel.body.scope.data.acceptance_criteria.map((item) => item.id), ['AC-1'])
+      assert.equal(gxCancel.body.acceptance.counts.total, 1)
+      assert.equal(gxCancel.body.acceptance.counts.pending, 1)
     })
   }
 }
@@ -3984,7 +3996,7 @@ for (const stage of ['S3', 'S4']) {
       assert.equal(after.review.snapshot.id, reviewed.snapshot.id)
       assert.notEqual(after.review.snapshot.id, after.snapshot.id)
       assert.equal(rejected.status, 409)
-      assert.match(rejected.body.error, /评审后代码或规则已变化/)
+      assert.match(rejected.body.error, /评审后代码已变化/)
       assert.equal(after.finished, false)
     })
     await px.tool('flowgate_cancel', {})

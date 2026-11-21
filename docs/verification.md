@@ -6,6 +6,32 @@
 
 历史记录中的 `by: 'subagents'` 仅表明调用了子代理聚合入口；聚合报告通过、`blocking: 0` 或流程走完，均不能证明真实子代理成功执行并返回有效报告。下文原有结论保留，其证据范围受此限定。
 
+## S4 结项与证据版本（2026-11-22）
+
+需求：用户原文（m00001）「我刚才测试显示 0 个问题，但是没有快捷通过的按钮，导致我完成不了测试」。排查发现现场流程 `f_fb3711ee-3dd` 的 15 个测试要点全部 `pass`，但 12 条 AC 全部被判 `uncovered`，界面上既没有「验收通过」也没有一键结束；用户最终「放弃这次流程」。用户确认修法（m00341、m00362）：快捷入口按钮只写「评审报告」「测试报告」，两本账并排放到提示行，结项按钮统一成「结束流程」，其余按七条方案执行。
+
+方案：
+- **快照不含运行环境**：`currentSnapshot` 不再把 `hostRevision` / `diskHostRevision` 塞进 `rules`，`lib/provenance.js` 的快照格式升到 `version: 2`。宿主可信度仍由 `runtimeState()` 经 `runtime.status` 单独报告。
+- **AC 证据的 `version` 由工具盖戳**：schema 里 `version` 改为可选；留空时填提交时刻的内容快照 id，显式写了别的版本则原样保留（不替陈旧证据补盖当前版本），`acceptanceLedger` 据此判未覆盖并给出原因。
+- **规则变化不算代码变化**：新增 `sameCode` 只比文件路径与哈希，S4 检查评审是否失效改用它；规则或测试方向变更不再让评审失效，只有文件内容真的变了才拦。
+- **`skip` 不再免检**：`gateValidation` 删除「S4 的 skip 直接放行」，跳过与通过共用一套校验；`waitTestGate` / `waitReviewGate` 把 `outcome` 透传给 `passGate`，阶段记 `skipped`、缺口照实留账本。
+- **放弃流程保留 `scope.data`**：只清 `frozen` 与授权字段，避免 `acceptance_criteria` 消失后账本归零、反而算出「验收通过」。
+- **界面**：结项按钮统一「结束流程」（含「结束流程（需确认）」与「确认结束流程」），有缺口时门禁卡不再给「跳过测试门禁」；快捷入口始终并排显示两本账，报告按钮只写名字。
+
+改动范围：`lib/index.js`（`currentSnapshot`、`sameCode`、`gateValidation`、`passGate` 两处 `outcome` 透传、`cancelFlow`、`ACCEPTANCE_SCHEMA`、`stampAcceptanceVersions`、`reportAcceptance` 及工具提示文案）、`lib/provenance.js`（快照 `version: 2`）、`lib/client.js`（`gateHasExceptions` 取代 `finalGateLabel`、门禁与 dock 按钮、两本账提示行、报告入口按钮）、`test/client.test.mjs`、`test/host.test.mjs`、`test/subagents.test.mjs`、`README.md`、`docs/development.md`、`docs/render_images.py`、`docs/images/workflow.png`、`CHANGELOG.md`、本文件。
+
+| 验收项 | 状态 | 证据与限制 |
+| :--- | :--- | :--- |
+| AC-1 与代码无关的动作不再更换快照 id | 通过 | `test/provenance.test.mjs` 断言快照格式 `version: 2` 且 `rules` 不含 `hostRevision`；`test/subagents.test.mjs`「S4 只加测试方向不算代码变化，已通过的评审仍然有效」：新增测试方向后 `snapshot.id` 变化、评审不失效、`complete('pass')` 成功且 `finished === true` |
+| AC-2 代码真的变了仍然拦住旧评审 | 通过 | 同文件保留 `sameCode` 分支：文件哈希变化时 `flowgate_gate` 返回 409 且文案匹配 `/评审后代码已变化/` |
+| AC-3 证据版本留空由工具盖当前快照 | 通过 | `test/subagents.test.mjs`「子报告传输 AC 证据与原始版本」：隐藏参数不传 `version` 时落库为当前快照 id；显式传旧版本时原样保留（`true` / `false` 两个分支都对） |
+| AC-4 跳过测试门禁不再免检 | 通过 | `test/host.test.mjs` 的跳门禁用例改为显式 `acceptUncovered: true` 才 200，未带时 409 且提示「明确接受未通过/未覆盖项」；`test/gatemode.test.mjs` 与 `test/subagents.test.mjs` 的降级夹具同步显式接受缺口 |
+| AC-5 放弃流程后账本不再归零 | 通过 | `lib/index.js` `cancelFlow` 只清 `frozen`；`test/host.test.mjs`「取消已冻结的流程后验收标准仍在账本里，不归零」断言 `scope.frozen === false`、`scope.data.acceptance_criteria` 仍为 `['AC-1']`、`acceptance.counts.total === 1` 且 `pending === 1`（已冻结 scope 才具区分力；未冻结的取消用例 `scope.data` 本来就是 `null`，已在原地注明） |
+| AC-6 两本账并排、按钮文案收短 | 通过 | `test/client.test.mjs`「阶段提示：放弃要两次确认，S4 带缺口时不提供一键结束」断言提示行含「验收标准：通过 0 · 未通过 1 · 未覆盖 0 · 待验证 0（共 1 条）」与「测试要点：通过 0 · 失败 0 · 未覆盖 0 · 环境受限 0（共 0 个）」，且 dock 无「结束流程」按钮；「S4未全通过时按钮标出需确认」断言主按钮为「结束流程（需确认）」、确认按钮为「确认结束流程」、门禁卡无「跳过测试门禁」；评审与测试入口按钮分别为「评审报告」「测试报告」 |
+| AC-7 真实界面视觉对齐 | 未覆盖 | 本轮无已认证的桌面端接入与真实页面 CDP，未执行 `docs/verify-layout.mjs`；按钮与提示行的排版仅由组件渲染树断言覆盖，不代表真实 GUI 已测量 |
+
+执行记录（本地，Node 24.21.0）：`node test/provenance.test.mjs`（20 项）、`acceptance`（30 项）、`runtime`（18 checks）、`host`（321 项）、`gatemode`（10 项）、`subagents`（82 项）、`integration`（33 项）、`client`（243 项）、`install`（17 项）全部通过；`node scripts/stamp-revisions.mjs --check` 输出 `Module revisions verified (6 modules).`；`node --check` 对六个模块与 `docs/verify-layout.mjs` 均通过；`docs/render_images.py` 重新生成 `docs/images/workflow.png`（1600 × 820），S4 卡片按钮文案改为「结束流程」。对照实验：`git archive HEAD` 导出的改动前版本跑 `test/subagents.test.mjs` 为 82 项全过，确认本轮失败均由改动引入而非历史遗留。
+
 ## 门禁模式与命令清单（2026-11-21）
 
 需求：用户原文（m00001）「我觉得现在的需求开发的流程有点麻烦了，还要勾选什么权限，这些都不能自动获取权限吗？……最好用户最多点通过就好了」。追问答疑后确认为两部分：门禁能否「没有阻塞项就直接通过」且模式随时可切（m00044）；权限清单应由 S1 分析项目推导，要「适合」而不是过多或过少（m00044）。方案经用户「确认」（m00117）后实施。

@@ -782,7 +782,7 @@ await check('阶段提示：dock 给出本阶段的流转按钮，四个阶段�
     ['S1', { doc: { html: '<p>需求</p>', pending: true } }, ['需求文档', '批准并冻结 scope', '修改需求', '跳过评审，直接开发', '放弃这次流程']],
     ['S2', {}, ['完成开发', '跳过门禁，直接评审', '回到需求分析调整 scope', '放弃这次流程']],
     ['S3', {}, ['通过评审，进入测试', '退回开发修复', '回到需求分析调整 scope', '跳过评审，直接测试', '放弃这次流程']],
-    ['S4', { acceptance: { items: [{ id: 'AC-1', status: 'pass', evidence: '日志' }], counts: { total: 1, pass: 1, fail: 0, uncovered: 0, pending: 0 } } }, ['验收通过，结束流程', '退回开发修复', '跳过测试门禁', '放弃这次流程']],
+    ['S4', { acceptance: { items: [{ id: 'AC-1', status: 'pass', evidence: '日志' }], counts: { total: 1, pass: 1, fail: 0, uncovered: 0, pending: 0 } } }, ['结束流程', '退回开发修复', '跳过测试门禁', '放弃这次流程']],
   ]
   const seen = []
   for (const [stage, patch, expected] of cases) {
@@ -843,10 +843,11 @@ await check('阶段提示：放弃要两次确认，S4 带缺口时不提供一�
   // 有未通过项时快捷入口不再给一键结束：这一排按钮摆不下缺口清单，
   // 也就没法让人「看清了再接受」，所以例外结项只留在出口门禁里走两步确认。
   const hintTree = renderer.toJSON()
-  assert.equal(hasButton(hintTree, '接受未通过项并结束'), false, '快捷入口不能绕开例外确认')
-  assert.equal(hasButton(hintTree, '接受未覆盖并结束'), false, '快捷入口不能绕开例外确认')
+  assert.equal(hasButton(hintTree, '结束流程'), false, '快捷入口不能绕开例外确认')
   assert.ok(buttonByText(hintTree, '退回开发修复'), '带缺口时仍能退回修复')
-  assert.match(flat(hintTree), /验收标准通过 0 \/ 1/, '快捷入口要说清 AC 账本')
+  // 两本账并排写在一行：只报测试要点会让人把「0 失败」读成验收通过。
+  assert.match(flat(hintTree), /验收标准：通过 0 · 未通过 1 · 未覆盖 0 · 待验证 0（共 1 条）/, '快捷入口要说清 AC 账本')
+  assert.match(flat(hintTree), /测试要点：通过 0 · 失败 0 · 未覆盖 0 · 环境受限 0（共 0 个）/, '快捷入口要并排报测试要点')
   assert.match(flat(hintTree), /带缺口结束要在「出口门禁」里看清缺口并确认接受/)
   assert.equal(posted.length, 0, '摆说明本身不投递任何请求')
   // 放弃：两次确认后才真的投递 cancel。
@@ -877,7 +878,7 @@ await check('阶段提示：投递失败要留下可诊断的错误行，认不�
   }
   // stage 认不出来时工作台落到最后一档，dock 给出同一组按钮。
   currentView = baseView('S9', { waiting: true, waitingKind: 'gate' })
-  assert.deepEqual(buttons(nodeByClass((await render(stageHint, {})).toJSON(), 'fg-hint-actions')).map((node) => flat(node)), ['验收通过，结束流程', '退回开发修复', '跳过测试门禁', '放弃这次流程'])
+  assert.deepEqual(buttons(nodeByClass((await render(stageHint, {})).toJSON(), 'fg-hint-actions')).map((node) => flat(node)), ['结束流程', '退回开发修复', '跳过测试门禁', '放弃这次流程'])
 })
 
 await check('阶段提示：各阶段左侧内容保持两行，右侧独立承载按钮', async () => {
@@ -945,13 +946,13 @@ await check('快捷评审：阻塞与建议分别列出，报告存在时才显�
   ] }] } })
   const renderer = await render(stageHint, {})
   assert.equal(quickDialog(renderer), null)
-  await click(buttonByText(renderer.toJSON(), '评审结果 · 1 阻塞 / 2 建议'))
+  await click(buttonByText(renderer.toJSON(), '评审报告'))
   const dialog = quickDialog(renderer)
   assert.match(flat(dialog), /阻塞项 · 1.*阻塞问题.*建议项 · 2.*范围外建议.*次要建议/)
   assert.equal(findTags(dialog, 'h2')[0].props.id, dialog.props['aria-labelledby'])
   await click(buttonByText(dialog, '关闭'))
   assert.equal(quickDialog(renderer), null)
-  assert.equal(buttons((await render(stageHint, {})).toJSON()).some((node) => flat(node).startsWith('测试结果')), false)
+  assert.equal(buttons((await render(stageHint, {})).toJSON()).some((node) => flat(node).startsWith('测试报告')), false)
 })
 
 await check('快捷测试：区分失败、未覆盖、环境受限并保留原因', async () => {
@@ -966,7 +967,7 @@ await check('快捷测试：区分失败、未覆盖、环境受限并保留原�
   })
   const renderer = await render(stageHint, {})
   assert.equal(quickDialog(renderer), null)
-  await click(buttonByText(renderer.toJSON(), '测试结果 · 1 失败 / 1 未覆盖 / 1 受限'))
+  await click(buttonByText(renderer.toJSON(), '测试报告'))
   const text = flat(quickDialog(renderer))
   for (const value of ['未通过 · 2', '提交失败', '返回 500', 'AC-4', '缺少截图', '未覆盖 · 1', '窄屏测量', '环境受限 · 1', '原生弹窗', '缺少桌面宿主']) assert.ok(text.includes(value), value + ' 未出现：' + text)
   assert.ok(!text.includes('正常路径'))
@@ -2092,7 +2093,7 @@ const HubPanelIcon = componentOf('sidebar.panellist')
   const tree = renderer.toJSON()
   await check('S4 测试结果交上来后门禁按钮可点', async () => {
     assert.ok(flat(tree).includes('上次的门禁请求被中断'))
-    await click(buttonByText(tree, '验收通过，结束流程'))
+    await click(buttonByText(tree, '结束流程'))
     const last = posted[posted.length - 1]
     assert.equal(last.action, 'gate')
     assert.equal(last.payload.decision, 'pass')
@@ -2302,15 +2303,15 @@ await check('接受风险阶段标识与接受原因不同于评审通过或跳�
     assert.ok(text.includes('返回了 500'))
   })
 
-  await check('S4 门禁给出明确例外验收 / 退回 / 跳过', () => {
-    assert.ok(buttonByText(tree, '接受未通过项并结束（需确认）'))
+  await check('S4 门禁给出明确例外验收 / 退回，跳过不再是免检通道', () => {
+    assert.ok(buttonByText(tree, '结束流程（需确认）'))
     assert.ok(buttonByText(tree, '退回开发修复'))
-    assert.ok(buttonByText(tree, '跳过测试门禁'))
+    assert.equal(hasButton(tree, '跳过测试门禁'), false, '有缺口时跳过和结束流程等价，留着只会点出错')
   })
 
   await check('S4 点例外按钮先展开缺口清单，不直接投递', async () => {
     assert.equal(posted.length, 0)
-    await click(buttonByText(renderer.toJSON(), '接受未通过项并结束（需确认）'))
+    await click(buttonByText(renderer.toJSON(), '结束流程（需确认）'))
     assert.equal(posted.length, 0, '第一次点击只展开缺口，不发请求')
     const panel = renderer.toJSON()
     assert.match(flat(panel), /这些项目不会被标记为通过/)
@@ -2318,14 +2319,14 @@ await check('接受风险阶段标识与接受原因不同于评审通过或跳�
     assert.match(flat(panel), /未通过的测试要点（2 个）/)
     assert.match(flat(panel), /冒烟验证 · 过期后返回 401（失败）/)
     assert.match(flat(panel), /回归影响 · 旧用例不退化（未覆盖）/)
-    const confirmBtn = buttonByText(panel, '确认接受缺口并结束流程')
+    const confirmBtn = buttonByText(panel, '确认结束流程')
     assert.equal(confirmBtn.props.disabled, false, '看完清单点确认就能结束，不再要用户打字')
     // 退回修复的说明框还在，这里只断言不再有「接受原因」这种必填项。
     assert.equal(findTags(panel, 'textarea').filter((node) => String(node.props['aria-label'] ?? '').includes('接受原因')).length, 0, '缺口确认区不应再有必填说明输入框')
   })
 
   await check('S4 确认缺口后提交带缺口结项，不附带说明', async () => {
-    await click(buttonByText(renderer.toJSON(), '确认接受缺口并结束流程'))
+    await click(buttonByText(renderer.toJSON(), '确认结束流程'))
     const last = posted[posted.length - 1]
     assert.equal(last.action, 'gate')
     assert.equal(last.payload.decision, 'pass')
@@ -4352,15 +4353,16 @@ await check('scope展示冻结的验证方法和步骤', async () => {
   assert.ok(text.includes('验证步骤：先过期再请求接口'))
 })
 
-await check('S4未全通过时使用明确结束文案，两步确认后才提交例外结项', async () => {
-  for (const [statuses, label] of [[['pass', 'uncovered'], '接受未覆盖并结束'], [['pending'], '接受未覆盖并结束'], [['fail', 'uncovered'], '接受未通过项并结束']]) {
+await check('S4未全通过时按钮标出需确认，两步确认后才提交例外结项', async () => {
+  // 按钮文案统一成一个短词：缺口性质由旁边的账本行说明，不再把三种长句塞进按钮。
+  for (const statuses of [['pass', 'uncovered'], ['pending'], ['fail', 'uncovered']]) {
     currentView = baseView('S4', { waiting: true, acceptance: acceptanceOf(statuses) })
     posted = []
     const renderer = await render(FlowDetail, {})
-    assert.ok(!hasButton(renderer.toJSON(), '验收通过，结束流程'))
-    await click(buttonByText(renderer.toJSON(), label + '（需确认）'))
+    assert.equal(buttons(renderer.toJSON()).some((node) => flat(node) === '结束流程'), false, '有缺口时不能出现不带确认的结束按钮')
+    await click(buttonByText(renderer.toJSON(), '结束流程（需确认）'))
     assert.equal(posted.length, 0, '第一次点击只展开缺口，不发请求')
-    await click(buttonByText(renderer.toJSON(), '确认接受缺口并结束流程'))
+    await click(buttonByText(renderer.toJSON(), '确认结束流程'))
     const payload = posted.find((item) => item.action === 'gate').payload
     assert.equal(payload.acceptUncovered, true)
     assert.equal(payload.acceptanceNote, undefined)
@@ -4373,10 +4375,9 @@ await check('AC全通过但测试要点未通过时仍明确接受例外', async
     currentView = baseView('S4', { waiting: true, acceptance: acceptanceOf(['pass']), test: { directions: [{ id: 'smoke', points: [{ point: '独立验证', result }] }] } })
     posted = []
     const renderer = await render(FlowDetail, {})
-    const label = result === 'fail' ? '接受未通过项并结束' : '接受未覆盖并结束'
-    await click(buttonByText(renderer.toJSON(), label + '（需确认）'))
+    await click(buttonByText(renderer.toJSON(), '结束流程（需确认）'))
     assert.equal(posted.length, 0)
-    await click(buttonByText(renderer.toJSON(), '确认接受缺口并结束流程'))
+    await click(buttonByText(renderer.toJSON(), '确认结束流程'))
     assert.equal(posted.find((item) => item.action === 'gate').payload.acceptUncovered, true)
   }
 })
@@ -4395,12 +4396,12 @@ await check('测试要点 failed: 0 但 AC 一条没过时，两套账分别显�
   assert.match(flat(tree), /验收标准：通过 0 · 未通过 0 · 未覆盖 3 · 待验证 0（共 3 条）/)
   assert.match(flat(tree), /测试要点：通过 0 · 失败 0 · 未覆盖 1 · 环境受限 0（共 1 个）/)
   // 结束方式必须自成一档，不能读成「全部验收通过」。
-  assert.ok(!hasButton(tree, '验收通过，结束流程'))
-  assert.ok(hasButton(tree, '接受未覆盖并结束（需确认）'))
-  await click(buttonByText(tree, '接受未覆盖并结束（需确认）'))
-  const confirmBtn = buttonByText(renderer.toJSON(), '确认接受缺口并结束流程')
+  assert.equal(buttons(tree).some((node) => flat(node) === '结束流程'), false)
+  assert.ok(hasButton(tree, '结束流程（需确认）'))
+  await click(buttonByText(tree, '结束流程（需确认）'))
+  const confirmBtn = buttonByText(renderer.toJSON(), '确认结束流程')
   assert.equal(confirmBtn.props.disabled, false, '缺口已摊开，确认即接受')
-  await click(buttonByText(renderer.toJSON(), '确认接受缺口并结束流程'))
+  await click(buttonByText(renderer.toJSON(), '确认结束流程'))
   assert.equal(posted.find((item) => item.action === 'gate').payload.acceptUncovered, true)
 })
 
@@ -4424,7 +4425,7 @@ await check('S4全部通过时沿用原按钮且不发送例外许可', async ()
   currentView = baseView('S4', { waiting: true, acceptance: acceptanceOf(['pass']) })
   posted = []
   const renderer = await render(FlowDetail, {})
-  await click(buttonByText(renderer.toJSON(), '验收通过，结束流程'))
+  await click(buttonByText(renderer.toJSON(), '结束流程'))
   assert.equal(posted.find((item) => item.action === 'gate').payload.acceptUncovered, undefined)
 })
 

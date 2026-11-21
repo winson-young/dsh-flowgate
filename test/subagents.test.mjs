@@ -296,7 +296,8 @@ function makeHost(options = {}) {
       assert.equal((await host.state()).stage, stage)
     },
     // 这些传输/权限夹具没有实际 AC 执行证据；S4 默认明确跳过，不冒充验收通过。
-    async complete(kind, promise, payload = { decision: kind === 'test' ? 'skip' : 'pass' }) {
+    // 跳过与通过走同一套校验，所以缺口要显式接受，否则这些夹具都会被 409 拦住。
+    async complete(kind, promise, payload = kind === 'test' ? { decision: 'skip', acceptUncovered: true } : { decision: 'pass' }) {
       const field = kind === 'review' ? 'review' : 'test'
       await eventually(async () => {
         const state = await host.state()
@@ -671,7 +672,9 @@ for (const [name, options, marker] of [
     await test(kind + ' 的' + name + '可见降级且不悬挂', async () => {
       await fixture(options, async (host) => {
         await host.advance(kind === 'review' ? 'S3' : 'S4')
-        const { before } = await host.complete(kind, host.call('flowgate_' + kind + '_run'), { decision: 'skip' })
+        // S4 的跳过不再免检：这些降级夹具没有真实 AC 证据，缺口必须显式接受。
+        const skipPayload = kind === 'test' ? { decision: 'skip', acceptUncovered: true } : { decision: 'skip' }
+        const { before } = await host.complete(kind, host.call('flowgate_' + kind + '_run'), skipPayload)
         const report = before[kind]
         assert.equal(before.stageSummary.execution.status, 'failed', '降级报告不能掩盖实际执行失败')
         assert.match(JSON.stringify(report), marker)
@@ -1176,7 +1179,7 @@ for (const kind of ['review', 'test']) for (const stale of [false, true]) {
   })
 }
 
-await test('S4 规则改变后已通过的 S3 快照失效，即使显式接受缺口也返回 409', async () => {
+await test('S4 只加测试方向不算代码变化，已通过的评审仍然有效', async () => {
   await fixture({}, async (host) => {
     await host.advance('S4')
     const reviewed = (await host.state()).review.snapshot.id
@@ -1184,13 +1187,14 @@ await test('S4 规则改变后已通过的 S3 快照失效，即使显式接受�
     const pending = host.call('flowgate_test_run')
     await eventually(async () => Boolean((await host.state()).test) && (await host.state()).waitingKind === 'gate', '新规则测试报告')
     const state = await host.state()
+    // 加方向会让整份快照 id 变（规则进了 digest），但代码一行没动，
+    // 所以不该判成「评审后代码已变化」把用户赶回 S2 重做评审。
     assert.notEqual(state.snapshot.id, reviewed)
     assert.equal(state.test.snapshot.id, state.snapshot.id)
-    const rejected = await host.requestAction('gate', { decision: 'pass', acceptUncovered: true })
-    assert.equal(rejected.status, 409)
-    assert.match(rejected.body.error, /评审后代码或规则已变化/)
-    assert.equal((await host.state()).finished, false)
-    await host.complete('test', pending)
+    await host.complete('test', pending, { decision: 'pass', acceptUncovered: true, acceptanceNote: '规则变化不等于代码变化；缺口显式接受' })
+    const after = await host.state()
+    assert.equal(after.finished, true)
+    assert.equal(after.acceptanceDecision.status, 'accepted-with-gaps')
   })
 })
 
