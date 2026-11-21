@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { normalizeCriteria, acceptanceLedger, remediationList, stageSummary } from '../lib/acceptance.js'
+import { normalizeCriteria, acceptanceLedger, remediationList, scopeReadiness, stageSummary } from '../lib/acceptance.js'
 
 const snapshot = { id: 'a'.repeat(64), complete: true }
 const runtime = { status: 'verified', hostRevision: 'host-v1', clientRevision: 'client-v1', pageId: 'page-1', viewport: { width: 1440, height: 900 } }
@@ -29,6 +29,77 @@ test('规范化兼容旧 scope，保留声明内容且默认明显布局要求�
   assert.deepEqual(normalizeCriteria(null), [])
   assert.equal(normalizeCriteria([{ ...layout, verification: { tolerancePx: -1 } }])[0].verification.tolerancePx, 1)
   assert.equal(normalizeCriteria([{ ...layout, verification: { method: 'visual', tolerancePx: 0 } }])[0].verification.tolerancePx, 0)
+})
+
+test('冻结前的验收方案体检：集成验收缺测试文件与命令时给出缺口，不拦截', () => {
+  const criteria = [
+    { id: 'AC-1', when: '跨模块调用', then: '夹具联动成功', verification: { method: 'integration', procedure: '运行集成用例' } },
+  ]
+  const readiness = scopeReadiness(criteria, [], ['src/auth/session.ts'])
+  assert.deepEqual(readiness.blockers, [])
+  assert.deepEqual(readiness.risks.map((item) => item.code), ['no-test-command', 'integration-without-test-file'])
+  assert.deepEqual(readiness.risks[0].acs, ['AC-1'])
+  assert.match(readiness.risks[0].message, /声明了可执行验证（集成测试）/)
+  assert.match(readiness.risks[0].message, /清单为空/)
+  assert.match(readiness.risks[1].message, /没有任何测试文件/)
+  assert.match(readiness.risks[1].message, /S3 评审会要求回 S1 调 scope/)
+})
+
+test('验证步骤点名 scope 外的文件时给出缺口，点名的文件已在 scope 内就不再提示', () => {
+  const criteria = [{
+    id: 'AC-1',
+    when: '跨模块联动',
+    then: '夹具一起跑通',
+    verification: { method: 'integration', procedure: '先改 test/fixtures/session.ts，再运行 test/integration.test.mjs' },
+  }]
+  const outside = scopeReadiness(criteria, ['npm test'], ['test/integration.test.mjs'])
+  const risk = outside.risks.find((item) => item.code === 'procedure-file-outside-scope')
+  assert.ok(risk, JSON.stringify(outside.risks))
+  assert.deepEqual(risk.acs, ['AC-1'])
+  assert.match(risk.message, /test\/fixtures\/session\.ts/)
+  assert.doesNotMatch(risk.message, /test\/integration\.test\.mjs/)
+  // 目录级覆盖也算：scope 列了 test/ 就把下面的文件都算在内。
+  const covered = scopeReadiness(criteria, ['npm test'], ['test/integration.test.mjs', 'test/'])
+  assert.deepEqual(covered.risks.map((item) => item.code), [])
+  // 人工核验不需要动文件，不该被这条规则误伤。
+  const manual = [{ id: 'AC-2', when: '看界面', then: '观感正常', verification: { method: 'manual', procedure: '人工核对 src/a.ts 的文案' } }]
+  assert.deepEqual(scopeReadiness(manual, [], []).risks.map((item) => item.code), [])
+})
+
+test('清单里已经有测试文件时不再报「没有测试文件」', () => {
+  const criteria = [{ id: 'AC-1', when: '跨模块调用', then: '夹具联动成功', verification: { method: 'integration', procedure: '运行集成用例' } }]
+  const readiness = scopeReadiness(criteria, ['npm test'], ['test/host.test.mjs'])
+  assert.deepEqual(readiness.risks, [])
+})
+
+test('补全命令与测试文件后体检无缺口', () => {
+  const criteria = [
+    { id: 'AC-1', when: '跨模块调用', then: '夹具联动成功', verification: { method: 'integration', procedure: '运行集成用例' } },
+    { id: 'AC-2', when: '提交请求', then: '返回成功', verification: { method: 'unit', procedure: '跑单测' } },
+  ]
+  const readiness = scopeReadiness(criteria, ['npm test'], ['test/integration.test.mjs'])
+  assert.deepEqual(readiness.blockers, [])
+  assert.deepEqual(readiness.risks, [])
+  assert.deepEqual(readiness.testCommands, ['npm test'])
+  assert.deepEqual(readiness.testFiles, ['test/integration.test.mjs'])
+})
+
+test('视觉验收没写测量方式时给出缺口，写了就不再提示', () => {
+  const vague = [{ id: 'AC-1', when: '打开界面', then: '按钮居中', verification: { method: 'visual', procedure: '看一下' } }]
+  assert.deepEqual(scopeReadiness(vague, [], []).risks.map((item) => item.code), ['visual-without-measurement'])
+  const measured = [{ id: 'AC-1', when: '打开界面', then: '按钮居中', verification: { method: 'visual', procedure: '用 getBoundingClientRect 量左右边界，容差 1px' } }]
+  assert.deepEqual(scopeReadiness(measured, [], []).risks, [])
+})
+
+test('id 缺失或重复是硬阻塞，不是风险', () => {
+  const readiness = scopeReadiness([
+    { when: '没有 id', then: '无法关联证据', verification: { method: 'unit', procedure: '跑单测' } },
+    { id: 'AC-1', when: 'a', then: 'b', verification: { method: 'unit', procedure: '跑单测' } },
+    { id: 'AC-1', when: 'c', then: 'd', verification: { method: 'unit', procedure: '跑单测' } },
+  ], ['npm test'], ['test/a.test.mjs'])
+  assert.deepEqual(readiness.blockers.map((item) => item.code), ['missing-id', 'duplicate-id'])
+  assert.match(readiness.blockers[0].message, /没有 id/)
+  assert.match(readiness.blockers[1].message, /AC-1（2 条）/)
 })
 
 test('提交测试之前为 pending，旧测试总数和方向通过不转为 AC 通过', () => {

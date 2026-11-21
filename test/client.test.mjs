@@ -847,7 +847,7 @@ await check('阶段提示：放弃要两次确认，S4 带缺口时不提供一�
   assert.equal(hasButton(hintTree, '接受未覆盖并结束'), false, '快捷入口不能绕开例外确认')
   assert.ok(buttonByText(hintTree, '退回开发修复'), '带缺口时仍能退回修复')
   assert.match(flat(hintTree), /验收标准通过 0 \/ 1/, '快捷入口要说清 AC 账本')
-  assert.match(flat(hintTree), /带缺口结束要在「出口门禁」里看清缺口并写明原因/)
+  assert.match(flat(hintTree), /带缺口结束要在「出口门禁」里看清缺口并确认接受/)
   assert.equal(posted.length, 0, '摆说明本身不投递任何请求')
   // 放弃：两次确认后才真的投递 cancel。
   await click(buttonByText(renderer.toJSON(), '放弃这次流程'))
@@ -1739,6 +1739,119 @@ const HubPanelIcon = componentOf('sidebar.panellist')
   })
 }
 
+// P2：AC 声明集成验收、验证步骤点名 scope 外的夹具时，批准前必须摊开缺口并明确接受。
+// 只点一下「批准」就签掉它，等于等到 S4 才发现方法对不上证据。
+{
+  posted = []
+  currentView = baseView('S1', {
+    doc: {
+      html: '<html><body>需求文档</body></html>',
+      pending: true,
+      pendingScope: {
+        files_expected_to_change: ['test/host.test.mjs'],
+        commands: ['node test/host.test.mjs'],
+        capabilities: ['补集成测试'],
+        out_of_scope_explicitly: [],
+        acceptance_criteria: [{
+          id: 'AC-1', when: '跨模块联动', then: '夹具一起跑通',
+          method: 'integration', procedure: '先改 test/fixtures/session.ts',
+        }],
+      },
+      droppedScopeEntries: [],
+      pendingScopeRisks: [{
+        code: 'procedure-file-outside-scope',
+        acs: ['AC-1'],
+        message: '这些验收标准的验证步骤点名了 scope 之外的文件：AC-1 → test/fixtures/session.ts。开发阶段改不了它们，评审也会把相关发现判成范围外。',
+      }],
+    },
+    waiting: false,
+    waitingKind: null,
+  })
+  const renderer = await render(FlowDetail, {})
+  const tree = renderer.toJSON()
+  await check('S1 批准前展示验收方案缺口', () => {
+    const text = flat(tree)
+    assert.ok(text.includes('验收方案缺口（批准前需确认）'), text)
+    assert.ok(text.includes('test/fixtures/session.ts'))
+    assert.ok(text.includes('批准并冻结 scope（需确认缺口）'))
+    assert.ok(text.includes('跳过评审，直接开发（需确认缺口）'))
+  })
+  await check('点批准先展开缺口确认区，不直接投递', async () => {
+    await click(buttonByText(renderer.toJSON(), '批准并冻结 scope（需确认缺口）'))
+    assert.equal(posted.length, 0, JSON.stringify(posted))
+    const confirm = nodeByLabel(renderer.toJSON(), '验收方案缺口确认')
+    const confirmText = flat(confirm)
+    assert.ok(confirmText.includes('这份 scope 有 1 条验收方案缺口'), confirmText)
+    assert.ok(confirmText.includes('AC-1'))
+    assert.ok(confirmText.includes('test/fixtures/session.ts'))
+    assert.ok(confirmText.includes('缺口不会被当成通过'))
+  })
+  await check('确认区不再要用户写接受原因，确认按钮直接可用', () => {
+    const confirm = nodeByLabel(renderer.toJSON(), '验收方案缺口确认')
+    const confirmButton = buttons(confirm).find((node) => flat(node).includes('确认接受缺口并冻结 scope'))
+    assert.ok(confirmButton, '缺少确认按钮')
+    assert.equal(confirmButton.props.disabled, false, '接受靠动作本身，不靠一段说明')
+    assert.equal(findTags(confirm, 'textarea').length, 0, '确认区不应再有必填说明输入框')
+    assert.ok(!flat(confirm).includes('接受原因'), '缺口清单与计数才是事后能核的东西')
+  })
+  await check('点确认提交 acceptScopeRisks，不附带说明', async () => {
+    const confirm = nodeByLabel(renderer.toJSON(), '验收方案缺口确认')
+    const confirmButton = buttons(confirm).find((node) => flat(node).includes('确认接受缺口并冻结 scope'))
+    await click(confirmButton)
+    const last = posted[posted.length - 1]
+    assert.equal(last.action, 'doc')
+    assert.equal(last.payload.decision, 'approve')
+    assert.equal(last.payload.acceptScopeRisks, true)
+    assert.equal(last.payload.scopeRiskNote, undefined)
+  })
+  await check('取消确认区后回到普通批准入口，缺口仍然摆着', async () => {
+    const confirm = nodeByLabel(renderer.toJSON(), '验收方案缺口确认')
+    await click(buttons(confirm).find((node) => flat(node).includes('取消')))
+    assert.equal(nodeByLabel(renderer.toJSON(), '验收方案缺口确认'), null)
+    assert.ok(flat(renderer.toJSON()).includes('验收方案缺口（批准前需确认）'))
+  })
+}
+
+// 冻结后缺口要一直可见：结束之后也要能追溯当时接受了什么。用户自己补的原因有就显示，没有不占位。
+{
+  currentView = baseView('S2', {
+    scope: {
+      frozen: true,
+      frozenAt: '2026-11-17T10:00:00Z',
+      withoutDocApproval: false,
+      data: {
+        version: 1,
+        frozen_at: '2026-11-17T10:00:00Z',
+        in_scope: {
+          files_expected_to_change: ['test/host.test.mjs'],
+          commands: ['node test/host.test.mjs'],
+          capabilities: ['补集成测试'],
+          shared_contracts: [],
+        },
+        out_of_scope_explicitly: [],
+        acceptance_criteria: [{ id: 'AC-1', when: '跨模块联动', then: '夹具一起跑通' }],
+        scope_risks: {
+          accepted: true,
+          note: '夹具下一轮补，本轮先用主机测试兜底',
+          at: '2026-11-17T10:00:00Z',
+          risks: [{ code: 'procedure-file-outside-scope', acs: ['AC-1'], message: '验证步骤点名了 scope 之外的文件：test/fixtures/session.ts' }],
+        },
+      },
+    },
+    waiting: false,
+    waitingKind: null,
+  })
+  const tree = (await render(FlowDetail, {})).toJSON()
+  await check('冻结后展示用户已接受的验收方案缺口', () => {
+    const text = flat(tree)
+    assert.ok(text.includes('验收方案缺口（用户已接受）'), text)
+    assert.ok(text.includes('test/fixtures/session.ts'))
+    // 用户主动补过原因时才展示，措辞也要说清这是补充说明，不是接受的前提。
+    assert.ok(text.includes('用户补充的接受原因：夹具下一轮补，本轮先用主机测试兜底'))
+    assert.ok(text.includes('unit 证据也顶不了 integration'))
+  })
+}
+
 {
   currentView = baseView('S1', {
     doc: {
@@ -2209,19 +2322,18 @@ await check('接受风险阶段标识与接受原因不同于评审通过或跳�
     assert.match(flat(panel), /冒烟验证 · 过期后返回 401（失败）/)
     assert.match(flat(panel), /回归影响 · 旧用例不退化（未覆盖）/)
     const confirmBtn = buttonByText(panel, '确认接受缺口并结束流程')
-    assert.equal(confirmBtn.props.disabled, true, '没写接受原因不能确认')
+    assert.equal(confirmBtn.props.disabled, false, '看完清单点确认就能结束，不再要用户打字')
+    // 退回修复的说明框还在，这里只断言不再有「接受原因」这种必填项。
+    assert.equal(findTags(panel, 'textarea').filter((node) => String(node.props['aria-label'] ?? '').includes('接受原因')).length, 0, '缺口确认区不应再有必填说明输入框')
   })
 
-  await check('S4 写明接受原因后才提交带缺口结项', async () => {
-    const field = findTags(renderer.toJSON(), 'textarea').find((node) => node.props['aria-label'] === '接受原因（必填）')
-    assert.ok(field, '接受原因必须是独立必填项，不再是「可选」')
-    await changeValue(field, '已知 500 由上游改造引起，本流程只保证 401 路径')
+  await check('S4 确认缺口后提交带缺口结项，不附带说明', async () => {
     await click(buttonByText(renderer.toJSON(), '确认接受缺口并结束流程'))
     const last = posted[posted.length - 1]
     assert.equal(last.action, 'gate')
     assert.equal(last.payload.decision, 'pass')
     assert.equal(last.payload.acceptUncovered, true)
-    assert.equal(last.payload.acceptanceNote, '已知 500 由上游改造引起，本流程只保证 401 路径')
+    assert.equal(last.payload.acceptanceNote, undefined)
   })
 }
 
@@ -4195,7 +4307,7 @@ await check('scope展示冻结的验证方法和步骤', async () => {
   assert.ok(text.includes('验证步骤：先过期再请求接口'))
 })
 
-await check('S4未全通过时使用明确结束文案，两步确认后才提交例外说明', async () => {
+await check('S4未全通过时使用明确结束文案，两步确认后才提交例外结项', async () => {
   for (const [statuses, label] of [[['pass', 'uncovered'], '接受未覆盖并结束'], [['pending'], '接受未覆盖并结束'], [['fail', 'uncovered'], '接受未通过项并结束']]) {
     currentView = baseView('S4', { waiting: true, acceptance: acceptanceOf(statuses) })
     posted = []
@@ -4203,12 +4315,10 @@ await check('S4未全通过时使用明确结束文案，两步确认后才提�
     assert.ok(!hasButton(renderer.toJSON(), '验收通过，结束流程'))
     await click(buttonByText(renderer.toJSON(), label + '（需确认）'))
     assert.equal(posted.length, 0, '第一次点击只展开缺口，不发请求')
-    const field = findTags(renderer.toJSON(), 'textarea').find((node) => node.props['aria-label'] === '接受原因（必填）')
-    await changeValue(field, '允许稍后补齐验证')
     await click(buttonByText(renderer.toJSON(), '确认接受缺口并结束流程'))
     const payload = posted.find((item) => item.action === 'gate').payload
     assert.equal(payload.acceptUncovered, true)
-    assert.equal(payload.acceptanceNote, '允许稍后补齐验证')
+    assert.equal(payload.acceptanceNote, undefined)
     assert.deepEqual(currentView.acceptance.items.map((item) => item.status), statuses)
   }
 })
@@ -4221,8 +4331,6 @@ await check('AC全通过但测试要点未通过时仍明确接受例外', async
     const label = result === 'fail' ? '接受未通过项并结束' : '接受未覆盖并结束'
     await click(buttonByText(renderer.toJSON(), label + '（需确认）'))
     assert.equal(posted.length, 0)
-    const field = findTags(renderer.toJSON(), 'textarea').find((node) => node.props['aria-label'] === '接受原因（必填）')
-    await changeValue(field, '先按已知结果结束')
     await click(buttonByText(renderer.toJSON(), '确认接受缺口并结束流程'))
     assert.equal(posted.find((item) => item.action === 'gate').payload.acceptUncovered, true)
   }
@@ -4246,8 +4354,7 @@ await check('测试要点 failed: 0 但 AC 一条没过时，两套账分别显�
   assert.ok(hasButton(tree, '接受未覆盖并结束（需确认）'))
   await click(buttonByText(tree, '接受未覆盖并结束（需确认）'))
   const confirmBtn = buttonByText(renderer.toJSON(), '确认接受缺口并结束流程')
-  assert.equal(confirmBtn.props.disabled, true)
-  await changeValue(findTags(renderer.toJSON(), 'textarea').find((node) => node.props['aria-label'] === '接受原因（必填）'), '真实浏览器不可用，先按未覆盖结项')
+  assert.equal(confirmBtn.props.disabled, false, '缺口已摊开，确认即接受')
   await click(buttonByText(renderer.toJSON(), '确认接受缺口并结束流程'))
   assert.equal(posted.find((item) => item.action === 'gate').payload.acceptUncovered, true)
 })
@@ -4261,7 +4368,7 @@ await check('流程以带缺口方式结束后，门禁卡显示缺口而不是�
   assert.ok(hasButton(tree, '带缺口结束') === false, '结束方式用徽标呈现，不是可点按钮')
   assert.match(flat(tree), /带缺口结束/)
   assert.match(flat(tree), /验收标准 0 通过 \/ 0 未通过 \/ 3 未覆盖（共 3 条）/)
-  assert.match(flat(tree), /接受原因：真实浏览器不可用/)
+  assert.match(flat(tree), /用户补充的接受原因：真实浏览器不可用/)
   const gate = nodeByLabel(tree, '出口门禁')
   assert.ok(gate, '门禁卡必须存在')
   assert.ok(!flat(gate).includes('流程已结束'), '带缺口结束不能只写「流程已结束」，那句话和全部通过没区别')

@@ -545,7 +545,13 @@ await check('当前版本的逐 AC 实际执行证据才可正常验收通过', 
         verification: { method: 'integration', procedure: '在集成测试中读取 proof.txt 并断言精确文本' } }] },
   }, S), '证据文档')
   await tick()
-  assert.equal((await post({ sessionId: S, action: 'doc', payload: { decision: 'approve' } })).status, 200)
+  // 本例只验证「证据能对上版本」，scope 里没有测试文件也没有测试命令，冻结前的验收方案体检会给出缺口。
+  // 按新语义必须显式接受并写明原因，不能靠默认放行把缺口签掉。
+  assert.equal((await post({ sessionId: S, action: 'doc', payload: {
+    decision: 'approve',
+    acceptScopeRisks: true,
+    scopeRiskNote: '本例只验证证据闭环，测试文件与命令不在本次写范围内',
+  } })).status, 200)
   await doc
   const dev = within(call('flowgate_gate', {}, S), '证据开发门禁')
   await tick()

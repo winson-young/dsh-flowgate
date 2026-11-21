@@ -1705,8 +1705,11 @@ rmSync(cwd, { recursive: true, force: true })
     payload: { decision: 'approve' },
   })
   const docSkipped = await docCall
-  check('AC-7 文档批准返回字段集合不变', () => {
-    assert.deepEqual(Object.keys(docSkipped).sort(), ['decision', 'frozen', 'message', 'preset'])
+  check('AC-7 文档批准返回字段只新增 scopeRisks，其余不变', () => {
+    // scopeRisks 是刻意扩展的契约：Agent 要能看到「用户带着哪些缺口批准了 scope」。
+    assert.deepEqual(Object.keys(docSkipped).sort(), ['decision', 'frozen', 'message', 'preset', 'scopeRisks'])
+    // 没有缺口时是空数组，调用方不需要额外分支。
+    assert.deepEqual(docSkipped.scopeRisks, [])
   })
   const gateCall = cx.tool('flowgate_gate', {})
   await tick()
@@ -3475,6 +3478,122 @@ for (const [kind, reason, expected] of [
 }
 
 // ---------------------------------------------------------------------------
+// S1 冻结前的验收方案体检：AC 声明集成验收、验证步骤点名跨模块夹具，而 scope 只列了
+// 主机测试文件与命令——这是「scope 与验证方法不相容」里唯一能静态抓到的一类。
+// 必须批准前摊开缺口清单并明确接受；补全 scope 后要能正常推进，S4 仍按方法核验。
+// 放在最后单独起 host：currentService 是模块级单例，中途再 apply 会顶掉前面的实例。
+// ---------------------------------------------------------------------------
+{
+  const riskCwd = mkdtempSync(join(tmpdir(), 'flowgate-scope-risk-'))
+  try {
+    const rx = makeHost(riskCwd, 'sess-scope-risk')
+    const act = (action, payload) => rx.request('/api/flowgate/action', { sessionId: 'sess-scope-risk', action, payload })
+    await rx.tool('flowgate_start', { title: '验收方案缺口', preset: 'fast' })
+    const riskHtml = '<html><body><p>缺口</p></body></html>'
+    const riskScope = (extraFiles) => ({
+      files_expected_to_change: ['test/host.test.mjs', ...(extraFiles || [])],
+      commands: ['node test/host.test.mjs'],
+      capabilities: ['补集成测试'],
+      out_of_scope_explicitly: [],
+      acceptance_criteria: [{
+        id: 'AC-1',
+        when: '跨模块联动',
+        then: '夹具一起跑通',
+        verification: { method: 'integration', procedure: '先改 test/fixtures/session.ts，再运行集成用例' },
+      }],
+    })
+    const riskDoc = rx.tool('flowgate_doc', { html: riskHtml, scope: riskScope() })
+    await tick()
+    const riskState = await rx.request('/api/flowgate/state?sessionId=sess-scope-risk')
+    // 注意：doc 工具调用要等门禁决策才会 settle，这里先读视图，批准后再 await。
+    check('提交时就体检出验收方案缺口，并随待批准 scope 一起展示', () => {
+      const risks = riskState.body.doc.pendingScopeRisks
+      assert.ok(Array.isArray(risks) && risks.length === 1, JSON.stringify(risks))
+      assert.equal(risks[0].code, 'procedure-file-outside-scope')
+      assert.deepEqual(risks[0].acs, ['AC-1'])
+      assert.match(risks[0].message, /test\/fixtures\/session\.ts/)
+    })
+
+    const riskNoAccept = await act('doc', { decision: 'approve' })
+    check('有缺口时不能一键批准，必须先显式接受', () => {
+      assert.equal(riskNoAccept.status, 409)
+      assert.match(String(riskNoAccept.body?.error ?? riskNoAccept.body), /验收方案缺口/)
+      assert.match(String(riskNoAccept.body?.error ?? riskNoAccept.body), /acceptScopeRisks/)
+    })
+
+    const riskOk = await act('doc', { decision: 'approve', acceptScopeRisks: true })
+    await riskDoc
+    check('明确接受就能冻结，不要求用户写说明；缺口随冻结凭据落盘', () => {
+      assert.equal(riskOk.status, 200)
+      assert.equal(riskOk.body.stage, 'S2')
+      const accepted = riskOk.body.scope.data.scope_risks
+      assert.equal(accepted.accepted, true)
+      // 没写原因时不塞一个空字段：缺口清单与计数才是事后能核的东西。
+      assert.equal(accepted.note, undefined)
+      assert.deepEqual(accepted.risks.map((item) => item.code), ['procedure-file-outside-scope'])
+      assert.equal(riskOk.body.scopeRisksAccepted.accepted, true)
+    })
+
+    const riskEvents = readFileSync(join(riskCwd, '.dsh-flowgate', 'flows.jsonl'), 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+    check('缺口接受单独留痕：事件里能追溯接受了哪些缺口', () => {
+      const event = riskEvents.find((item) => item.type === 'scope.risks_accepted')
+      assert.ok(event, '缺少 scope.risks_accepted 事件')
+      assert.deepEqual(event.detail.codes, ['procedure-file-outside-scope'])
+      assert.deepEqual(event.detail.acs, ['AC-1'])
+      assert.equal(event.detail.decision, 'approve')
+      assert.equal(event.detail.note, undefined, '没写原因就不留空字段')
+    })
+
+    const riskStatus = await rx.tool('flowgate_status', {})
+    check('状态摘要把缺口念给 Agent，避免它当成已经通过', () => {
+      const summary = String(riskStatus?.summary ?? riskStatus?.content?.[0]?.text ?? JSON.stringify(riskStatus))
+      assert.match(summary, /验收方案缺口（用户已明确接受 1 条）/)
+      assert.match(summary, /test\/fixtures\/session\.ts/)
+      assert.match(summary, /S4 仍严格按每条验收标准声明的方法核验证据/)
+      assert.ok(!summary.includes('接受原因：'), '没写原因时摘要不该摆一个「接受原因」空位')
+    })
+
+    // 补全 scope 后应能正常推进：退回 S1 重新提交，把夹具补进白名单。
+    await act('gate', { decision: 'back', to: 'S1' })
+    const fixedDoc = rx.tool('flowgate_doc', { html: riskHtml, scope: riskScope(['test/fixtures/session.ts']) })
+    await tick()
+    const fixedState = await rx.request('/api/flowgate/state?sessionId=sess-scope-risk')
+    const fixedOk = await act('doc', { decision: 'approve' })
+    await fixedDoc
+    check('补全 scope 后缺口消失，不需要接受例外就能冻结', () => {
+      assert.deepEqual(fixedState.body.doc.pendingScopeRisks, [])
+      assert.equal(fixedOk.status, 200)
+      assert.equal(fixedOk.body.stage, 'S2')
+      assert.equal(fixedOk.body.scope.data.scope_risks, undefined)
+    })
+
+    // 原因虽然不再必填，用户主动写了仍要留下：这是事后唯一能解释「当时为什么算了」的东西。
+    await act('gate', { decision: 'back', to: 'S1' })
+    const notedDoc = rx.tool('flowgate_doc', { html: riskHtml, scope: riskScope() })
+    await tick()
+    const notedOk = await act('doc', {
+      decision: 'approve',
+      acceptScopeRisks: true,
+      scopeRiskNote: '跨模块夹具在下一轮补，本轮先用主机测试兜底',
+    })
+    await notedDoc
+    check('用户主动写的接受原因仍会随缺口一起落盘', () => {
+      assert.equal(notedOk.status, 200)
+      assert.equal(notedOk.body.scope.data.scope_risks.note, '跨模块夹具在下一轮补，本轮先用主机测试兜底')
+      const events = readFileSync(join(riskCwd, '.dsh-flowgate', 'flows.jsonl'), 'utf8')
+        .split('\n').filter(Boolean).map((line) => JSON.parse(line))
+      const noted = events.filter((item) => item.type === 'scope.risks_accepted').pop()
+      assert.equal(noted.detail.note, '跨模块夹具在下一轮补，本轮先用主机测试兜底')
+    })
+  } finally {
+    rmSync(riskCwd, { recursive: true, force: true })
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 评审归属口径与完整计数：只有挂在冻结 scope 的验收标准上、且落在 scope 文件内的
 // 非 MINOR 发现才进重做清单；对不上的降级成建议。fast 档同样保留完整发现。
 // 放在最后单独起 host：currentService 是模块级单例，中途再 apply 会顶掉前面的实例。
@@ -3668,7 +3787,9 @@ async function provenanceFixture(label) {
   const doc = px.tool('flowgate_doc', {
     html: '<html><body><p>按内容与执行证据验收</p></body></html>',
     scope: {
-      commands: [], files_expected_to_change: ['src/session.mjs', 'src/helper.mjs'],
+      // 验收方案体检会拦住「声明了 unit 验收却没有测试命令」：这个夹具要走完整条流程，
+      // 所以补一条真实可用的测试命令，而不是每次批准都接受缺口。
+      commands: ['npm test'], files_expected_to_change: ['src/session.mjs', 'src/helper.mjs'],
       capabilities: ['过期请求拒绝'], out_of_scope_explicitly: [],
       acceptance_criteria: [{ id: 'AC-1', when: '会话过期后发请求', then: '返回 401', verification: { method: 'unit', procedure: '调用 response(true) 并断言状态码' } }],
     },

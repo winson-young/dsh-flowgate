@@ -6,6 +6,38 @@
 
 历史记录中的 `by: 'subagents'` 仅表明调用了子代理聚合入口；聚合报告通过、`blocking: 0` 或流程走完，均不能证明真实子代理成功执行并返回有效报告。下文原有结论保留，其证据范围受此限定。
 
+## 冻结前验收方案体检（2026-11-21）
+
+需求：冻结 scope 与验收方法、验证命令之间缺少一致性检查。AC 可以声明「集成测试」而 scope 里既没有测试文件也没有测试命令，验证步骤可以点名 scope 之外的文件，视觉验收可以完全不写怎么量——这些在 S1 都能静态看出苗头，但当时没人拦。等 S4 交证据时才暴露「方法对不上证据」，只剩两条路：带缺口结项，或整轮退回重做。
+
+改动范围：`lib/acceptance.js`（新增 `scopeReadiness` 与 `scopeCovers` / `procedureOutsideScope` 两个内部函数，`TEST_FILE` / `TEST_COMMAND` / `MEASURE_HINT` / `PATH_HINT` 常量）、`lib/index.js`（`flowgate_doc` 提交时体检、`decideDoc` 冻结前重算并要求 `acceptScopeRisks`（原因可选）、`scope.risks_accepted` 事件、视图 `doc.pendingScopeRisks` 与顶层 `scopeRisksAccepted`、`flowgate_status` 摘要、`pendingScopeRisks` 流程字段）、`lib/client.js`（`DocGate` 的缺口确认区与两步批准、`ScopeBlock` 的「验收方案缺口」区块）、`test/acceptance.test.mjs`、`test/host.test.mjs`、`test/client.test.mjs`、`test/integration.test.mjs`、`docs/development.md`。
+
+| 验收项 | 状态 | 证据与限制 |
+| :--- | :--- | :--- |
+| AC-1 验收标准缺 `id` 或 `id` 重复直接拒收 | 通过 | `test/acceptance.test.mjs`「id 缺失或重复是硬阻塞，不是风险」断言 `blockers` 依次为 `['missing-id','duplicate-id']`；`flowgate_doc` 提交时 `blockers` 非空即抛错，不进入待批准状态 |
+| AC-2 声明可执行验证却没有测试命令时给出缺口 | 通过 | 同文件「冻结前的验收方案体检：集成验收缺测试文件与命令时给出缺口，不拦截」断言 `risks` 的 `code` 依次为 `['no-test-command','integration-without-test-file']`；「清单里已经有测试文件时不再报『没有测试文件』」与「补全命令与测试文件后体检无缺口」两条反向用例证明它不会一律报缺口 |
+| AC-3 验证步骤点名 scope 之外的文件时给出缺口 | 通过 | 同文件「验证步骤点名 scope 外的文件时给出缺口…」：`procedure` 提到 `test/fixtures/session.ts` 而 scope 只含 `test/host.test.mjs` 时报 `procedure-file-outside-scope`，把 `test/` 加进 scope 后缺口消失；`manual` 方法不被误伤。目录级覆盖算覆盖，所以列了 `test/` 就不再逐文件报 |
+| AC-4 视觉验收没写测量方式时给出缺口 | 通过 | 同文件「视觉验收没写测量方式时给出缺口，写了就不再提示」：`method: 'visual'` 且 `procedure` 不含测量类词汇时报 `visual-without-measurement`，写上 `getBoundingClientRect` 后消失 |
+| AC-5 有缺口不能一键冻结，必须显式接受 | 通过 | `test/host.test.mjs` 的 `sess-scope-risk` 组：只带 `decision: 'approve'` 返回 409 并匹配 `/验收方案缺口/` 与 `/acceptScopeRisks/`；带 `acceptScopeRisks: true` 后 200（原因改为可选，见本节末尾的后续调整） |
+| AC-6 接受结果落盘且可追溯 | 通过 | 同组断言 `scope.data.scope_risks.accepted === true`、`scopeRisksAccepted.accepted === true`、`flows.jsonl` 有 `scope.risks_accepted` 事件（带 `codes` / `acs` / `decision`），`flowgate_status` 摘要含「验收方案缺口（用户已明确接受 1 条）」与「S4 仍严格按每条验收标准声明的方法核验证据」；用户主动写原因时另有「用户补充的接受原因：…」 |
+| AC-7 工作台在批准前摊开缺口，不让人盲签 | 通过 | `test/client.test.mjs` 的 S1 组：主按钮变「批准并冻结 scope（需确认缺口）」，点它只展开确认区（`posted.length === 0`），确认按钮直接可用且确认区内没有任何「接受原因」输入框，点它提交 `acceptScopeRisks: true` 且不带 `scopeRiskNote`；取消后回到普通入口且缺口仍摆着。S2 组断言冻结后显示「验收方案缺口（用户已接受）」 |
+| AC-8 补上缺口后可以直接冻结，不残留旧缺口 | 通过 | `test/host.test.mjs` 同组最后一条：退回 S1 把 `test/fixtures/session.ts` 加进 scope 后 `pendingScopeRisks` 为空，`decision: 'approve'` 不带任何额外字段即 200，且 `scope_risks` 为 `undefined` |
+| AC-9 无回归 | 通过 | 八个测试入口整组通过：内容快照 20、验收账本 30、运行版本 18、宿主 350、子代理 82、集成 33、客户端 232、安装 17，合计 782 项；`scripts/stamp-revisions.mjs --check` 输出 `Module revisions verified (6 modules).` |
+
+### 后续调整：接受原因改为可选（2026-11-21）
+
+按用户要求去掉两处必填的「接受原因」输入框（验收方案缺口确认区、例外结项确认区）：接受靠「看清清单再点确认」这个动作区分，不再靠用户打一段字。后端同步删除两道必填校验（`decideDoc` 的 `scopeRiskNote`、`gateValidation` 的 `acceptanceNote`），`scope.data.scope_risks.note`、`gate.gapAcceptance.note`、`scope.risks_accepted` 事件的 `note` 与 `flow.closure.note` 都改为「用户写了才出现」，不再留「未填写」占位；展示文案统一为「用户补充的接受原因：…」。
+
+验证：`test/client.test.mjs` 两条用例改为断言确认按钮直接可用、确认区内无 `textarea`、提交载荷不带 `scopeRiskNote` / `acceptanceNote`；`test/host.test.mjs` 的 `sess-scope-risk` 组改为「带 `acceptScopeRisks: true` 即 200 且 `note` 为 `undefined`」，并新增「用户主动写的接受原因仍会随缺口一起落盘」；八个入口合计 782 项通过。
+
+### 已知未通过项
+
+无。
+
+### 真实视觉未覆盖
+
+`DocGate` 的缺口确认区、`ScopeBlock` 的缺口区块都只在组件树层面核对（文案、disabled 状态、提交的 payload），没有在真实 DSH 工作台里加载看过。缺口的四种风险各自都有单测与宿主测试，但「真实模型写出一个既有测试文件又有测试命令、验证步骤却不越界的 scope」这条干净路径没有端到端跑过——本机 `.dsh-flowgate/flows` 里没有任何流程记录过 `scope_risks`，因为这条体检是本次新加的，历史数据全在它之前。
+
 ## 评审子代理读取口径与并行读取记账（2026-11-21）
 
 需求：核查「评审子代理读取能力与提示不一致」——提示要求子代理直接调用 `tools.ops_read_files`，但该工具在按需 SDK 环境里可能尚未加载；历史评审报告记录过 `TypeError: tools.ops_read_files is not a function`，子代理没读源码却提交 `verdict: pass`、空 findings；测试夹具预置了该工具，没有模拟真实加载。要求提示改用默认可用的读取工具或给出按需加载路径，保持只读守卫边界，读取失败或未检查目标文件时角度必须标未完成 / 未覆盖，不得因 findings 为空判通过。
