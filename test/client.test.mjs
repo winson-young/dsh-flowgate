@@ -4659,6 +4659,206 @@ await check('已有样式节点和ShadowRoot样式内容会在热更新时替换
 })
 
 // ---------------------------------------------------------------------------
+// S1 决策问题：会话输入框上方直接作答
+// ---------------------------------------------------------------------------
+
+/** S1 停在一个待回答的决策问题上；问题与选项和工作台的 GrillCard 同源。 */
+function grillView(patch = {}) {
+  return baseView('S1', {
+    waiting: true,
+    waitingKind: 'answer',
+    grill: {
+      pending: {
+        id: 'q_dock_1',
+        question: '点选快捷答案后要不要再留一条用户发言？',
+        context: '只影响会话记录，不影响流程推进。',
+        options: [
+          { label: '不用额外发消息，点一下即答', tradeoff: '不引入「发送用户消息」依赖' },
+          { label: '顺带发一条用户发言', tradeoff: '会话里留下这次选择' },
+        ],
+        recommended: 0,
+        allowCustom: true,
+        at: '2026-11-21T10:00:00Z',
+      },
+      answeredCount: 0,
+      awaiting: true,
+    },
+    ...patch,
+  })
+}
+
+function answerButtons(tree) {
+  const opts = nodeByClass(tree, 'fg-hint-answer-opts')
+  return opts ? buttons(opts) : []
+}
+
+await check('阶段提示：S1 决策问题在 dock 里直接作答，选项与推荐项同源', async () => {
+  currentView = grillView()
+  const tree = (await render(stageHint, {})).toJSON()
+  const box = nodeByClass(tree, 'fg-hint-answer')
+  assert.ok(box, '有决策问题时 dock 出现回答区')
+  assert.match(flat(box), /问：点选快捷答案后要不要再留一条用户发言？/)
+  assert.match(flat(box), /只影响会话记录，不影响流程推进。/)
+  const opts = answerButtons(tree)
+  // 每个选项按钮里两行：标签（带推荐后缀）与取舍说明，标签文案只取第一行。
+  assert.deepEqual(opts.map((node) => flat(nodeByClass(node, 'fg-hint-answer-opt-label'))), ['不用额外发消息，点一下即答（推荐）', '顺带发一条用户发言'])
+  assert.ok(opts[0].props.className.includes('fg-hint-btn-primary'), '推荐项用主色')
+  // 取舍说明直接排在选项下面：触屏、键盘与读屏都拿得到，不靠悬停。
+  assert.equal(flat(nodeByClass(opts[0], 'fg-hint-answer-opt-label')), '不用额外发消息，点一下即答（推荐）')
+  assert.equal(flat(nodeByClass(opts[0], 'fg-hint-answer-opt-note')), '不引入「发送用户消息」依赖', '取舍说明可见')
+  assert.equal(opts[0].props.title, undefined, '取舍不再只挂在 title 上')
+  // 回答区独占一行：流转按钮组仍然是原来那一个（S1 未交文档时只剩放弃）。
+  assert.deepEqual(buttons(nodeByClass(tree, 'fg-hint-actions')).map((node) => flat(node)), ['放弃这次流程'])
+})
+
+await check('阶段提示：点一下快捷答案只投递一次 answer', async () => {
+  currentView = grillView()
+  const renderer = await render(stageHint, {})
+  posted = []
+  await click(answerButtons(renderer.toJSON())[1])
+  assert.equal(posted.length, 1, '一次点击只投递一条请求')
+  assert.equal(posted[0].action, 'answer')
+  assert.deepEqual(posted[0].payload, { choiceIndex: 1, customText: '' })
+})
+
+await check('阶段提示：自定义答案 Ctrl+Enter 与按钮同源，禁用时不出现入口', async () => {
+  currentView = grillView()
+  const renderer = await render(stageHint, {})
+  posted = []
+  await click(buttonByText(renderer.toJSON(), '其他答案…'))
+  assert.equal(buttonByText(renderer.toJSON(), '提交答案').props.disabled, true, '空草稿不能提交')
+  await changeValue(findTags(renderer.toJSON(), 'textarea')[0], '  按我的方案来  ')
+  const input = findTags(renderer.toJSON(), 'textarea')[0]
+  assert.equal(buttonByText(renderer.toJSON(), '提交答案').props.disabled, false)
+  assert.equal(await pressKey(input, { ctrlKey: true }), 1, 'Ctrl+Enter 要吞掉默认换行')
+  assert.equal(posted.length, 1)
+  assert.deepEqual(posted[0].payload, { choiceIndex: -1, customText: '按我的方案来' })
+  // allowCustom === false：自定义入口完全不出现。
+  const base = grillView()
+  currentView = grillView({ grill: { ...base.grill, pending: { ...base.grill.pending, allowCustom: false } } })
+  const tree = (await render(stageHint, {})).toJSON()
+  // buttonByText 找不到时自己就会抛错，断言「不存在」只能用 buttons 自己找。
+  assert.equal(buttons(tree).some((node) => flat(node).includes('其他答案…')), false, 'allowCustom:false 时不出现自定义入口')
+  assert.equal(findTags(tree, 'textarea').length, 0)
+})
+
+await check('阶段提示：提交中锁住答案按钮，失败给出可读报错', async () => {
+  currentView = grillView()
+  const renderer = await render(stageHint, {})
+  const originalFetch = globalThis.fetch
+  let release
+  const gate = new Promise((resolve) => { release = resolve })
+  posted = []
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/action')) {
+      posted.push(JSON.parse(init.body))
+      await gate
+      return { ok: false, status: 500, json: async () => ({ error: '宿主正忙，请稍后再试' }) }
+    }
+    return originalFetch(url, init)
+  }
+  try {
+    const press = (node) => node.props.onClick({ currentTarget: { focus() {} } })
+    await act(async () => {
+      press(answerButtons(renderer.toJSON())[0])
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    })
+    assert.equal(posted.length, 1, '在飞时再点不会重复投递')
+    const busy = renderer.toJSON()
+    for (const node of answerButtons(busy)) assert.equal(node.props.disabled, true, '在飞时按钮锁住')
+    assert.match(flat(busy), /提交中…/)
+    await act(async () => {
+      press(answerButtons(renderer.toJSON())[0])
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    })
+    assert.equal(posted.length, 1, '1.5 秒轮询窗口里连点也只发一次')
+    await act(async () => { release(); await new Promise((resolve) => setTimeout(resolve, 60)) })
+    const err = findTags(renderer.toJSON(), 'div').find((node) => node.props?.className === 'fg-hint-err')
+    assert.ok(err, '失败要给出报错')
+    assert.equal(err.props.role, 'alert')
+    assert.match(flat(err), /宿主正忙/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+await check('阶段提示：换问题不继承上一条的提交态与回包', async () => {
+  const sessionId = 'hint-swap-' + (++seq)
+  currentView = grillView()
+  const renderer = await render(stageHint, { session: { sessionId } }, false)
+  const originalFetch = globalThis.fetch
+  let release
+  const gate = new Promise((resolve) => { release = resolve })
+  try {
+    globalThis.fetch = async (url, init) => {
+      if (String(url).includes('/action')) {
+        await gate
+        return { ok: true, status: 200, json: async () => ({ ok: true }) }
+      }
+      return originalFetch(url, init)
+    }
+    await act(async () => {
+      answerButtons(renderer.toJSON())[0].props.onClick({ currentTarget: { focus() {} } })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    })
+    assert.match(flat(renderer.toJSON()), /提交中…/)
+    // 旧请求还挂着时换一道题：新问题的按钮不该被上一道的提交态锁死。
+    const base = grillView()
+    currentView = grillView({ grill: { ...base.grill, pending: { ...base.grill.pending, id: 'q_dock_2' } } })
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 1650)) })
+    const tree = renderer.toJSON()
+    assert.ok(flat(tree).includes('问：'), '换上新问题后仍可作答')
+    for (const node of answerButtons(tree)) assert.equal(node.props.disabled, false, '换问题后按钮不该被旧请求锁住')
+    assert.ok(!flat(tree).includes('提交中…'))
+    // 旧回包这时才到：结果属于上一道题，不能拿来改这一道的状态。
+    await act(async () => { release(); await new Promise((resolve) => setTimeout(resolve, 60)) })
+    const after = renderer.toJSON()
+    assert.equal(findTags(after, 'div').some((node) => node.props?.className === 'fg-hint-err'), false, '旧回包不能在新问题上报错')
+    for (const node of answerButtons(after)) assert.equal(node.props.disabled, false)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+await check('阶段提示：问题被答掉后回答区随轮询消失，不残留答案按钮', async () => {
+  const sessionId = 'hint-answer-' + (++seq)
+  currentView = grillView()
+  const renderer = await render(stageHint, { session: { sessionId } }, false)
+  assert.ok(nodeByClass(renderer.toJSON(), 'fg-hint-answer'))
+  currentView = grillView({ grill: { pending: null, answeredCount: 1, awaiting: false } })
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 1650)) })
+  const tree = renderer.toJSON()
+  assert.equal(nodeByClass(tree, 'fg-hint-answer'), null)
+  assert.equal(buttons(tree).some((node) => flat(node) === '其他答案…'), false)
+})
+
+await check('阶段提示：等待说明按 waitingKind 分流，只有可作答时才指向快捷答案', async () => {
+  const why = (tree) => flat(nodeByClass(tree, 'fg-hint-why'))
+  currentView = grillView()
+  assert.equal(why((await render(stageHint, {})).toJSON()), '点上面的快捷答案，或到「流程工作台」回答')
+  currentView = baseView('S1', { waiting: true, waitingKind: 'answer' })
+  assert.equal(why((await render(stageHint, {})).toJSON()), '到左侧栏「流程工作台」回答这个问题')
+  currentView = baseView('S1', { waiting: true, waitingKind: 'doc' })
+  assert.equal(why((await render(stageHint, {})).toJSON()), '在左侧栏「流程工作台」确认后才继续')
+  currentView = baseView('S2', { waiting: true, waitingKind: 'gate' })
+  assert.equal(why((await render(stageHint, {})).toJSON()), '在左侧栏「流程工作台」确认后才继续')
+})
+
+await check('阶段提示：回答区整行铺满、窄屏单列（样式契约）', async () => {
+  const css = styleNodes[0].textContent
+  assert.match(css, /\.fg-hint-answer \{[^}]*grid-column: 1 \/ -1;[^}]*display: flex;[^}]*flex-wrap: wrap;/)
+  assert.match(css, /\.fg-hint-answer-opts \{[^}]*flex-wrap: wrap;/)
+  assert.match(css, /@media \(max-width: 640px\) \{[\s\S]*\.fg-hint-answer-opts > button \{ flex: 1 1 100%; text-align: left; \}/)
+  // 不写死布局像素宽度：只允许 min-height / max-height 这类纵向约束。
+  for (const line of css.split('\n').filter((entry) => entry.includes('.fg-hint-answer'))) {
+    assert.ok(!/width:\s*\d+px/.test(line), '回答区不能写死像素宽度：' + line.trim())
+  }
+  // .fg-hint 的宽度契约原样保留。
+  assert.match(css, /\.fg-hint \{[^}]*width: calc\(100% - 2 \* var\(--dsh-composer-side-clearance, 0px\) - 4 \* var\(--dsh-composer-dock-inset, 0px\)\);/)
+  assert.match(css, /max-width: calc\(var\(--dsh-composer-card-max-width, 100%\) - 4 \* var\(--dsh-composer-dock-inset, 0px\)\);/)
+})
+
+// ---------------------------------------------------------------------------
 // 收尾
 // ---------------------------------------------------------------------------
 

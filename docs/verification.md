@@ -6,6 +6,54 @@
 
 历史记录中的 `by: 'subagents'` 仅表明调用了子代理聚合入口；聚合报告通过、`blocking: 0` 或流程走完，均不能证明真实子代理成功执行并返回有效报告。下文原有结论保留，其证据范围受此限定。
 
+## 会话内快捷作答 S1 决策问题（2026-11-21）
+
+需求：S1 需求分析阶段 Agent 提问时，会话界面没有快捷回答入口，只能切到左侧栏「流程工作台」的拍板卡片作答。需求原文：「需求分析阶段如果要回答问题，会话界面没有快捷回答的按钮，要加一下，至于怎么加用户体验最好你来决定」。
+
+方案：在 `conversation.input.dock` 的阶段提示里新增 `HintAnswer`，独占整行排在阶段流转按钮下面——点一下选项即提交，需要写自己的答案时展开「其他答案…」，按 `Ctrl/Cmd + Enter` 或「提交答案」提交。按用户确认，点选快捷答案只投递一条 `answer`，不额外发送用户发言（不引入「发送用户消息」依赖，只走既有 `/api/flowgate/action` 通道）。宿主侧协议、`GrillCard` 与门禁语义都不改。
+
+改动范围：`lib/client.js`（新增 `HintAnswer` 与 `waitingWhy`，`HintActions` 尾部挂载回答区，`.fg-hint-answer` 样式系列与 ≤640px 竖排规则，`fg-hint-why` 按 `waitingKind` 分流）、`test/client.test.mjs`（8 条用例 + `grillView` / `answerButtons` 两个辅助）、`docs/development.md`、`README.md`、`docs/verification.md`。
+
+| 验收项 | 状态 | 证据与限制 |
+| :--- | :--- | :--- |
+| AC-1 dock 渲染回答区，选项与 `pending.options` 一一对应，推荐项用主色并标「（推荐）」 | 通过 | `test/client.test.mjs`「阶段提示：S1 决策问题在 dock 里直接作答，选项与推荐项同源」断言 `.fg-hint-answer` 存在、显示「问：…」与 `context`、两条选项文案带「（推荐）」、`opts[0].props.className` 含 `fg-hint-btn-primary`、`.fg-hint-answer-opt-note` 的文本等于 `tradeoff` 且按钮不再挂 `title`，且 `.fg-hint-actions` 里仍是 `['放弃这次流程']`（既有按钮集合不变） |
+| AC-2 点选项只投递一次 `answer`，载荷为 `{choiceIndex, customText: ''}` | 通过 | 同文件「点一下快捷答案只投递一次 answer」断言 `posted.length === 1`、`action === 'answer'`、`payload` 深等于 `{ choiceIndex: 1, customText: '' }` |
+| AC-3 允许自定义时可提交 `{choiceIndex: -1, customText}`，`allowCustom === false` 时完全不出现自定义入口 | 通过 | 同文件「自定义答案 Ctrl+Enter 与按钮同源，禁用时不出现入口」：空草稿时「提交答案」`disabled`，填入后 `Ctrl+Enter` 返回 1 并提交 `{ choiceIndex: -1, customText: '按我的方案来' }`；`allowCustom: false` 时既无「其他答案…」也无 `textarea` |
+| AC-4 在飞时按钮置灰显示「提交中…」，失败给出可读报错 | 通过 | 同文件「提交中锁住答案按钮，失败给出可读报错」：`fetch` 替身挂起后 `posted.length` 保持 1、选项与「提交答案」`disabled`、出现「提交中…」；返回 500 `{error: '宿主正忙，请稍后再试'}` 后出现 `.fg-hint-err` 且 `role === 'alert'` |
+| AC-5 问题被答掉后回答区随轮询消失，不残留答案按钮 | 通过 | 同文件「问题被答掉后回答区随轮询消失，不残留答案按钮」：把 `grill.pending` 置空并等过一轮 1.5 秒轮询后 `.fg-hint-answer` 为 `null` |
+| AC-6 等待说明按 `waitingKind` 分流，`doc` / `gate` 保持原文 | 通过 | 同文件「等待说明按 waitingKind 分流，只有可作答时才指向快捷答案」断言四种文案：可作答的 `answer` 为「点上面的快捷答案，或到「流程工作台」回答」、不可作答的 `answer` 为「到左侧栏「流程工作台」回答这个问题」、`doc` 与 `gate` 仍为「在左侧栏「流程工作台」确认后才继续」 |
+| AC-7 回答区整行铺满、窄屏单列，不改 dock 宽度契约 | 通过 | 同文件「回答区整行铺满、窄屏单列（样式契约）」对样式文本断言 `.fg-hint-answer` 含 `grid-column: 1 / -1`、`display: flex`、`flex-wrap: wrap`，`.fg-hint-answer-opts` 含 `flex-wrap: wrap`，`@media (max-width: 640px)` 内含 `.fg-hint-answer-opts > button { flex: 1 1 100%; text-align: left; }`；逐行断言 `.fg-hint-answer*` 规则里没有 `width: <像素>px`；`.fg-hint` 的 `width` / `max-width` calc 公式原样保留 |
+| AC-8 无回归 | 通过 | 八个入口逐个实跑：内容快照 20、验收账本 30、运行版本 18、宿主 349、子代理 82、集成 33、客户端 240、安装 17，合计 789 项全通过。语法与指纹：`stamp-revisions.mjs --check` 输出 `Module revisions verified (6 modules).`，`lib/index.js` / `lib/client.js` / `lib/provenance.js` / `lib/acceptance.js` / `lib/runtime.js` / `lib/revisions.js` / `docs/verify-layout.mjs` 七个文件 `node --check` 全部通过。既有「阶段提示」用例一条未改，新增 7 条全通过 |
+
+### 执行环境与方式
+
+本机 `PATH` 里没有 `node` / `npm`，`npm test` 与 `npm run check` 无法直接执行。实测是用运行时自带的可执行文件逐个跑同一批入口：
+
+```
+"C:/Users/lenovo/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/node/bin/node.exe" test/<entry>.test.mjs
+```
+
+覆盖 `npm test` 的全部八个入口，外加 `stamp-revisions.mjs --check` 与七个文件的 `node --check`，即 `npm run check` 的全部内容。命令语义与 npm 脚本一致，但**不是**通过 `npm` 发起的：npm 脚本自己的环境变量与钩子未参与。
+
+### 已知未通过项
+
+无。首次实跑时 AC-3 那条用例失败过一次（`FAIL 阶段提示：自定义答案 Ctrl+Enter 与按钮同源，禁用时不出现入口 → 找不到按钮：其他答案…`）：断言「按钮不存在」时误用了 `buttonByText`，而它在找不到时会自己抛错，于是 `allowCustom: false` 分支永远过不了。改成用 `buttons(tree).some(...) === false` 直接找，重跑后 239 项全通过（之后又补了第 8 条用例，现为 240 项，见下方「评审后修复」）。这是用例本身的写法错误，不是实现缺陷——但它恰好说明测试阶段的价值：S2 / S3 阶段把这一条记成「静态核对无误」时，那个断言其实是错的。
+
+### 真实视觉未覆盖
+
+dock 回答区只在组件树与样式字符串层面核对（文案、`disabled` 状态、提交载荷、CSS 声明），没有在真实 DSH 会话界面里加载量过——整行铺满是否与输入框对齐、窄屏竖排的换行位置、长选项（≤120 字符）与长问题（≤500 字符）的实际折行都没在真实宿主里看过。本机没有可用的 CDP 接入或插件诊断通道，按既有约定记为未覆盖。
+
+### 评审后修复（2026-11-21）
+
+S3 评审留下 6 条非阻塞发现，其中两条是实现缺陷，按用户「直接改」的授权在流程结项后修掉；另外四条是测试写法与既有模式延伸，保持原样。
+
+| 缺陷 | 位置 | 修法 | 验证 |
+| :--- | :--- | :--- | :--- |
+| 取舍说明只挂在 `title` 上，触屏、键盘与读屏都拿不到，而它正是「点之前判断选哪个」的唯一依据 | `lib/client.js` 选项按钮 | 取舍改成选项按钮里的第二行 `.fg-hint-answer-opt-note`，按钮内部改为 `display: flex; flex-direction: column`，去掉 `title`；推荐项副行用前景色并降透明度 | AC-1 用例改为断言 `.fg-hint-answer-opt-label` / `.fg-hint-answer-opt-note` 的文本，并断言按钮不再挂 `title` |
+| 换问题时只重置草稿、展开态与报错，`busy` 与 `sending.current` 不重置；旧问题还在飞时换上新问题，新问题的按钮会被锁死 | `lib/client.js` `HintAnswer` 的 `useEffect([questionId])` | 一并清 `busy` 与 `sending`；另加 `asking` ref，回包晚到而题目已换时直接返回，不拿上一道题的结果改这一道的状态 | 新增用例「阶段提示：换问题不继承上一条的提交态与回包」：旧请求挂在 `fetch` 替身上时把 `pending.id` 换成新问题，断言「提交中…」消失、按钮恢复可点；旧回包随后才到时断言不出现 `.fg-hint-err`、按钮仍可点。`test/client.test.mjs` 240 项全通过 |
+
+修完重跑八个入口，合计 789 项全通过（内容快照 20、验收账本 30、运行版本 18、宿主 349、子代理 82、集成 33、客户端 240、安装 17），`stamp-revisions.mjs --check` 仍输出 `Module revisions verified (6 modules).`。文档同步改了 `docs/development.md`（取舍不再挂 `title`）与 `README.md`（不用悬停也能比较）。
+
 ## 冻结前验收方案体检（2026-11-21）
 
 需求：冻结 scope 与验收方法、验证命令之间缺少一致性检查。AC 可以声明「集成测试」而 scope 里既没有测试文件也没有测试命令，验证步骤可以点名 scope 之外的文件，视觉验收可以完全不写怎么量——这些在 S1 都能静态看出苗头，但当时没人拦。等 S4 交证据时才暴露「方法对不上证据」，只剩两条路：带缺口结项，或整轮退回重做。
