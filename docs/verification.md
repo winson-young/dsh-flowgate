@@ -6,6 +6,30 @@
 
 历史记录中的 `by: 'subagents'` 仅表明调用了子代理聚合入口；聚合报告通过、`blocking: 0` 或流程走完，均不能证明真实子代理成功执行并返回有效报告。下文原有结论保留，其证据范围受此限定。
 
+## 权限勾选退场：命令清单是唯一通道（2026-11-22）
+
+需求：用户原文（m00863）「我记得我说过不要让用户来勾选权限，用户不懂要什么权限，开发过程提示要勾选用户也会直接勾选，所以这个是不是有必要换种方式」。追问答疑后确认（m00883、m00906 后的选择）：照做，清单命中就放行、勾选全部退场；清单写漏时不给「临时放行」，唯一出口是「退回 S1 补命令清单」并预填被拒命令；测试方向的「写权限」概念整个删掉。
+
+方案：
+- **权限只来自 S1 批准的 `scope.commands`**：`shellDenial` 的判定顺序收成「逃逸痕迹 → 只读白名单 → 纯解析命令 → scope 清单」，删除末位的阶段授权分支；清单外一律拒绝。
+- **数据模型删除四个字段**：`shellGrant`、`writeGrants`、`needsWrite`、`directionWriteDeclared`；hub 动作 `toggleShellGrant`、`toggleWriteGrant`、`declareDirectionWrite` 一并移除，调用返回「未知操作」。`repairFlow` 清洗旧快照残留，`hydrate` 把清洗结果写回磁盘。
+- **补清单入口**：`shellDenial` 拒绝时写 `flow.lastDeniedCommand`（命令截断到 300 字），视图暴露 `deniedCommand`；新增 hub 动作 `reopenScopeForCommands`，带该命令退回 S1 并预填进 `pendingScope.commands`，保留已保存的需求文档、清空待定缺口，写 `scope.reopened` 事件。
+- **子代理同口径**：`registerChild` 只记 `flowId` / `directionId` / `readAttempts` / `signal`，`childDenial` 用当前流程的 `scope.commands` 判定 shell；方向级没有任何权限位。
+- **界面**：`ShellGrantToggle` 换成 `CommandAccess`（列清单原文、被拒命令与补清单按钮，无勾选框），挂在 S2 开发卡与 S4「测试命令」卡；测试方向面板的写权限分支整段删除；追加自定义方向表单与工作区规则 S4 组的写权限勾选框删除；快捷入口在被拒时给出提示条与「退回 S1 补命令清单」按钮。
+
+改动范围：`lib/index.js`（`shellDenial`、`rememberDeniedCommand`、`readonlyDenial`、`registerChild` / `childDenial`、`spawnReadonlyChild`、`runDirection`、`directionPrompt`、`repairFlow`、`hydrate`、`rollbackTo`、`cancelFlow`、`view`、hub 的 `reopenScopeForCommands` 与三个被删动作）、`lib/client.js`（`CommandAccess`、`Dock` 被拒提示、测试方向面板、方向表单、工作区规则）、`test/host.test.mjs`、`test/client.test.mjs`、`test/subagents.test.mjs`、`README.md`、`docs/development.md`、`docs/capture-ui.mjs`、`CHANGELOG.md`、本文件。
+
+| 验收项 | 状态 | 证据与限制 |
+| :--- | :--- | :--- |
+| AC-1 变更性命令只有 scope 清单一个来源 | 通过 | `test/host.test.mjs:425`「变更性 shell 在 S2 被拒，并指向 scope 清单与退回入口」断言拒绝文案含「变更性命令只有一条通道」与「退回 S1 补命令清单」，且 `'shellGrant' in body === false`；`:451`「清单外的构建命令被拒，没有可勾选的授权通道」断言 `npm run build` 被拒且 `view.deniedCommand.command === 'npm run build'` |
+| AC-2 授权开关的动作与字段全部消失 | 通过 | `test/host.test.mjs:331`「命令授权开关已退场，S1 也开不了」断言 `toggleShellGrant` 返回 409「未知操作」；D2 段断言 `toggleWriteGrant` / `declareDirectionWrite` 同样 409，方向对象无 `needsWrite` / `writeGranted`，视图无 `writeGrants` / `directionWriteDeclared` |
+| AC-3 被拒命令能一键退回 S1 补清单 | 通过 | `test/client.test.mjs:1984`「被拒命令给出退回 S1 补清单的入口」断言提示含命令原文、「不在 scope 命令清单里」「本轮评审与测试需要重跑」，点按钮后提交 `action: 'reopenScopeForCommands'` 且 `payload.command` 为被拒命令；服务端侧由 `test/host.test.mjs:3407` 附近的命令清单用例覆盖 `scope.reopened` 与预填 |
+| AC-4 旧快照的授权字段冷恢复后被清洗 | 通过 | `test/host.test.mjs:2796`「旧快照里的授权字段冷恢复后被清洗」手写 `shellGrant: true` / `writeGrants: ['smoke']` / `directionWriteDeclared: ['smoke']` 落盘，新宿主读回后视图与磁盘均无这些字段 |
+| AC-5 测试子代理只按清单放行，方向不带权限 | 通过 | `test/subagents.test.mjs:642`「S4 子代理只看 scope 清单：清单内放行、清单外一律拒，没有方向级写权限」：`npm test` 放行，`touch fixture-output`、`ops_write_file`、未知工具、带 `sandbox_permissions` 的 `pwd` 全部拒绝；`:928` 覆盖运行中改方向配置后约束不变 |
+| AC-6 界面没有任何权限勾选框 | 通过 | `test/client.test.mjs:1937`「S2 不再提供命令授权勾选框，只说明清单放行」与 `:1966`「S4 命令入口只列 scope 清单，不给勾选」均断言 `checkboxNodes(tree).length === 0` 且不含「允许执行构建/测试命令」；`:2633`「测试方向面板不再出现写权限声明与授权」断言三处旧文案消失 |
+| AC-7 真实界面视觉对齐 | 未覆盖 | 本轮无已认证的桌面端接入与真实页面 CDP，未执行 `docs/verify-layout.mjs`；`docs/capture-ui.mjs:201` 的断言已改为「保存后不含 `needsWrite`」，但脚本本身未运行 |
+
+执行记录（本地，Node 24.21.0）：`node test/provenance.test.mjs`（20 项）、`acceptance`（30 项）、`runtime`（18 checks）、`host`（310 项）、`gatemode`（10 项）、`subagents`（74 项）、`integration`（33 项）、`client`（231 项）、`install`（17 项）全部通过；`node scripts/stamp-revisions.mjs --check` 输出 `Module revisions verified (6 modules).`；`node --check` 对六个模块与 `docs/verify-layout.mjs` 均通过。项数相对上一节下降来自删除的授权用例：host 321→310、subagents 82→74、client 243→231。
 ## S4 结项与证据版本（2026-11-22）
 
 需求：用户原文（m00001）「我刚才测试显示 0 个问题，但是没有快捷通过的按钮，导致我完成不了测试」。排查发现现场流程 `f_fb3711ee-3dd` 的 15 个测试要点全部 `pass`，但 12 条 AC 全部被判 `uncovered`，界面上既没有「验收通过」也没有一键结束；用户最终「放弃这次流程」。用户确认修法（m00341、m00362）：快捷入口按钮只写「评审报告」「测试报告」，两本账并排放到提示行，结项按钮统一成「结束流程」，其余按七条方案执行。

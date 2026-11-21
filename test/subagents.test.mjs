@@ -269,14 +269,14 @@ function makeHost(options = {}) {
       }))
       return { status: response.status, body: await response.json() }
     },
-    async advance(stage = 'S3', { reviewDecision = 'pass', criteria } = {}) {
+    async advance(stage = 'S3', { reviewDecision = 'pass', criteria, commands = [] } = {}) {
       await host.call('flowgate_start', { title: '新版子代理黑盒回归', preset: 'fast' })
       // 这套黑盒用例验证每步都要人点的手动门禁；fast 档默认自动通过，这里显式切回来。
       await host.action('setGateMode', { mode: 'manual' })
       const doc = host.call('flowgate_doc', {
         html: '<!doctype html><html><body>fixture requirements</body></html>',
         scope: {
-          files_expected_to_change: ['src/auth/session.ts'], commands: [], capabilities: ['fixture'],
+          files_expected_to_change: ['src/auth/session.ts'], commands, capabilities: ['fixture'],
           out_of_scope_explicitly: [], acceptance_criteria: criteria ?? [{ id: 'AC-1', when: '运行', then: '可验证' }],
         },
       })
@@ -639,28 +639,29 @@ await test('run_code 只允许单个严格 JSON 工具转发，嵌套目标受�
   })
 })
 
-for (const granted of [false, true]) {
-  await test('S4 写权限例外只覆盖 shell：授权=' + granted, async () => {
-    await fixture({ onStart: async (activation, host) => {
-      const id = activation.childId
-      assert.equal((await host.check('ops_bash', { command: 'touch fixture-output' }, id, true)).kind, granted ? 'allow' : 'deny')
-      assert.equal((await host.check('ops_write_file', { path: 'src/auth/session.ts' }, id, true)).kind, 'deny')
-      assert.equal((await host.check('unknown_plugin_tool', {}, id, true)).kind, 'deny')
-      assert.equal((await host.check('ops_bash', { command: 'pwd', sandbox_permissions: 'danger-full-access' }, id, true)).kind, 'deny')
-    } }, async (host) => {
-      await host.advance('S4', { reviewDecision: 'skip' })
-      const added = await host.action('addDirection', { name: '迁移回滚', points: ['迁移后回滚'], needsWrite: true })
-      const direction = added.directions.find((item) => item.name === '迁移回滚')
-      for (const item of added.directions.filter((item) => item.id !== direction.id)) {
-        await host.action('toggleDirection', { id: item.id, enabled: false })
-      }
-      if (granted) await host.action('toggleWriteGrant', { id: direction.id, enabled: true })
-      const { before } = await host.complete('test', host.call('flowgate_test_run'))
-      assert.equal(host.activations.length, 1)
-      assert.equal(before.test.directions[0].id, direction.id)
-    })
+await test('S4 子代理只看 scope 清单：清单内放行、清单外一律拒，没有方向级写权限', async () => {
+  await fixture({ onStart: async (activation, host) => {
+    const id = activation.childId
+    assert.equal((await host.check('ops_bash', { command: 'npm test' }, id, true)).kind, 'allow')
+    assert.equal((await host.check('ops_bash', { command: 'touch fixture-output' }, id, true)).kind, 'deny')
+    assert.equal((await host.check('ops_write_file', { path: 'src/auth/session.ts' }, id, true)).kind, 'deny')
+    assert.equal((await host.check('unknown_plugin_tool', {}, id, true)).kind, 'deny')
+    assert.equal((await host.check('ops_bash', { command: 'pwd', sandbox_permissions: 'danger-full-access' }, id, true)).kind, 'deny')
+  } }, async (host) => {
+    await host.advance('S4', { reviewDecision: 'skip', commands: ['npm test'] })
+    const added = await host.action('addDirection', { name: '迁移回滚', points: ['迁移后回滚'], needsWrite: true })
+    const direction = added.directions.find((item) => item.name === '迁移回滚')
+    // 客户端多传的 needsWrite 被忽略：方向对象里没有这个概念，也没有任何授予结果。
+    assert.equal('needsWrite' in direction, false)
+    assert.equal('writeGranted' in direction, false)
+    for (const item of added.directions.filter((item) => item.id !== direction.id)) {
+      await host.action('toggleDirection', { id: item.id, enabled: false })
+    }
+    const { before } = await host.complete('test', host.call('flowgate_test_run'))
+    assert.equal(host.activations.length, 1)
+    assert.equal(before.test.directions[0].id, direction.id)
   })
-}
+})
 
 for (const [name, options, marker] of [
   ['启动失败', { startFails: true }, /fixture start failed/],
@@ -759,17 +760,16 @@ await test('signal 在 receipt 前取消：等待 receipt 并清理，不继续�
 })
 
 for (const failure of ['startFails', 'cleanupFails']) {
-  await test('S4 已授权方向失败后撤销 shell 写例外并保留隔离：' + failure, async () => {
+  await test('S4 方向执行失败后子会话仍被隔离，变更性 shell 始终被拒：' + failure, async () => {
     await fixture({ [failure]: true, onStart: async (activation, host) => {
-      assert.equal((await host.check('ops_bash', { command: 'touch fixture-output' }, activation.childId, true)).kind, 'allow')
+      assert.equal((await host.check('ops_bash', { command: 'touch fixture-output' }, activation.childId, true)).kind, 'deny')
     } }, async (host) => {
       await host.advance('S4', { reviewDecision: 'skip' })
-      const added = await host.action('addDirection', { name: '授权失败方向', points: ['执行并回滚'], needsWrite: true })
-      const custom = added.directions.find((direction) => direction.name === '授权失败方向')
+      const added = await host.action('addDirection', { name: '失败方向', points: ['执行并回滚'] })
+      const custom = added.directions.find((direction) => direction.name === '失败方向')
       for (const direction of added.directions.filter((direction) => direction.id !== custom.id)) {
         await host.action('toggleDirection', { id: direction.id, enabled: false })
       }
-      await host.action('toggleWriteGrant', { id: custom.id, enabled: true })
       const pending = host.call('flowgate_test_run')
       await eventually(async () => Boolean((await host.state()).test), '失败方向报告')
       assert.equal((await host.state()).stage, 'S4')
@@ -777,7 +777,7 @@ for (const failure of ['startFails', 'cleanupFails']) {
       const activation = host.activations[0]
       assert.equal(activation.stopped, false)
       assert.equal((await host.check('ops_write_file', { path: 'x' }, activation.childId, true)).kind, 'deny')
-      assert.equal((await host.check('ops_bash', { command: 'touch fixture-output' }, activation.childId, true)).kind, 'deny', '失败后即使父流程仍在 S4 也不能保留变更性 shell')
+      assert.equal((await host.check('ops_bash', { command: 'touch fixture-output' }, activation.childId, true)).kind, 'deny')
       assert.match(JSON.stringify((await host.state()).test), /fixture (start|cleanup) failed/)
       await host.complete('test', pending)
       assert.equal((await host.check('ops_bash', { command: 'touch fixture-output' }, activation.childId, true)).kind, 'deny')
@@ -899,103 +899,59 @@ await test('工作区 S2/S3 内置编辑进入真实评审子代理，保留最�
   })
 })
 
-for (const granted of [false, true]) {
-  await test('工作区 S4 内置 needsWrite 编辑需要本次显式授权：' + granted, async () => {
-    await fixture({ onStart: async (activation, host) => {
-      assert.equal(activation.spec.label, '测试：工作区冒烟')
-      assert.match(activation.spec.prompt[0].text, /工作区测试验证标记/)
-      assert.equal((await host.check('ops_bash', { command: 'touch fixture-output' }, activation.childId, true)).kind, granted ? 'allow' : 'deny')
-      assert.equal((await host.check('ops_write_file', { path: 'src/auth/session.ts' }, activation.childId, true)).kind, 'deny')
-    } }, async (host) => {
-      mkdirSync(join(host.cwd, '.dsh-flowgate'))
-      writeFileSync(join(host.cwd, '.dsh-flowgate', 'config.json'), JSON.stringify({ version: 2, writeGrants: ['smoke'], stages: {
-        S1: null, S2: null, S3: null,
-        S4: { ids: ['smoke'], custom: [], edits: [{ id: 'smoke', name: '工作区冒烟', points: ['工作区测试验证标记'], needsWrite: true }] },
-      } }))
-      await host.advance('S4')
-      const inherited = await host.state()
-      assert.equal(inherited.stageConfigs.S4.source, 'workspace')
-      assert.equal(inherited.directions[0].needsWrite, true)
-      assert.equal(inherited.directions[0].writeGranted, false)
-      assert.deepEqual(inherited.writeGrants, [])
-      if (granted) await host.action('toggleWriteGrant', { id: 'smoke', enabled: true })
-      const { before } = await host.complete('test', host.call('flowgate_test_run'))
-      assert.equal(host.activations.length, 1)
-      assert.deepEqual(before.test.directions[0].points.map((item) => item.point), ['工作区测试验证标记'])
-      assert.equal(before.test.directions[0].points[0].result, 'pass')
-    })
+await test('工作区 S4 里的 needsWrite 字段被忽略：不落盘、不给权限', async () => {
+  await fixture({ onStart: async (activation, host) => {
+    assert.equal(activation.spec.label, '测试：工作区冒烟')
+    assert.match(activation.spec.prompt[0].text, /工作区测试验证标记/)
+    assert.equal((await host.check('ops_bash', { command: 'touch fixture-output' }, activation.childId, true)).kind, 'deny')
+    assert.equal((await host.check('ops_write_file', { path: 'src/auth/session.ts' }, activation.childId, true)).kind, 'deny')
+  } }, async (host) => {
+    mkdirSync(join(host.cwd, '.dsh-flowgate'))
+    // 旧版本写下的 writeGrants 与 needsWrite 留在配置里，新宿主一律不认。
+    writeFileSync(join(host.cwd, '.dsh-flowgate', 'config.json'), JSON.stringify({ version: 2, writeGrants: ['smoke'], stages: {
+      S1: null, S2: null, S3: null,
+      S4: { ids: ['smoke'], custom: [], edits: [{ id: 'smoke', name: '工作区冒烟', points: ['工作区测试验证标记'], needsWrite: true }] },
+    } }))
+    await host.advance('S4')
+    const inherited = await host.state()
+    assert.equal(inherited.stageConfigs.S4.source, 'workspace')
+    assert.equal('needsWrite' in inherited.directions[0], false)
+    assert.equal('writeGranted' in inherited.directions[0], false)
+    assert.equal('writeGrants' in inherited, false)
+    const { before } = await host.complete('test', host.call('flowgate_test_run'))
+    assert.equal(host.activations.length, 1)
+    assert.deepEqual(before.test.directions[0].points.map((item) => item.point), ['工作区测试验证标记'])
+    assert.equal(before.test.directions[0].points[0].result, 'pass')
   })
-}
+})
 
-async function runningWorkspaceTest(custom, body) {
+await test('测试子代理运行中改动方向配置，仍然只能跑 scope 清单里的命令', async () => {
   await fixture({ manualResult: true }, async (host) => {
     const previousHome = process.env.DSH_FLOWGATE_HOME
     process.env.DSH_FLOWGATE_HOME = join(host.cwd, 'hub-home')
     try {
-      const id = custom ? 'workspace-write' : 'smoke'
-      const direction = { id, name: '运行中授权方向', points: ['当前声明决定权限'], needsWrite: true }
-      const stages = { S1: null, S2: null, S3: null, S4: {
-        ids: [id], custom: custom ? [direction] : [], edits: custom ? [] : [direction],
-      } }
+      const direction = { id: 'running-scope', name: '运行中方向', points: ['运行中要点'] }
+      const stages = { S1: null, S2: null, S3: null, S4: { ids: ['running-scope'], custom: [direction], edits: [] } }
       assert.equal((await host.hub('add', { path: host.cwd })).status, 200)
       assert.equal((await host.hub('rules', { path: host.cwd, stages })).status, 200)
-      await host.advance('S4')
-      await host.action('toggleWriteGrant', { id, enabled: true })
+      await host.advance('S4', { commands: ['npm test'] })
       const running = observe(host.call('flowgate_test_run'))
-      await eventually(() => host.activations.length === 1, '已授权方向正在执行')
+      await eventually(() => host.activations.length === 1, '方向正在执行')
       const activation = host.activations[0]
-      assert.equal((await host.check('ops_bash', { command: 'touch fixture-output' }, activation.childId, true)).kind, 'allow')
-      await body({ host, id, stages, activation, running })
+      assert.equal((await host.check('ops_bash', { command: 'npm test' }, activation.childId, true)).kind, 'allow')
+      assert.equal((await host.check('ops_bash', { command: 'touch fixture-output' }, activation.childId, true)).kind, 'deny')
+      // 运行中把方向从工作区配置里删掉：放行依据只有 scope 清单，与方向配置无关。
+      const changed = structuredClone(stages)
+      changed.S4 = { ids: [], custom: [], edits: [] }
+      assert.equal((await host.hub('rules', { path: host.cwd, stages: changed })).status, 200)
+      assert.equal((await host.check('ops_bash', { command: 'npm test' }, activation.childId, true)).kind, 'allow')
+      assert.equal((await host.check('ops_bash', { command: 'touch fixture-output' }, activation.childId, true)).kind, 'deny')
+      assert.equal((await host.check('ops_write_file', { path: 'src/auth/session.ts' }, activation.childId, true)).kind, 'deny')
+      void running
     } finally {
       if (previousHome === undefined) delete process.env.DSH_FLOWGATE_HOME
       else process.env.DSH_FLOWGATE_HOME = previousHome
     }
-  })
-}
-
-for (const change of ['撤回需要写声明', '恢复内置', '删除自定义', '工作区禁用', '本次禁用', '外部配置重载']) {
-  await test('运行中 S4 改动后立即失去旧 shell 授权：' + change, async () => {
-    await runningWorkspaceTest(change === '删除自定义', async ({ host, id, stages, activation }) => {
-      let changed = structuredClone(stages)
-      if (change === '撤回需要写声明' || change === '外部配置重载') changed.S4.edits[0].needsWrite = false
-      if (change === '恢复内置') changed.S4 = null
-      if (change === '删除自定义') changed.S4 = { ids: [], custom: [], edits: [] }
-      if (change === '工作区禁用') changed.S4.ids = []
-      if (change === '本次禁用') await host.action('toggleDirection', { id, enabled: false })
-      else if (change === '外部配置重载') {
-        writeFileSync(join(host.cwd, '.dsh-flowgate', 'config.json'), JSON.stringify({ version: 2, stages: changed }))
-      } else assert.equal((await host.hub('rules', { path: host.cwd, stages: changed })).status, 200)
-      // 直接查最终守卫，避免靠界面轮询才生效。
-      for (const finalOnly of [true, false]) {
-        assert.equal((await host.check('ops_bash', { command: 'touch fixture-output' }, activation.childId, finalOnly)).kind, 'deny')
-      }
-      assert.deepEqual((await host.state()).writeGrants, [])
-      assert.equal((await host.check('ops_write_file', { path: 'src/auth/session.ts' }, activation.childId, true)).kind, 'deny')
-      // 消失、关闭声明或停用之后仍能显式撤销；恢复配置不能自动复活授权。
-      await host.action('toggleWriteGrant', { id, enabled: false })
-      assert.equal((await host.hub('rules', { path: host.cwd, stages })).status, 200)
-      if (change === '本次禁用') await host.action('toggleDirection', { id, enabled: true })
-      assert.deepEqual((await host.state()).writeGrants, [])
-      assert.equal((await host.check('ops_bash', { command: 'touch fixture-output' }, activation.childId, true)).kind, 'deny')
-    })
-  })
-}
-
-await test('本次方向覆盖保持授权，恢复跟随工作区停用后撤销且不能再授予', async () => {
-  await runningWorkspaceTest(false, async ({ host, id, stages, activation }) => {
-    await host.action('toggleDirection', { id, enabled: true })
-    const disabled = structuredClone(stages)
-    disabled.S4.ids = []
-    assert.equal((await host.hub('rules', { path: host.cwd, stages: disabled })).status, 200)
-    assert.deepEqual((await host.state()).writeGrants, [id], '本次有效选择仍启用时不应撤销')
-    assert.equal((await host.check('ops_bash', { command: 'touch fixture-output' }, activation.childId, true)).kind, 'allow')
-    await host.action('followStageDefaults', { stage: 'S4' })
-    assert.deepEqual((await host.state()).writeGrants, [])
-    assert.equal((await host.check('ops_bash', { command: 'touch fixture-output' }, activation.childId, true)).kind, 'deny')
-    await assert.rejects(host.action('toggleWriteGrant', { id, enabled: true }), /当前未启用/)
-    await host.action('toggleWriteGrant', { id, enabled: false })
-    assert.equal((await host.hub('rules', { path: host.cwd, stages })).status, 200)
-    assert.deepEqual((await host.state()).writeGrants, [], '工作区重新启用也不得自动授予')
   })
 })
 
@@ -1030,20 +986,19 @@ for (const kind of ['review', 'test']) for (const cancellation of ['signal', 'fl
     const disposeGate = defer()
     const controller = new AbortController()
     await fixture({ manualResult: true, disposeGate }, async (host) => {
-      await host.advance(kind === 'review' ? 'S3' : 'S4')
+      await host.advance(kind === 'review' ? 'S3' : 'S4', { commands: ['npm test'] })
       if (kind === 'test') {
-        const added = await host.action('addDirection', { name: '正在测试', points: ['授权命令'], needsWrite: true })
+        const added = await host.action('addDirection', { name: '正在测试', points: ['清单命令'] })
         const custom = added.directions.find((direction) => direction.name === '正在测试')
         for (const direction of added.directions.filter((direction) => direction.id !== custom.id)) {
           await host.action('toggleDirection', { id: direction.id, enabled: false })
         }
-        await host.action('toggleWriteGrant', { id: custom.id, enabled: true })
         await host.action('addDirection', { name: '稍后方向', points: ['不能继续启动'] })
       }
       const pending = observe(host.call('flowgate_' + kind + '_run', {}, { signal: controller.signal }))
       await eventually(() => host.activations.length === 1, '子代理运行中')
       const activation = host.activations[0]
-      if (kind === 'test') assert.equal((await host.check('ops_bash', { command: 'touch fixture-output' }, activation.childId, true)).kind, 'allow')
+      if (kind === 'test') assert.equal((await host.check('ops_bash', { command: 'npm test' }, activation.childId, true)).kind, 'allow')
       let request
       if (cancellation === 'signal') controller.abort()
       else if (cancellation === 'flowgate_cancel') request = host.call('flowgate_cancel', { reason: 'fixture cancellation' })
@@ -1051,7 +1006,8 @@ for (const kind of ['review', 'test']) for (const cancellation of ['signal', 'fl
       request?.catch(() => {})
       await eventually(() => activation.disposeCalls === 1, '取消触发 dispose')
       assert.equal((await host.check('ops_write_file', { path: 'x' }, activation.childId, true)).kind, 'deny', '父流程已结束或回退也要保护清理中的子会话')
-      if (kind === 'test') assert.equal((await host.check('ops_bash', { command: 'touch fixture-output' }, activation.childId, true)).kind, 'deny', '取消后清理期间必须撤销先前 shell 写授权')
+      // 回退到 S2 后 scope 清单仍然有效，那里由既有用例覆盖；取消与结束则必须立刻失效。
+      if (kind === 'test' && cancellation !== 'rollback') assert.equal((await host.check('ops_bash', { command: 'npm test' }, activation.childId, true)).kind, 'deny', '取消后清理期间不再放行清单内命令')
       assert.equal(pending.settled, false)
       assert.equal(host.activations.length, 1)
       disposeGate.resolve()

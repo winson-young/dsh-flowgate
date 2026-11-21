@@ -1733,7 +1733,8 @@ const HubPanelIcon = componentOf('sidebar.panellist')
     assert.ok(text.includes('允许直接执行的命令'))
     assert.ok(text.includes('npm test'))
     assert.ok(text.includes('npm run *'))
-    assert.ok(text.includes('不需要再勾'))
+    assert.ok(text.includes('没有别的开关'))
+    assert.ok(text.includes('退回 S1'))
   })
 }
 
@@ -1923,68 +1924,29 @@ const HubPanelIcon = componentOf('sidebar.panellist')
   })
 }
 
-// S2 的命令授权：默认关闭，勾选后才允许变更性 shell。
+// 命令放行没有开关：唯一通道是 S1 批准过的 scope 清单，清单内的命令在 S2 / S4 直接执行。
 {
   posted = []
   currentView = baseView('S2', {
     devChanges: { files: ['src/auth/session.ts'], added: 42, removed: 7, at: '2026-11-17T09:40:00Z' },
-    shellGrant: false,
     waiting: true,
     waitingKind: 'gate',
   })
   const renderer = await render(FlowDetail, {})
   const tree = renderer.toJSON()
-  const boxes = checkboxNodes(tree)
-  await check('S2 默认关闭命令授权并说明只允许只读 shell', () => {
-    assert.ok(flat(tree).includes('允许执行构建/测试命令'))
-    assert.ok(flat(tree).includes('默认关闭'))
-    const grant = boxes.find((node) => node.props.checked === false)
-    assert.ok(grant, 'S2 必须有命令授权勾选框')
-  })
-  await check('S2 勾选命令授权提交 toggleShellGrant', async () => {
-    const grant = checkboxNodes(renderer.toJSON()).find((node) => node.props.checked === false)
-    await act(async () => {
-      grant.props.onChange({ target: { checked: true } })
-      await new Promise((resolve) => setTimeout(resolve, 40))
-    })
-    const call = posted.find((item) => item.action === 'toggleShellGrant')
-    assert.ok(call, '必须提交 toggleShellGrant')
-    assert.equal(call.payload.enabled, true)
-  })
-}
-
-// S4 要跑测试命令：授权入口必须和测试阶段同屏，否则用户只能手改 scope。
-{
-  posted = []
-  currentView = baseView('S4', { shellGrant: false })
-  const renderer = await render(FlowDetail, {})
-  const tree = renderer.toJSON()
-  await check('S4 主区提供命令授权开关', () => {
-    assert.ok(flat(tree).includes('允许执行构建/测试命令'))
-    // 文案改为「流程内持久」口径后，这里钉住它：不再按阶段说话，也不再要求重启后重勾。
+  await check('S2 不再提供命令授权勾选框，只说明清单放行', () => {
     const all = flat(tree)
-    assert.ok(all.includes('默认关闭'))
-    assert.ok(all.includes('本次流程内一直有效'))
-    assert.ok(!/S4 只允许只读 shell 命令/.test(all), '旧文案（按阶段说话）必须消失')
-  })
-  await check('S4 勾选命令授权提交 toggleShellGrant', async () => {
-    const grant = checkboxNodes(renderer.toJSON()).find((node) => node.props.checked === false)
-    assert.ok(grant, 'S4 必须有命令授权勾选框')
-    await act(async () => {
-      grant.props.onChange({ target: { checked: true } })
-      await new Promise((resolve) => setTimeout(resolve, 40))
-    })
-    const call = posted.find((item) => item.action === 'toggleShellGrant')
-    assert.ok(call, '必须提交 toggleShellGrant')
-    assert.equal(call.payload.enabled, true)
+    assert.ok(all.includes('不需要在这里勾选任何开关'), '要说清不用勾选')
+    assert.equal(all.includes('允许执行构建/测试命令'), false, '命令授权开关必须退场')
+    assert.equal(checkboxNodes(tree).length, 0, 'S2 开发卡不该再有任何授权勾选框')
+    assert.ok(all.includes('scope 清单里没有命令'), '没有清单时要说明只能跑只读命令')
   })
 }
 
-// scope 里列过命令时，开关必须先说清「这些命令不需要我」，否则用户会以为还得勾一次。
+// S4 要跑测试命令：入口必须和测试阶段同屏，且只列清单、不给开关。
 {
   posted = []
   currentView = baseView('S4', {
-    shellGrant: false,
     scope: {
       frozen: true,
       frozenAt: '2026-11-17T10:00:00Z',
@@ -2001,12 +1963,33 @@ const HubPanelIcon = componentOf('sidebar.panellist')
     },
   })
   const tree = (await render(FlowDetail, {})).toJSON()
-  await check('S4 授权开关说明清单内命令不需要它', () => {
+  await check('S4 命令入口只列 scope 清单，不给勾选', () => {
     const all = flat(tree)
-    assert.ok(all.includes('已列 2 条可执行命令'))
-    assert.ok(all.includes('只有清单外的变更性命令才受这里控制'))
-    // S4 不渲染冻结 scope 卡片，文案不能指向「下方」看不到的东西。
-    assert.ok(!all.includes('见下方「冻结 scope」'))
+    assert.ok(all.includes('npm test'), '清单要原样列出')
+    assert.ok(all.includes('npm run *'))
+    assert.ok(all.includes('不需要在这里勾选任何开关'))
+    assert.equal(all.includes('允许执行构建/测试命令'), false)
+    assert.equal(checkboxNodes(tree).length, 0, 'S4 也不该再有授权勾选框')
+  })
+}
+
+// 清单写漏时的唯一出口：退回 S1 补清单，并把被拒的那条命令预填进去。
+{
+  posted = []
+  currentView = baseView('S4', {
+    deniedCommand: { command: 'npm run build', at: '2026-11-17T10:05:00Z' },
+  })
+  const renderer = await render(FlowDetail, {})
+  const tree = renderer.toJSON()
+  await check('被拒命令给出退回 S1 补清单的入口', async () => {
+    const all = flat(tree)
+    assert.ok(all.includes('npm run build'), '要显示被拒的那条命令')
+    assert.ok(all.includes('不在 scope 命令清单里'))
+    assert.ok(all.includes('本轮评审与测试需要重跑'), '要说清代价')
+    await click(buttonByText(tree, '退回 S1 补命令清单'))
+    const call = posted.find((item) => item.action === 'reopenScopeForCommands')
+    assert.ok(call, '必须提交 reopenScopeForCommands')
+    assert.equal(call.payload.command, 'npm run build')
   })
 }
 
@@ -2582,31 +2565,6 @@ await check('接受风险阶段标识与接受原因不同于评审通过或跳�
   })
 }
 
-{
-  // D2：v1 唯一的写权限例外——只对声明 needsWrite 的方向、只在 S4、只由用户显式勾选。
-  posted = []
-  currentView = baseView('S4', {
-    directions: [{ id: 'mig', name: '迁移回滚', points: ['回滚可恢复'], needsWrite: true, writeGranted: false }],
-    directionCatalog: [{ id: 'mig', name: '迁移回滚', points: ['回滚可恢复'], needsWrite: true }],
-  })
-  const renderer = await render(FlowDetail, {})
-  // S4 默认落在测试方向组，写权限授权勾选也在这组里。
-  const modalTree = await openSettings(renderer)
-  const boxes = checkboxNodes(modalTree)
-  const text = flat(modalTree)
-  await check('S1 拍板不再提供无实际作用的跳过按钮', async () => {
-  currentView = baseView('S1', {
-    grill: { pending: { id: 'q-skip', question: '过期后是否强制重新登录？', options: [{ label: '强制重新登录', tradeoff: '更安全' }], recommended: 0 }, answeredCount: 0 },
-  })
-  posted = []
-  const tree = await render(FlowDetail, {})
-  const card = nodeByClass(tree.toJSON(), 'fg-q')
-  assert.ok(card)
-  assert.equal(hasButton(tree.toJSON(), '跳过'), false)
-  assert.ok(hasButton(tree.toJSON(), '强制重新登录'))
-  assert.equal(posted.length, 0)
-})
-
 await check('点「修改需求」后回到追问流程并说明下一步', async () => {
   currentView = baseView('S1', { doc: { html: null, revisedAt: '2026-11-17T10:00:00Z' } })
   const tree = await render(FlowDetail, {})
@@ -2662,92 +2620,24 @@ await check('修改意见超过 2000 字时先拦下来，不提交也不静默�
   } finally { await act(async () => { renderer.unmount() }) }
 })
 
-await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
-    assert.ok(text.includes('授权执行变更性命令'))
-    // 按文案定位：S4 主区的「允许执行构建/测试命令」是另一个开关，不能靠「第一个可用勾选框」猜。
-    const grant = ruleCheckbox(modalTree, '授权执行变更性命令')
-    assert.equal(grant.props.disabled, false)
-    assert.equal(grant.props.checked, false)
-  })
-  await check('D2 勾选授权提交 toggleWriteGrant', async () => {
-    const grant = ruleCheckbox(modalTree, '授权执行变更性命令')
-    await act(async () => {
-      grant.props.onChange({ target: { checked: true } })
-      await new Promise((resolve) => setTimeout(resolve, 40))
-    })
-    const call = posted.find((item) => item.action === 'toggleWriteGrant')
-    assert.ok(call, '必须提交 toggleWriteGrant')
-    assert.equal(call.payload.id, 'mig')
-    assert.equal(call.payload.enabled, true)
-  })
-}
-
+// 写权限不再由用户勾选：测试方向只决定验证什么，能执行什么由 S1 批准的 scope 清单决定。
 {
-  // 内置方向原来在设置面板里只有「启用」，没有任何声明写权限的入口：
-  // S4 想跑迁移脚本只能另建一个自定义方向，界面看不出差别。
   posted = []
   currentView = baseView('S4', {
-    directions: [{ id: 'smoke', name: '冒烟验证', points: ['能打开'], writeGranted: false }],
-    directionCatalog: [{ id: 'smoke', name: '冒烟验证', points: ['能打开'] }],
+    directions: [{ id: 'mig', name: '迁移回滚', points: ['回滚可恢复'] }],
+    directionCatalog: [{ id: 'mig', name: '迁移回滚', points: ['回滚可恢复'] }],
   })
   const renderer = await render(FlowDetail, {})
-  const tree = await openSettings(renderer)
-  const text = flat(tree)
-  await check('未声明写权限的方向给出声明入口', () => {
-    assert.ok(text.includes('声明该方向需要写权限'))
-  })
-  await check('声明入口是按钮，不是勾上就弹回去的勾选框', () => {
-    // 曾经这里是 checked 写死为 false 的勾选框：点一下立刻按 false 重渲染，用户只看到「勾不动」。
-    const labels = findTags(tree, 'label').filter((node) => flat(node).includes('声明该方向需要写权限'))
-    assert.equal(labels.length, 0, '声明入口不能是勾选框')
-  })
-  await check('点声明按钮提交 declareDirectionWrite', async () => {
-    await click(buttonByText(tree, '声明该方向需要写权限'))
-    await settle()
-    const call = posted.find((item) => item.action === 'declareDirectionWrite')
-    assert.ok(call, '必须提交 declareDirectionWrite')
-    assert.equal(call.payload.id, 'smoke')
-    assert.equal(call.payload.enabled, true)
+  const modalTree = await openSettings(renderer)
+  const text = flat(modalTree)
+  await check('测试方向面板不再出现写权限声明与授权', () => {
+    assert.equal(text.includes('授权执行变更性命令'), false, '用户不再为方向勾选命令授权')
+    assert.equal(text.includes('声明该方向需要写权限'), false, '方向不再有写权限这个概念')
+    assert.equal(text.includes('本次流程已声明写权限'), false)
+    assert.ok(text.includes('不决定能执行什么'), '要说清能执行什么由 scope 清单决定')
   })
 }
 
-{
-  // 后端曾经只把声明合并进 view.directions，没合并进 stageConfigs.S4.catalog；
-  // 设置弹窗读的是后者，于是点完声明这一行毫无变化，用户读成「点了没反应」。
-  currentView = baseView('S1', {
-    directions: [{ id: 'smoke', name: '冒烟验证', points: ['主路径可用'], needsWrite: true, writeDeclared: true, writeGranted: false }],
-    stageConfigs: {
-      S4: { ids: ['smoke'], catalog: [{ id: 'smoke', name: '冒烟验证', points: ['主路径可用'] }], source: 'flow' },
-    },
-  })
-  const renderer = await render(FlowDetail, {})
-  await openSettings(renderer)
-  const tree = await switchGroup(renderer, '测试方向')
-  await check('目录里的方向没有声明时，仍按流程实时状态显示已声明', () => {
-    const panel = flat(tree)
-    assert.ok(panel.includes('已声明需要写权限'), '必须以 view.directions 的实时状态为准')
-    assert.equal(panel.includes('声明该方向需要写权限'), false, '已声明的方向不能再摆声明入口')
-  })
-}
-
-{
-  // 声明过就永远撤回不了的话，内置方向会一直躺在 S4 授权清单里。
-  posted = []
-  currentView = baseView('S4', {
-    directions: [{ id: 'smoke', name: '冒烟验证', points: ['能打开'], needsWrite: true, writeDeclared: true, writeGranted: true }],
-    directionCatalog: [{ id: 'smoke', name: '冒烟验证', points: ['能打开'], needsWrite: true, writeDeclared: true }],
-  })
-  const renderer = await render(FlowDetail, {})
-  const tree = await openSettings(renderer)
-  await check('用户声明出来的写权限可以撤回', async () => {
-    assert.ok(hasButton(tree, '撤销写权限声明'))
-    await click(buttonByText(tree, '撤销写权限声明'))
-    await settle()
-    const call = posted.find((item) => item.action === 'declareDirectionWrite')
-    assert.ok(call, '必须提交 declareDirectionWrite')
-    assert.equal(call.payload.enabled, false)
-  })
-}
 
 {
   // 宿主新增的只读工具（实机是刷新入口）默认被拒，界面上必须有个声明出口，
@@ -2779,44 +2669,6 @@ await check('D2 声明写权限的方向在 S4 出现授权勾选', () => {
   })
 }
 
-{
-  currentView = baseView('S2', {
-    directions: [{ id: 'mig', name: '迁移回滚', points: ['回滚可恢复'], needsWrite: true, writeGranted: false }],
-    directionCatalog: [{ id: 'mig', name: '迁移回滚', points: ['回滚可恢复'], needsWrite: true }],
-  })
-  const renderer = await render(FlowDetail, {})
-  await openSettings(renderer)
-  // S2 默认组是开发规则，授权说明在测试方向组里。
-  const text = flat(await switchGroup(renderer, '测试方向'))
-  await check('D2 非 S4 阶段不摆灰勾选框，只报「已声明」状态', () => {
-    // 灰着的勾选框会被当成「点了没反应」，所以非 S4 阶段干脆不放勾选框。
-    assert.ok(text.includes('已声明需要写权限'))
-    assert.ok(text.includes('授权执行变更性命令只在 S4 测试阶段开放'))
-    assert.equal(text.includes('授权执行变更性命令该方向声明需要写权限'), false, '非 S4 不渲染授权勾选框本体')
-  })
-}
-
-{
-  // 界面渲染出问题时，用户没法判断是「数据没写进去」还是「界面没刷新」。
-  // 把流程里的原始声明列表直接摆出来，点完一眼能分清。
-  currentView = baseView('S1', { directionWriteDeclared: ['smoke', 'functional'] })
-  const renderer = await render(FlowDetail, {})
-  await openSettings(renderer)
-  const text = flat(await switchGroup(renderer, '测试方向'))
-  await check('测试方向面板直接显示流程里的原始声明列表', () => {
-    assert.ok(text.includes('本次流程已声明写权限：smoke、functional'), '要显示原始声明，不能只靠目录推断')
-  })
-}
-
-{
-  currentView = baseView('S1', { directionWriteDeclared: [] })
-  const renderer = await render(FlowDetail, {})
-  await openSettings(renderer)
-  const text = flat(await switchGroup(renderer, '测试方向'))
-  await check('没有任何声明时原始列表显示「无」', () => {
-    assert.ok(text.includes('本次流程已声明写权限：（无）'))
-  })
-}
 
 // ---------------------------------------------------------------------------
 // 8.5 D4：scope 外的评审发现要给出「得回 S1」的指引
@@ -3958,7 +3810,7 @@ await check('预览档位只切换默认启用项，内容自定义与跟随档�
   } finally { await act(async () => { renderer.unmount() }) }
 })
 
-await check('工作区S4方向可声明needsWrite，保存不提交任何执行授权', async () => {
+await check('工作区S4方向不再声明写权限，只保存方向本身', async () => {
   resetHub([emptyMember('write-direction')]); posted = []
   const renderer = await renderHub()
   try {
@@ -3966,14 +3818,14 @@ await check('工作区S4方向可声明needsWrite，保存不提交任何执行�
     await openWorkspaceRules(renderer, 'S4')
     await click(buttonByText(ruleDialog(renderer), '添加规则'))
     await changeValue(inputByPlaceholder(ruleDialog(renderer), '规则名称'), '迁移回滚验证')
-    const declaration = findTags(ruleDialog(renderer), 'label').find((node) => flat(node).includes('仍需在 S4 单独授权'))
-    await act(async () => { checkboxNodes(declaration)[0].props.onChange({ target: { checked: true } }) })
+    // 方向不再有「写权限」这个概念：能执行什么由 S1 批准的 scope 清单决定。
+    assert.equal(flat(ruleDialog(renderer)).includes('仍需在 S4 单独授权'), false)
     await click(buttonByText(ruleDialog(renderer), '加入列表'))
     assert.ok(flat(ruleDialog(renderer)).includes('新增自定义'))
     await click(buttonByText(ruleDialog(renderer), '保存规则'))
     const stage = ruleWrites().at(-1).stages.S4
-    assert.equal(stage.custom[0].needsWrite, true)
     assert.deepEqual(Object.keys(stage).sort(), ['custom', 'edits', 'ids'])
+    assert.equal(Object.hasOwn(stage.custom[0], 'needsWrite'), false)
     assert.equal(Object.hasOwn(stage.custom[0], 'writeGranted'), false)
     assert.deepEqual(posted, [])
   } finally { await act(async () => { renderer.unmount() }) }

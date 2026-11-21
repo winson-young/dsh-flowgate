@@ -198,7 +198,7 @@ const inspectRules = async () => {
   await evaluate('window.fixtureRuleSaveDelay=0')
   const writes = await evaluate('window.fixtureRequests.filter(r=>r.route.includes("/hub/rules")&&r.body.stages).map(r=>r.body.stages)')
   const stages = writes[0]
-  check('one save commits all stages and preserves other stage drafts on reset', writes.length === 1 && stages.S1 !== null && stages.S2 === null && stages.S3 !== null && stages.S4.custom.some(rule => rule.name === '检查会话恢复' && rule.needsWrite))
+  check('one save commits all stages and preserves other stage drafts on reset', writes.length === 1 && stages.S1 !== null && stages.S2 === null && stages.S3 !== null && stages.S4.custom.some(rule => rule.name === '检查会话恢复') && !JSON.stringify(stages).includes('needsWrite'))
   check('test direction configuration grants no write permission', !JSON.stringify(stages).includes('writeGrants'))
 }
 try {

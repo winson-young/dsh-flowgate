@@ -328,9 +328,12 @@ check('未登记进白名单的工具默认被拒绝', () => {
   })
 }
 
-// 命令授权只在 S2 / S4 开放：S1 想提前开也不行。
+// 命令授权开关已退场：任何阶段都没有 toggleShellGrant 这个操作，S1 更不能提前开。
 const earlyShellGrant = await postAction('toggleShellGrant', { enabled: true })
-check('S1 阶段不能授权执行变更性命令', () => assert.equal(earlyShellGrant.status, 409))
+check('命令授权开关已退场，S1 也开不了', () => {
+  assert.equal(earlyShellGrant.status, 409)
+  assert.match(earlyShellGrant.body.error, /未知操作/)
+})
 
 // 文档与 scope 都会原样进快照、每次全量写盘：体积不设上限，一次提交就能让流程卡死。
 {
@@ -419,10 +422,18 @@ const allowIn = await guard('edit', { file_path: join(cwd, 'src/auth/session.ts'
 check('scope 内 edit 放行', () => assert.equal(allowIn.kind, 'allow'))
 // 变更性 shell 无法逐条核对 scope，S2 也必须拒绝——放行等于给 scope 边界开后门。
 const denyShell = await guard('bash', { command: 'git checkout -- src/api/middleware.ts' })
-check('变更性 shell 在 S2 被拒并给出授权指引', () => {
+check('变更性 shell 在 S2 被拒，并指向 scope 清单与退回入口', () => {
   assert.equal(denyShell.kind, 'deny')
   assert.match(denyShell.reason, /只允许只读 shell 命令/)
-  assert.match(denyShell.reason, /显式授权/)
+  // 唯一通道是 S1 批准过的 scope 清单，界面上没有别的授权开关。
+  assert.match(denyShell.reason, /变更性命令只有一条通道/)
+  assert.match(denyShell.reason, /退回 S1 补命令清单/)
+})
+const deniedView = await getState()
+check('被拒命令记进视图，供界面预填补清单入口', () => {
+  assert.equal(deniedView.body.deniedCommand.command, 'git checkout -- src/api/middleware.ts')
+  assert.equal(deniedView.body.deniedCommand.stage, 'S2')
+  assert.equal('shellGrant' in deniedView.body, false)
 })
 const denyShellOps = await guard('ops_bash', { command: 'rm -rf src/api' })
 check('ops_bash 这类别名 shell 同样被拦（不同 profile 装的 shell 插件不同）', () => {
@@ -434,29 +445,20 @@ check('只读 shell 放行', () => assert.equal(denyShell2.kind, 'allow'))
 const allowGitDiff = await guard('ops_bash', { command: 'git diff --stat' })
 check('ops_bash 的只读命令放行', () => assert.equal(allowGitDiff.kind, 'allow'))
 
-// S2 的「允许执行构建/测试命令」：默认关闭，用户显式授权后才放行变更性 shell。
-const shellGranted = await postAction('toggleShellGrant', { enabled: true })
-const afterGrant = await guard('bash', { command: 'npm run build' })
-const afterGrantState = await getState()
-check('S2 用户显式授权后变更性 shell 放行', () => {
-  assert.equal(shellGranted.status, 200)
-  assert.equal(afterGrantState.body.shellGrant, true)
-  assert.equal(afterGrant.kind, 'allow')
+// scope 清单里没有 npm run build：S2 照样拒绝，且没有任何勾选能绕过它。
+const unlistedBuild = await guard('bash', { command: 'npm run build' })
+const unlistedView = await getState()
+check('清单外的构建命令被拒，没有可勾选的授权通道', () => {
+  assert.equal(unlistedBuild.kind, 'deny')
+  assert.match(unlistedBuild.reason, /只允许只读 shell 命令/)
+  assert.equal(unlistedView.body.deniedCommand.command, 'npm run build')
+  assert.equal('shellGrant' in unlistedView.body, false)
 })
-// 授权只放宽「写盘类命令」，解释器内联执行仍然拒绝：那等价于任意代码执行。
+// 解释器内联执行始终拒绝：那等价于任意代码执行，与清单无关。
 const stillEscape = await guard('bash', { command: 'node -e "require(\'fs\').writeFileSync(\'x\',\'y\')"' })
-check('授权后解释器内联执行仍被拒绝', () => {
+check('解释器内联执行始终被拒绝', () => {
   assert.equal(stillEscape.kind, 'deny')
   assert.match(stillEscape.reason, /任意代码/)
-})
-const shellRevoked = await postAction('toggleShellGrant', { enabled: false })
-const afterRevoke = await guard('bash', { command: 'npm run build' })
-const afterRevokeState = await getState()
-check('撤销授权后变更性 shell 重新被拒', () => {
-  assert.equal(shellRevoked.status, 200)
-  assert.equal(afterRevokeState.body.shellGrant, false)
-  assert.equal(afterRevoke.kind, 'deny')
-  assert.match(afterRevoke.reason, /只允许只读 shell 命令/)
 })
 
 // 只读白名单本身也有边界：多行命令、能写文件的选项、会改 refs 的子命令。
@@ -559,11 +561,7 @@ check('run_code 里组合只读工具照常放行', () => assert.equal(allowRead
   })
 }
 
-// 命令授权在本次流程内持久：S2 打开之后进 S3、进 S4、退回 S2 都不清除（AC1/AC2/AC3），
-// 但放行仍按阶段判定——S1 与 S3 只接受只读命令（AC4）。
-const grantBeforeAdvance = await postAction('toggleShellGrant', { enabled: true })
-check('进入阶段推进前授权', () => assert.equal(grantBeforeAdvance.status, 200))
-
+// 放行按阶段判定：只有 S2 / S4 认 scope 清单，S1 与 S3 一律只接受只读命令（AC4）。
 // scope 未冻结分支：直接构造 flow 验证守卫文案。
 check('scope 未冻结时 S2 写操作返回「scope 未冻结」', () => {
   const flow = { cwd, finished: false, stage: 'S2', scope: { frozen: false, data: null } }
@@ -581,13 +579,14 @@ check('S2 完成开发后进入 S3', () => {
   assert.match(devResult.message, /不要在阶段交界处停下/)
 })
 const afterDev = await getState()
-check('AC1 离开 S2 进入 S3 后命令授权仍然有效', () => {
+check('AC1 离开 S2 进入 S3 后视图不再有任何授权字段', () => {
   assert.equal(afterDev.body.stage, 'S3')
-  assert.equal(afterDev.body.shellGrant, true)
+  assert.equal('shellGrant' in afterDev.body, false)
+  assert.equal('writeGrants' in afterDev.body, false)
 })
-// AC4：授权字段跨阶段存活，但放行仍按阶段判定——评审阶段不能跑变更性命令。
+// AC4：阶段闸门在前——评审阶段不能跑变更性命令，哪怕清单里写了。
 const s3ShellAfterAdvance = await guard('bash', { command: 'npm run build' })
-check('AC4 授权为真但在 S3 仍拒绝变更性 shell', () => {
+check('AC4 S3 阶段仍拒绝变更性 shell', () => {
   assert.equal(s3ShellAfterAdvance.kind, 'deny')
   assert.match(s3ShellAfterAdvance.reason, /只允许只读 shell 命令/)
 })
@@ -646,27 +645,23 @@ check('显式带风险继续后进入 S4 且不声称评审通过', () => {
 check('评审报告结构化聚合', () => {
   assert.equal(reviewResult.blocking, 1)
 })
-// AC2：S2 那次授权带得进 S4，不必重新勾选就能跑测试命令。
+// AC2：阶段推进不改变放行口径——S4 认的还是同一份 scope 清单，没有可继承的授权。
 const s4InheritedState = await getState()
 const s4InheritedShell = await guard('bash', { command: 'npm run build' })
-check('AC2 带着既有授权进 S4 直接放行变更性命令', () => {
+check('AC2 进 S4 不继承任何授权，清单外命令照样被拒', () => {
   assert.equal(s4InheritedState.body.stage, 'S4')
-  assert.equal(s4InheritedState.body.shellGrant, true)
-  assert.equal(s4InheritedShell.kind, 'allow')
+  assert.equal('shellGrant' in s4InheritedState.body, false)
+  assert.equal(s4InheritedShell.kind, 'deny')
 })
 
-// AC3：回退只清写授权、不清命令授权。先在 S4 把两种授权都打开。
+// AC3：回退不产生也不残留任何授权字段。
 const ac3Dir = await postAction('addDirection', {
   name: '回退授权口径',
   points: ['回退后仍能跑构建与测试'],
-  needsWrite: true,
 })
-const ac3DirId = ac3Dir.body.directions.find((d) => d.name === '回退授权口径').id
-const ac3Grant = await postAction('toggleWriteGrant', { id: ac3DirId, enabled: true })
-const ac3Shell = await postAction('toggleShellGrant', { enabled: true })
-check('AC3 前置：S4 里写授权与命令授权都打开', () => {
-  assert.deepEqual(ac3Grant.body.writeGrants, [ac3DirId])
-  assert.equal(ac3Shell.body.shellGrant, true)
+check('AC3 前置：追加方向不产生写授权', () => {
+  assert.equal(ac3Dir.status, 200)
+  assert.equal('writeGrants' in ac3Dir.body, false)
 })
 
 // 回退验证：S4 门禁点「退回开发修复」。
@@ -677,17 +672,20 @@ check('门禁可回退到 S2', () => {
   assert.equal(backToDev.status, 200)
   assert.equal(backToDev.body.stage, 'S2')
 })
-check('AC3 回退保留命令授权', () => assert.equal(backToDev.body.shellGrant, true))
-check('AC3 回退仍清空写授权', () => assert.deepEqual(backToDev.body.writeGrants, []))
+check('AC3 回退后视图仍无授权字段', () => {
+  assert.equal('shellGrant' in backToDev.body, false)
+  assert.equal('writeGrants' in backToDev.body, false)
+})
 await s4Gate
 
 // AC7：界面文案与新语义一致，不能再声称「阶段推进就失效」。
 {
   const clientSource = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
-  check('AC7 授权文案不再声称只在当前阶段有效', () => {
+  check('AC7 客户端不再提供任何命令授权开关', () => {
+    assert.doesNotMatch(clientSource, /允许执行构建\/测试命令/)
     assert.doesNotMatch(clientSource, /授权只在当前阶段有效/)
     assert.doesNotMatch(clientSource, /阶段推进后需重新授权/)
-    assert.match(clientSource, /本次流程内一直有效/)
+    assert.match(clientSource, /scope 清单/)
   })
 }
 
@@ -745,71 +743,49 @@ check('零阻塞评审仍按普通通过落状态并写入评审通过事件', (
   assert.ok(events.some((event) => event.type === 'gate.passed' && event.detail.stage === 'S3'))
 })
 
-// S4 要跑测试命令，同一个开关必须在这里也能用，否则测试阶段只能手改 scope。
-const s4Grant = await postAction('toggleShellGrant', { enabled: true })
+// S4 要跑测试命令，入口仍然只有 scope 清单：清单里没有的命令照样拒绝。
 const s4Shell = await guard('bash', { command: 'npm test' })
 const s4Escape = await guard('bash', { command: 'node -e "process.exit(0)"' })
-const s4Revoke = await postAction('toggleShellGrant', { enabled: false })
-check('S4 阶段同样可以授权执行测试命令', () => {
-  assert.equal(s4Grant.status, 200)
-  assert.equal(s4Shell.kind, 'allow')
+check('S4 清单外的测试命令被拒，只给补清单入口', () => {
+  assert.equal(s4Shell.kind, 'deny')
+  assert.match(s4Shell.reason, /退回 S1 补命令清单/)
 })
-check('S4 授权后解释器内联执行仍被拒绝', () => {
+check('S4 解释器内联执行仍被拒绝', () => {
   assert.equal(s4Escape.kind, 'deny')
   assert.match(s4Escape.reason, /任意代码/)
 })
-check('S4 撤销授权后测试命令重新被拒', () => {
-  assert.equal(s4Revoke.status, 200)
-})
 
-// D2：v1 唯一的写权限例外——只在 S4、只对声明 needsWrite 的方向、只由用户显式授权。
+// 写权限声明与授权已整体退场：测试方向只决定验证什么，不决定能执行什么。
 const addDir = await postAction('addDirection', {
   name: '迁移回滚',
   points: ['迁移后回滚可恢复'],
   needsWrite: true,
 })
-check('D2 追加带写权限声明的测试方向', () => assert.equal(addDir.status, 200))
-const customDirId = addDir.body.directions.find((d) => d.name === '迁移回滚').id
-const grantBuiltin = await postAction('toggleWriteGrant', { id: 'smoke', enabled: true })
-check('D2 未声明需要写权限的方向不能被授权', () => assert.equal(grantBuiltin.status, 409))
-const granted = await postAction('toggleWriteGrant', { id: customDirId, enabled: true })
-check('D2 用户显式勾选后授权生效', () => {
-  assert.equal(granted.status, 200)
-  assert.deepEqual(granted.body.writeGrants, [customDirId])
-  assert.equal(granted.body.directions.find((d) => d.id === customDirId).writeGranted, true)
+check('追加测试方向不再带写权限声明', () => {
+  assert.equal(addDir.status, 200)
+  const dir = addDir.body.directions.find((d) => d.name === '迁移回滚')
+  assert.equal('needsWrite' in dir, false, '方向对象不该再有 needsWrite')
+  assert.equal('writeGranted' in dir, false, '方向对象不该再有 writeGranted')
 })
-const revoked = await postAction('toggleWriteGrant', { id: customDirId, enabled: false })
-check('D2 取消勾选后授权撤销', () => assert.deepEqual(revoked.body.writeGrants, []))
-
-// 内置方向原来没有写权限入口：S4 想跑迁移脚本只能新建一个自定义方向，
-// 于是「内置方向 + 需要写盘」这件事在界面上根本无法表达。
-const declaredState = await getState()
-const builtinDirId = declaredState.body.directions[0].id
-const declared = await postAction('declareDirectionWrite', { id: builtinDirId, enabled: true })
-check('内置方向可以在 S4 直接声明写权限', () => {
-  assert.equal(declared.status, 200)
-  assert.equal(declared.body.directions.find((d) => d.id === builtinDirId).needsWrite, true)
+const legacyGrant = await postAction('toggleWriteGrant', { id: 'smoke', enabled: true })
+check('写权限授权操作已退场', () => {
+  assert.equal(legacyGrant.status, 409)
+  assert.match(legacyGrant.body.error, /未知操作/)
 })
-// 设置弹窗读的是 stageConfigs.S4.catalog，不是 directions。两处不同步时，
-// 用户点完声明界面毫无变化，按钮一直在，看起来就是「点了没反应」。
-const declaredCatalog = declared.body.stageConfigs.S4.catalog.find((entry) => entry.id === builtinDirId)
-check('声明同时反映到设置弹窗读的目录里', () => {
-  assert.equal(declaredCatalog.needsWrite, true, 'stageConfigs 的目录必须带上写权限声明')
-  assert.equal(declaredCatalog.writeDeclared, true, '界面要靠 writeDeclared 区分用户声明与方向自带')
+const legacyDeclare = await postAction('declareDirectionWrite', { id: 'smoke', enabled: true })
+check('写权限声明操作已退场', () => {
+  assert.equal(legacyDeclare.status, 409)
+  assert.match(legacyDeclare.body.error, /未知操作/)
 })
-const declaredGrant = await postAction('toggleWriteGrant', { id: builtinDirId, enabled: true })
-check('声明后内置方向可以授权，与自定义方向互不影响', () => {
-  assert.equal(declaredGrant.status, 200)
-  assert.ok(declaredGrant.body.writeGrants.includes(builtinDirId))
+const dirView = await getState()
+check('视图不再暴露任何写权限字段', () => {
+  assert.equal('writeGrants' in dirView.body, false)
+  assert.equal('directionWriteDeclared' in dirView.body, false)
+  for (const dir of dirView.body.directions) {
+    assert.equal('needsWrite' in dir, false)
+    assert.equal('writeGranted' in dir, false)
+  }
 })
-const undeclared = await postAction('declareDirectionWrite', { id: builtinDirId, enabled: false })
-check('撤回声明后写授权一起失效，不留悬空授权', () => {
-  assert.equal(undeclared.status, 200)
-  assert.ok(!undeclared.body.writeGrants.includes(builtinDirId))
-  assert.notEqual(undeclared.body.directions.find((d) => d.id === builtinDirId).needsWrite, true)
-})
-const unknownDeclare = await postAction('declareDirectionWrite', { id: 'no-such-direction', enabled: true })
-check('声明不存在方向被拒', () => assert.equal(unknownDeclare.status, 409))
 
 // 只读豁免：插件不认识的只读工具（实机是刷新入口）默认被拒，用户声明后放行。
 const allowBefore = await guard('unlag_refresh', {})
@@ -832,10 +808,6 @@ const allowCleared = await postAction('setToolAllowlist', { tools: [] })
 check('清空豁免名单后恢复默认拒绝', () => {
   assert.deepEqual(allowCleared.body.toolAllowlist, [])
 })
-
-// 流程结束前把授权打开，验证结束会清掉它（AC6）。
-const beforeFinishGrant = await postAction('toggleShellGrant', { enabled: true })
-check('AC6 前置：结束前命令授权为真', () => assert.equal(beforeFinishGrant.body.shellGrant, true))
 
 const testPending = gateRound(
   'flowgate_test',
@@ -864,7 +836,12 @@ check('AC-8 流程结束且显式跳过 S4 的计数为 1', () => {
   assert.equal(finalState.body.finished, true)
   assert.equal(finalState.body.skippedCount, 1)
 })
-check('AC6 流程结束后命令授权被清除', () => assert.equal(finalState.body.shellGrant, false))
+check('AC6 流程结束后视图不再有授权字段', () => {
+  assert.equal('shellGrant' in finalState.body, false)
+  assert.equal('writeGrants' in finalState.body, false)
+  // 被拒命令的提示也不该跟到流程结束后。
+  assert.equal(finalState.body.deniedCommand, null)
+})
 check('AC-8 flows.jsonl 记录完整阶段事件', () => {
   const file = join(cwd, '.dsh-flowgate', 'flows.jsonl')
   assert.ok(existsSync(file), 'flows.jsonl 未生成')
@@ -1431,14 +1408,12 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
     await tick()
     const gxApprove = await gx.request('/api/flowgate/action', { sessionId: 'sess-cancel-grant', action: 'doc', payload: { decision: 'approve' } })
     await gxDoc
-    const gxGrant = await gx.request('/api/flowgate/action', { sessionId: 'sess-cancel-grant', action: 'toggleShellGrant', payload: { enabled: true } })
     const gxCancel = await gx.request('/api/flowgate/action', { sessionId: 'sess-cancel-grant', action: 'cancel', payload: {} })
-    check('AC6 放弃流程时命令授权一并清除', () => {
+    check('AC6 放弃流程后视图不再有授权字段', () => {
       assert.equal(gxApprove.status, 200)
-      assert.equal(gxGrant.status, 200)
-      assert.equal(gxGrant.body.shellGrant, true)
       assert.equal(gxCancel.status, 200)
-      assert.equal(gxCancel.body.shellGrant, false)
+      assert.equal('shellGrant' in gxCancel.body, false)
+      assert.equal('writeGrants' in gxCancel.body, false)
     })
     // 这里的 scope 已经冻结过：放弃可以解冻白名单，但不能把验收账本抹成 0 条，
     // 否则一条缺口流程在放弃后会显示成「0 条 · 全部通过」。
@@ -2554,8 +2529,8 @@ for (const [kind, reason, expected] of [
     })
     const chosen = { S1: 'clarify-goal', S2: 'scope-only', S3: 'correctness', S4: 'smoke' }
     const stages = Object.fromEntries(Object.entries(chosen).map(([stage, id]) => {
-      const custom = { id: 'project-' + stage, name: '新增 ' + stage, points: ['新增要点 ' + stage], ...(stage === 'S4' ? { needsWrite: true } : {}) }
-      const edit = { ...defaults[stage].builtin.find((item) => item.id === id), name: '已编辑 ' + stage, points: ['执行标记 ' + stage], ...(stage === 'S4' ? { needsWrite: true } : {}) }
+      const custom = { id: 'project-' + stage, name: '新增 ' + stage, points: ['新增要点 ' + stage] }
+      const edit = { ...defaults[stage].builtin.find((item) => item.id === id), name: '已编辑 ' + stage, points: ['执行标记 ' + stage] }
       return [stage, { ids: stage === 'S1' ? null : [id, custom.id], custom: [custom], edits: [edit] }]
     }))
     const saved = await post('rules', { path: ws, stages, scope: { frozen: true }, writeGrants: ['smoke'] })
@@ -2574,6 +2549,8 @@ for (const [kind, reason, expected] of [
       assert.equal(disk.version, 2)
       assert.deepEqual(disk.stages, stages)
       assert.deepEqual(Object.keys(disk).sort(), ['stages', 'updatedAt', 'version'])
+      // 写权限概念已删除：客户端多传的字段不会被写进工作区配置。
+      assert.equal(JSON.stringify(disk).includes('needsWrite'), false)
     })
     const savedRaw = readFileSync(configFile, 'utf8')
     const invalidStages = [
@@ -2581,7 +2558,7 @@ for (const [kind, reason, expected] of [
       { ...stages, S1: { ...stages.S1, edits: [{ id: 'security', name: '跨阶段编辑', points: [] }] } },
       { ...stages, S3: { ...stages.S3, edits: [...stages.S3.edits, ...stages.S3.edits] } },
       { ...stages, S4: { ...stages.S4, custom: [{ id: 'smoke', name: '冲突', points: [] }] } },
-      { ...stages, S4: { ...stages.S4, edits: [{ ...stages.S4.edits[0], needsWrite: 'true' }] } },
+      { ...stages, S4: { ...stages.S4, edits: [{ ...stages.S4.edits[0], points: '不是数组' }] } },
       { ...stages, S2: { ...stages.S2, custom: [{ ...stages.S2.custom[0], points: [1] }] } },
     ]
     for (const invalid of invalidStages) assert.equal((await post('rules', { path: ws, stages: invalid })).status, 400)
@@ -2627,10 +2604,10 @@ for (const [kind, reason, expected] of [
       assert.equal('summary' in afterDuplicate.body, false)
       assert.equal(afterDuplicate.body.preset, 'strict')
       assert.equal(started.body.scope.frozen, false)
-      assert.deepEqual(started.body.writeGrants, [])
+      assert.equal('writeGrants' in started.body, false)
       for (const stage of Object.keys(chosen)) assert.equal(started.body.stageConfigs[stage].source, 'workspace')
       assert.deepEqual(started.body.stageConfigs.S1.ids, defaults.S1.defaults.strict)
-      assert.ok(started.body.directions.every((item) => !item.writeGranted))
+      assert.ok(started.body.directions.every((item) => !('writeGranted' in item)))
       assert.match(cx.delivered[0].message.content.map((item) => item.text).join('\n'), /执行标记 S1/)
       assert.match(cx.delivered[0].message.content.map((item) => item.text).join('\n'), /完整保留需求原文/)
       // 需求依据只能来自原文：唤醒消息里出现 brief 首行，而不是把标题当成需求描述。
@@ -2669,7 +2646,7 @@ for (const [kind, reason, expected] of [
       assert.deepEqual(followed.body.stageConfigs.S3.ids, stages.S3.ids)
       for (const stage of ['S1', 'S2', 'S4']) assert.equal(followed.body.stageConfigs[stage].source, 'flow')
       assert.equal(readFileSync(configFile, 'utf8'), savedRaw)
-      assert.deepEqual(followed.body.writeGrants, [])
+      assert.equal('writeGrants' in followed.body, false)
     })
     const reset = await post('rules', { path: ws, rules: null })
     await act('followStageDefaults', { stage: 'S2' })
@@ -2744,8 +2721,9 @@ for (const [kind, reason, expected] of [
       assert.equal(brokenState.body.active, true)
       assert.equal(brokenState.body.stage, 'S1')
       assert.equal(brokenState.body.preset, 'fast')
-      assert.equal(brokenState.body.shellGrant, false)
-      assert.deepEqual(brokenState.body.writeGrants, [])
+      // 旧快照里的授权字段一律清洗掉：权限只有一个来源，就是冻结 scope 的 commands 清单。
+      assert.equal('shellGrant' in brokenState.body, false)
+      assert.equal('writeGrants' in brokenState.body, false)
       assert.equal(brokenHub.status, 200)
       assert.equal(brokenHub.body.flows.some((flow) => flow.id === 'f_noid'), false)
     })
@@ -2757,14 +2735,15 @@ for (const [kind, reason, expected] of [
   }
 }
 
-// 授权状态的跨工作区与磁盘恢复：只使用真实宿主工具、路由和已有公开服务接口。
+// 权限只有一个来源：S1 批准过的 scope.commands 清单。冷恢复不复活任何授权，
+// 旧快照里残留的授权字段一律清洗，测试子代理也只看清单。
 {
-  const root = mkdtempSync(join(tmpdir(), 'flowgate-grant-state-'))
+  const root = mkdtempSync(join(tmpdir(), 'flowgate-scope-only-'))
   const ws = join(root, 'workspace'), other = join(root, 'other')
   mkdirSync(ws); mkdirSync(other)
   const previousHome = process.env.DSH_FLOWGATE_HOME
   process.env.DSH_FLOWGATE_HOME = join(root, 'home')
-  const sid = 'grant-main', foreignSid = 'grant-other'
+  const sid = 'scope-only', foreignSid = 'scope-only-other'
   const sessionDirs = new Map([[sid, ws], [foreignSid, other]])
   const services = { sessions: { get: (id) => ({ header: { id, cwd: sessionDirs.get(id) ?? ws } }) } }
   let cx = makeHost(ws, sid, { services })
@@ -2779,122 +2758,61 @@ for (const [kind, reason, expected] of [
     if (name === 'flowgate_start') assert.equal((await act('setGateMode', { mode: 'manual' }, id)).status, 200)
     return value
   }
-  const stages = { S1: null, S2: null, S3: null, S4: {
-    ids: ['smoke'], custom: [], edits: [{ id: 'smoke', name: '授权恢复验证', points: ['当前声明与本次授权一致'], needsWrite: true }],
-  } }
-  const disabled = structuredClone(stages)
-  disabled.S4.edits[0].needsWrite = false
-  const configFile = join(ws, '.dsh-flowgate', 'config.json')
-  const originalRename = fs.renameSync
   try {
-    for (const path of [ws, other]) {
-      assert.equal((await post('add', { path })).status, 200)
-      assert.equal((await post('rules', { path, stages })).status, 200)
-    }
+    for (const path of [ws, other]) assert.equal((await post('add', { path })).status, 200)
     for (const id of [sid, foreignSid]) {
-      await call('flowgate_start', { title: '授权恢复验证', preset: 'fast' }, id)
-      const doc = call('flowgate_doc', { html: '<html><body>授权恢复</body></html>', scope: {
-        commands: [], files_expected_to_change: ['src/auth/session.ts'], capabilities: ['授权恢复'], out_of_scope_explicitly: [],
-        acceptance_criteria: [{ id: 'AC-1', when: '配置变化', then: '旧授权不会复活' }],
+      await call('flowgate_start', { title: '清单是唯一权限', preset: 'fast' }, id)
+      const doc = call('flowgate_doc', { html: '<html><body>清单</body></html>', scope: {
+        commands: ['npm test'], files_expected_to_change: ['src/auth/session.ts'], capabilities: ['清单放行'],
+        out_of_scope_explicitly: [],
+        acceptance_criteria: [{ id: 'AC-1', when: '清单命中', then: '放行' }],
       } }, id)
       await tick(); assert.equal((await act('doc', { decision: 'approve' }, id)).status, 200); await doc
       const dev = call('flowgate_gate', {}, id)
       await tick(); assert.equal((await act('gate', { decision: 'pass' }, id)).status, 200); await dev
       const review = call('flowgate_review', { angles: [{ id: 'correctness', name: '正确性', verdict: 'pass', findings: [] }] }, id)
       await tick(); assert.equal((await act('gate', { decision: 'pass' }, id)).status, 200); await review
-      assert.equal((await act('toggleWriteGrant', { id: 'smoke', enabled: true }, id)).status, 200)
     }
     const initial = (await state()).body
-    const activeService = currentService()
-    const activeFlow = activeService.get(sid)
-    activeService.hydrate(ws)
-    activeService.hydrate(ws + '/.')
-    const refreshed = (await state()).body
-    await post('flows', { path: ws })
-    check('首次显式授权正常生效，同服务hydrate与Hub刷新保留内存授权', () => {
-      assert.equal(activeService.get(sid), activeFlow)
-      assert.deepEqual(refreshed.writeGrants, ['smoke'])
-      assert.equal(refreshed.directions[0].writeGranted, true)
-      assert.deepEqual(activeService.get(sid).writeGrants, ['smoke'])
+    check('两个工作区都进到 S4，视图里没有任何授权字段', () => {
+      assert.equal(initial.stage, 'S4')
+      assert.equal('shellGrant' in initial, false)
+      assert.equal('writeGrants' in initial, false)
+      assert.equal('directionWriteDeclared' in initial, false)
+      for (const dir of initial.directions) {
+        assert.equal('needsWrite' in dir, false)
+        assert.equal('writeGranted' in dir, false)
+      }
     })
+    // 旧版本留在磁盘上的授权字段：冷恢复必须清洗，不能靠「上次勾过」继续放行。
     const flowFile = join(ws, '.dsh-flowgate', 'flows', initial.id + '.json')
-    const oldConfig = readFileSync(configFile, 'utf8'), oldFlow = readFileSync(flowFile, 'utf8')
-    fs.renameSync = function (from, to) {
-      if (String(to) === configFile) throw Object.assign(new Error('配置提交 EACCES'), { code: 'EACCES' })
-      return originalRename.call(this, from, to)
-    }
-    syncBuiltinESMExports()
-    const failed = await post('rules', { path: ws, stages: disabled })
-    fs.renameSync = originalRename; syncBuiltinESMExports()
-    const retained = (await state()).body
-    check('配置提交失败不修改旧配置、内存授权或磁盘授权', () => {
-      assert.equal(failed.status, 500)
-      assert.match(failed.body.error, /EACCES/)
-      assert.equal(readFileSync(configFile, 'utf8'), oldConfig)
-      assert.equal(readFileSync(flowFile, 'utf8'), oldFlow)
-      assert.deepEqual(retained.writeGrants, ['smoke'])
-      assert.equal(retained.directions[0].needsWrite, true)
-    })
-    assert.equal((await post('rules', { path: ws, stages: disabled })).status, 200)
-    const foreign = (await state(foreignSid)).body
-    check('只收敛当前工作区授权，不影响另一个cwd的既有授权', () => {
-      assert.deepEqual(JSON.parse(readFileSync(flowFile, 'utf8')).writeGrants, [])
-      assert.deepEqual(foreign.writeGrants, ['smoke'])
-      assert.equal(foreign.directions[0].needsWrite, true)
-      const foreignFile = join(other, '.dsh-flowgate', 'flows', foreign.id + '.json')
-      assert.deepEqual(JSON.parse(readFileSync(foreignFile, 'utf8')).writeGrants, ['smoke'])
-    })
-    assert.equal((await post('rules', { path: ws, stages })).status, 200)
+    const legacy = JSON.parse(readFileSync(flowFile, 'utf8'))
+    legacy.shellGrant = true
+    legacy.writeGrants = ['smoke']
+    legacy.directionWriteDeclared = ['smoke']
+    writeFileSync(flowFile, JSON.stringify(legacy))
     cx = makeHost(ws, sid, { services })
     const restored = (await state()).body
-    check('needsWrite false→true后正常持久化与冷恢复均不复活旧授权', () => {
-      assert.equal(restored.directions[0].needsWrite, true)
-      assert.deepEqual(restored.writeGrants, [])
-      assert.equal(restored.directions[0].writeGranted, false)
-      assert.deepEqual(JSON.parse(readFileSync(flowFile, 'utf8')).writeGrants, [])
+    check('旧快照里的授权字段冷恢复后被清洗', () => {
+      assert.equal(restored.stage, 'S4')
+      assert.equal('shellGrant' in restored, false)
+      assert.equal('writeGrants' in restored, false)
+      assert.equal('directionWriteDeclared' in restored, false)
+      assert.equal(JSON.parse(readFileSync(flowFile, 'utf8')).shellGrant, undefined)
     })
-    assert.equal((await act('toggleWriteGrant', { id: 'smoke', enabled: true })).status, 200)
-    assert.deepEqual((await state()).body.writeGrants, ['smoke'])
-    cx = makeHost(ws, sid, { services })
-    const coldWithValidGrant = (await state()).body
-    check('即使配置未变且磁盘完好，冷恢复也不自动继承上次测试授权', () => {
-      assert.equal(coldWithValidGrant.directions[0].needsWrite, true)
-      assert.deepEqual(coldWithValidGrant.writeGrants, [])
-      assert.deepEqual(JSON.parse(readFileSync(flowFile, 'utf8')).writeGrants, [])
-    })
-    assert.equal((await act('toggleWriteGrant', { id: 'smoke', enabled: true })).status, 200)
-    let failedFlowWrites = 0
-    fs.renameSync = function (from, to) {
-      if (String(to) === flowFile) {
-        failedFlowWrites++
-        throw Object.assign(new Error('快照提交 EACCES'), { code: 'EACCES' })
-      }
-      return originalRename.call(this, from, to)
-    }
-    syncBuiltinESMExports()
-    const readonlySaved = await post('rules', { path: ws, stages: disabled })
-    const inMemory = (await state()).body.writeGrants
-    const writableSaved = await post('rules', { path: ws, stages })
-    const staleDisk = JSON.parse(readFileSync(flowFile, 'utf8')).writeGrants
-    cx = makeHost(ws, sid, { services })
-    const afterRestart = (await state()).body
+    // 测试子代理同样只看清单：登记里根本没有权限位可传。
     const service = currentService()
-    service.registerChild(sid, 'restored-child', { allowShellWrite: true, flowId: afterRestart.id, directionId: 'smoke' })
-    const denial = service.childDenial({ name: 'ops_bash', arguments: { command: 'touch fixture-output' },
-      agent: { session: { header: { id: 'restored-child', cwd: ws } } } })
-    check('快照持续提交失败后恢复needsWrite并重启仍不得复活旧授权', () => {
-      assert.equal(readonlySaved.status, 200)
-      assert.equal(writableSaved.status, 200)
-      assert.deepEqual(inMemory, [])
-      assert.deepEqual(staleDisk, ['smoke'], '故障注入必须实际留下含旧授权的快照')
-      assert.ok(failedFlowWrites >= 2, '撤销与冷恢复期间快照提交都必须持续失败')
-      assert.deepEqual(afterRestart.writeGrants, [])
-      assert.equal(afterRestart.directions[0].needsWrite, true)
-      assert.equal(afterRestart.directions[0].writeGranted, false)
-      assert.ok(denial, '恢复后的子代理不得获得变更性shell')
+    service.registerChild(sid, 'scope-only-child', { flowId: restored.id, directionId: restored.directions[0].id })
+    const childExec = (command) => ({ name: 'ops_bash', arguments: { command },
+      agent: { session: { header: { id: 'scope-only-child', cwd: ws } } } })
+    const childIn = service.childDenial(childExec('npm test'))
+    const childOut = service.childDenial(childExec('npm publish'))
+    check('测试子代理只按 scope 清单放行，没有别的权限位', () => {
+      assert.equal(childIn, null)
+      assert.ok(childOut)
+      assert.match(String(childOut), /scope\.commands/)
     })
   } finally {
-    fs.renameSync = originalRename; syncBuiltinESMExports()
     if (previousHome === undefined) delete process.env.DSH_FLOWGATE_HOME
     else process.env.DSH_FLOWGATE_HOME = previousHome
     rmSync(root, { recursive: true, force: true })
@@ -3384,25 +3302,25 @@ for (const [kind, reason, expected] of [
     await sx.request('/api/flowgate/action', { sessionId: 'sess-s1-grant', action: 'doc', payload: { decision: 'approve' } })
     await s1Doc
     const s1Grant = await sx.request('/api/flowgate/action', { sessionId: 'sess-s1-grant', action: 'toggleShellGrant', payload: { enabled: true } })
-    // S2 直接退回 S1：rollbackTo 现在刻意不清 shellGrant，字段会带着 true 进 S1。
+    // S2 直接退回 S1：权限只来自冻结 scope 的清单，回退不该留下任何授权残留。
     const s1Back = await sx.request('/api/flowgate/action', { sessionId: 'sess-s1-grant', action: 'gate', payload: { decision: 'back', to: 'S1' } })
     const s1Shell = await sx.guard('bash', { command: 'npm run build' })
-    check('AC4 退回 S1 后命令授权仍在但变更性 shell 仍被拒', () => {
-      assert.equal(s1Grant.body.shellGrant, true)
+    check('AC4 退回 S1 后变更性 shell 仍被拒，且没有授权字段', () => {
+      assert.equal(s1Grant.status, 409, '授权开关已退场，S1 里也不该存在')
       assert.equal(s1Back.body.stage, 'S1')
-      assert.equal(s1Back.body.shellGrant, true)
+      assert.equal('shellGrant' in s1Back.body, false)
       assert.equal(s1Shell.kind, 'deny')
       assert.match(s1Shell.reason, /只允许只读 shell 命令/)
     })
 
-    // AC6 冷恢复：上一段把 shellGrant 留成 true 并落了盘，新宿主必须把它清掉。
-    // 这里用结构完好的快照，才不会像残缺快照那条一样分不清是 repairFlow 还是 hydrate 起的效。
+    // AC6 冷恢复：快照里不会有授权字段，新宿主读出来的视图也不该凭空多出来。
     const cold = makeHost(grantCwd, 'sess-s1-grant')
     const coldState = await cold.request('/api/flowgate/state?sessionId=sess-s1-grant')
-    check('AC6 结构完好的快照冷恢复后命令授权被清除', () => {
+    check('AC6 结构完好的快照冷恢复后没有授权字段', () => {
       assert.equal(coldState.body.active, true)
       assert.equal(coldState.body.stage, 'S1')
-      assert.equal(coldState.body.shellGrant, false)
+      assert.equal('shellGrant' in coldState.body, false)
+      assert.equal('writeGrants' in coldState.body, false)
     })
   } finally {
     rmSync(grantCwd, { recursive: true, force: true })
@@ -3481,12 +3399,13 @@ for (const [kind, reason, expected] of [
     const s2CmdState = await cx.request('/api/flowgate/state?sessionId=sess-scope-cmd')
     check('S2 清单内命令不需要开关就放行，清单外仍然拒', () => {
       assert.equal(s2CmdState.body.stage, 'S2')
-      // 放行完全来自 scope 清单：授权开关始终没被打开。
-      assert.equal(s2CmdState.body.shellGrant, false)
+      // 放行完全来自 scope 清单：视图里根本没有授权字段。
+      assert.equal('shellGrant' in s2CmdState.body, false)
       assert.equal(listExact.kind, 'allow', JSON.stringify(listExact))
       assert.equal(listWild.kind, 'allow', JSON.stringify(listWild))
       assert.equal(listMiss.kind, 'deny')
-      assert.match(listMiss.reason, /commands 清单/)
+      assert.match(listMiss.reason, /scope\.commands/)
+      assert.match(listMiss.reason, /退回 S1 补命令清单/)
     })
 
     await cx.guard('bash', { command: 'npm publish ' + 'a'.repeat(300) })
@@ -3522,7 +3441,6 @@ for (const [kind, reason, expected] of [
       cwd: stageCwd,
       finished: false,
       stage,
-      shellGrant: false,
       events: [],
       scope: { frozen: true, data: { in_scope: { files_expected_to_change: ['src/a.ts'], commands, capabilities: [] } } },
     })

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **权限不再由用户勾选：命令清单是唯一通道**：此前要跑构建或测试，用户得在 S2「开发变更」或 S4「测试命令」卡片里勾「允许执行构建/测试命令」，测试方向还要先「声明需要写权限」、再在 S4 逐个方向勾「授权执行变更性命令」。三处勾选全是空转：用户不知道自己要什么权限，Agent 说一句「需要授权」他就会照勾，勾完的责任却落在他身上。而 S1 批准 `scope.commands` 时，清单和验收标准是摆在一起看的——那一次才是真正有上下文的授权。
+  现在放行只有一个来源：需求文档里那份已批准的 `scope.commands`。`shellGrant`、`writeGrants`、`needsWrite`、`directionWriteDeclared` 四个字段从数据模型删除，`toggleShellGrant`、`toggleWriteGrant`、`declareDirectionWrite` 三个 hub 动作一并移除（调用会得到「未知操作」），`repairFlow` 负责清洗旧快照里的残留字段，`hydrate` 再把清洗结果写回磁盘——否则文件里一直留着 `shellGrant: true`，读的人分不清它还算不算数。冷恢复因此不再涉及任何「重新授权」。
+  清单写漏时唯一的出口是补清单，不是临时放行：`shellDenial` 拒绝时把命令原文记进 `flow.lastDeniedCommand`（截断到 300 字），视图新增 `deniedCommand`，工作台在「开发变更」「测试命令」卡片和快捷入口里显示被拒命令，并给出「退回 S1 补命令清单」按钮；它调新增的 `reopenScopeForCommands`，带着那条命令退回 S1、预填进清单草稿，用户确认后重新批准，代价是本轮评审与测试要重跑。界面把这条代价写在按钮旁边。
+  界面随之退场：`ShellGrantToggle` 换成 `CommandAccess`（只列清单原文、被拒命令与补清单入口，没有任何勾选框）；测试方向面板删掉整段写权限分支，改为一句「测试方向只决定验证什么，不决定能执行什么」；追加自定义方向表单与工作区规则 S4 组里的写权限勾选框一并删除。测试子代理的 `childDenial` 改用当前流程的 `scope.commands` 判定，`registerChild` 不再携带任何权限位。
+  测试：`test/client.test.mjs` 的写权限用例整段换成「S2 不再提供命令授权勾选框，只说明清单放行」「S4 命令入口只列 scope 清单，不给勾选」「被拒命令给出退回 S1 补清单的入口」「测试方向面板不再出现写权限声明与授权」；`test/host.test.mjs` 把授权开关的放行/撤销/跨阶段持久用例换成「清单外的构建命令被拒，没有可勾选的授权通道」「旧快照里的授权字段冷恢复后被清洗」；`test/subagents.test.mjs` 把方向级写权限例外换成「S4 子代理只看 scope 清单：清单内放行、清单外一律拒」。九套测试（provenance 20 / acceptance 30 / runtime 18 / host 310 / gatemode 10 / subagents 74 / integration 33 / client 231 / install 17）全部通过，`stamp-revisions.mjs --check` 与各模块语法检查通过。
 - **「0 个问题」却点不了通过：证据版本被环境算进快照 id**：实测一次流程在 S4 显示 15 个测试要点全通过，界面上却没有任何通过按钮，用户最后只能「放弃这次流程」。根因是三处叠加：
   一是**快照 id 把运行环境也算进了内容指纹**。`currentSnapshot` 把 `hostRevision` / `diskHostRevision` 塞进 `rules`，`captureSnapshot` 再把 `rules` 一起 digest——重载插件、重新生成模块 revision 这类与代码无关的动作都会换掉快照 id，而两份快照里 11 个文件的内容哈希一字未变。现在 `lib/provenance.js` 的快照格式升到 `version: 2`，运行环境不参与 digest；宿主可信度仍由 `runtimeState()` 经 `runtime.status` 单独报告，不参与内容比对。
   二是**提交测试时不校验 AC 证据的 `version`**。`flowgate_test` 自己算出内容快照却不回传 id，schema 只让 Agent「抄 state.snapshot.id」；抄到的旧评审快照 id（`99655dc8…`）与测试时的快照（`99ac5244…`）不一致，12 条 `pass` 被 `acceptanceLedger` 静默判成 `uncovered`。现在 `version` 改为可选：留空由工具在提交时刻盖当前快照 id；显式写了别的版本则原样保留，绝不替它补盖——把「对着旧代码测的」改写成「对着新代码测的」是伪造证据，照实记旧版本，账本据此判未覆盖并给出原因。
