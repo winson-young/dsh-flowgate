@@ -1811,6 +1811,73 @@ const HubPanelIcon = componentOf('sidebar.panellist')
   })
 }
 
+// 宿主拒绝批准时会把重算出的缺口写回状态：界面必须补拉一次，
+// 否则用户反复点「批准」只看到红字，那个确认按钮永远不出现。
+{
+  posted = []
+  const pendingScope = {
+    files_expected_to_change: ['test/host.test.mjs'],
+    commands: ['node test/host.test.mjs'],
+    capabilities: ['补集成测试'],
+    out_of_scope_explicitly: [],
+    acceptance_criteria: [{
+      id: 'AC-1', when: '跨模块联动', then: '夹具一起跑通',
+      method: 'integration', procedure: '先改 test/fixtures/session.ts',
+    }],
+  }
+  const staleDoc = {
+    html: '<html><body>需求文档</body></html>',
+    pending: true,
+    pendingScope,
+    droppedScopeEntries: [],
+    pendingScopeRisks: [],
+  }
+  const freshDoc = {
+    ...staleDoc,
+    pendingScopeRisks: [{
+      code: 'procedure-file-outside-scope',
+      acs: ['AC-1'],
+      message: '这些验收标准的验证步骤点名了 scope 之外的文件：AC-1 → test/fixtures/session.ts。开发阶段改不了它们，评审也会把相关发现判成范围外。',
+    }],
+  }
+  currentView = baseView('S1', { doc: staleDoc, waiting: false, waitingKind: null })
+  const renderer = await render(FlowDetail, {})
+  const originalFetch = globalThis.fetch
+  let stateCalls = 0
+  globalThis.fetch = async (url, init) => {
+    const target = String(url)
+    if (target.includes('/action')) {
+      posted.push(JSON.parse(init.body))
+      return response({ error: '这份 scope 有 1 条验收方案缺口，不能直接冻结：…或在确认区明确接受这些缺口后重试（acceptScopeRisks: true）。' }, 409)
+    }
+    if (target.includes('/state')) {
+      stateCalls += 1
+      currentView = baseView('S1', { doc: freshDoc, waiting: false, waitingKind: null })
+      return response(currentView)
+    }
+    return originalFetch(url, init)
+  }
+  try {
+    await check('被拒之后自动补拉状态，按钮改口提示要确认缺口', async () => {
+      await click(buttonByText(renderer.toJSON(), '批准并冻结 scope'))
+      await settle()
+      assert.equal(posted.length, 1)
+      assert.ok(stateCalls >= 1, '宿主拒绝后没有补拉状态：界面还拿着旧的空缺口清单')
+      assert.ok(hasButton(renderer.toJSON(), '批准并冻结 scope（需确认缺口）'))
+    })
+    await check('补拉之后点一次就能展开确认区', async () => {
+      await click(buttonByText(renderer.toJSON(), '批准并冻结 scope（需确认缺口）'))
+      const confirm = nodeByLabel(renderer.toJSON(), '验收方案缺口确认')
+      assert.ok(confirm, '补拉之后仍然没有确认区')
+      assert.ok(flat(confirm).includes('test/fixtures/session.ts'))
+      assert.equal(posted.length, 1, '展开确认区不该再发请求')
+    })
+  } finally {
+    globalThis.fetch = originalFetch
+    await act(async () => { renderer.unmount() })
+  }
+}
+
 // 冻结后缺口要一直可见：结束之后也要能追溯当时接受了什么。用户自己补的原因有就显示，没有不占位。
 {
   currentView = baseView('S2', {

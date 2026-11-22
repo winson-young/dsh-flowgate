@@ -3674,6 +3674,23 @@ for (const [kind, reason, expected] of [
       assert.match(String(riskNoAccept.body?.error ?? riskNoAccept.body), /acceptScopeRisks/)
     })
 
+    const rejectedState = await rx.request('/api/flowgate/state?sessionId=sess-scope-risk')
+    check('被拒之后界面能拿到缺口清单：否则那个确认按钮永远不会出现', () => {
+      const risks = rejectedState.body.doc.pendingScopeRisks
+      assert.ok(Array.isArray(risks) && risks.length === 1, JSON.stringify(risks))
+      assert.equal(risks[0].code, 'procedure-file-outside-scope')
+      assert.equal(rejectedState.body.doc.pending, true)
+    })
+
+    await act('reopenScopeForCommands', { command: 'npm test' })
+    const reopenedState = await rx.request('/api/flowgate/state?sessionId=sess-scope-risk')
+    check('退回 S1 补命令后缺口按新清单重算，不会凭空清空', () => {
+      const risks = reopenedState.body.doc.pendingScopeRisks
+      assert.ok(Array.isArray(risks) && risks.length === 1, JSON.stringify(risks))
+      assert.equal(risks[0].code, 'procedure-file-outside-scope')
+      assert.ok(reopenedState.body.doc.pendingScope.commands.includes('npm test'))
+    })
+
     const riskOk = await act('doc', { decision: 'approve', acceptScopeRisks: true })
     await riskDoc
     check('明确接受就能冻结，不要求用户写说明；缺口随冻结凭据落盘', () => {
@@ -3741,6 +3758,21 @@ for (const [kind, reason, expected] of [
       const noted = events.filter((item) => item.type === 'scope.risks_accepted').pop()
       assert.equal(noted.detail.note, '跨模块夹具在下一轮补，本轮先用主机测试兜底')
     })
+
+    // 缺口补掉之后再退回补命令，重算结果应当仍是「没有缺口」：
+    // 重算不是「一律报缺口」，它只是让结论跟着当前清单走。
+    await act('gate', { decision: 'back', to: 'S1' })
+    const cleanDoc = rx.tool('flowgate_doc', { html: riskHtml, scope: riskScope(['test/fixtures/session.ts']) })
+    await tick()
+    await act('reopenScopeForCommands', { command: 'npm run build' })
+    const cleanState = await rx.request('/api/flowgate/state?sessionId=sess-scope-risk')
+    check('缺口补掉后补命令，重算不会凭空造出缺口', () => {
+      assert.deepEqual(cleanState.body.doc.pendingScopeRisks, [])
+      assert.ok(cleanState.body.doc.pendingScope.commands.includes('npm run build'))
+    })
+    // 文档还挂着门禁，收尾：此时没有缺口，直接放行。
+    await act('doc', { decision: 'approve' })
+    await cleanDoc
   } finally {
     rmSync(riskCwd, { recursive: true, force: true })
   }
