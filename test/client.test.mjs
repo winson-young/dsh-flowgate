@@ -693,7 +693,7 @@ await check('阶段提示：一行说清第几步、在做什么、已用多久'
   assert.ok(text.includes('S2 开发'), '应写明第几步与阶段名：' + text)
   assert.ok(text.includes('正在编辑 lib/client.js'), '应显示当前动作：' + text)
   assert.ok(text.includes('已用 1 分 36 秒'), '应显示已用时：' + text)
-  assert.deepEqual(buttons(tree).map((node) => flat(node)), ['完成开发', '跳过门禁，直接评审', '回到需求分析调整 scope', '放弃这次流程'], 'S2 阶段信息旁给本阶段的流转按钮')
+  assert.deepEqual(buttons(tree).map((node) => flat(node)), ['完成开发', '查看 scope 问题', '放弃这次流程'], 'S2 阶段信息旁给本阶段的流转按钮')
 })
 
 await check('阶段提示：宿主真实挂载形态（InputZone 的 session.sessionId）也渲染', async () => {
@@ -780,9 +780,11 @@ await check('阶段提示：dock 给出本阶段的流转按钮，四个阶段�
   const labels = (tree) => buttons(nodeByClass(tree, 'fg-hint-actions') || tree).map((node) => flat(node))
   const cases = [
     ['S1', { doc: { html: '<p>需求</p>', pending: true } }, ['需求文档', '批准并冻结 scope', '修改需求', '跳过评审，直接开发', '放弃这次流程']],
-    ['S2', {}, ['完成开发', '跳过门禁，直接评审', '回到需求分析调整 scope', '放弃这次流程']],
+    // S2 不再给「跳过门禁，直接评审」：服务端对 S2 不做门禁校验，两个按钮只有阶段标记不同。
+    ['S2', {}, ['完成开发', '查看 scope 问题', '放弃这次流程']],
     ['S3', {}, ['通过评审，进入测试', '退回开发修复', '回到需求分析调整 scope', '跳过评审，直接测试', '放弃这次流程']],
-    ['S4', { acceptance: { items: [{ id: 'AC-1', status: 'pass', evidence: '日志' }], counts: { total: 1, pass: 1, fail: 0, uncovered: 0, pending: 0 } } }, ['结束流程', '退回开发修复', '跳过测试门禁', '放弃这次流程']],
+    // S4 无缺口时只留结束流程：没有可修的东西，跳过门禁的结果还更差。
+    ['S4', { acceptance: { items: [{ id: 'AC-1', status: 'pass', evidence: '日志' }], counts: { total: 1, pass: 1, fail: 0, uncovered: 0, pending: 0 } } }, ['结束流程', '放弃这次流程']],
   ]
   const seen = []
   for (const [stage, patch, expected] of cases) {
@@ -809,12 +811,12 @@ await check('阶段提示：流转按钮的置灰与门禁就绪同源', async (
   // 宿主没在等、门禁产物也还没交：点了不会发生任何事，跟工作台一样置灰。
   currentView = baseView('S2')
   let tree = (await render(stageHint, {})).toJSON()
-  for (const label of ['完成开发', '跳过门禁，直接评审', '回到需求分析调整 scope']) {
+  for (const label of ['完成开发']) {
     assert.equal(buttonByText(tree, label).props.disabled, true, label + ' 在门禁就绪前应置灰')
   }
   assert.equal(buttonByText(tree, '放弃这次流程').props.disabled, false, '放弃不受门禁限制')
-  // 样式与工作台同源：S2 的「回到需求分析调整 scope」在工作台是危险色，主按钮是主色。
-  assert.ok(buttonByText(tree, '回到需求分析调整 scope').props.className.includes('fg-hint-btn-danger'), '回 scope 要与工作台一样用危险色')
+  // 「查看 scope 问题」只是摊开原因，不推进阶段，门禁没就绪也该能点。
+  assert.equal(buttonByText(tree, '查看 scope 问题').props.disabled, false, '查看类入口不受门禁限制')
   assert.ok(buttonByText(tree, '完成开发').props.className.includes('fg-hint-btn-primary'), '主按钮要与工作台一样用主色')
   // 宿主正在等：就绪。
   currentView = baseView('S2', { waiting: true, waitingKind: 'gate' })
@@ -843,12 +845,14 @@ await check('阶段提示：放弃要两次确认，S4 带缺口时不提供一�
   // 有未通过项时快捷入口不再给一键结束：这一排按钮摆不下缺口清单，
   // 也就没法让人「看清了再接受」，所以例外结项只留在出口门禁里走两步确认。
   const hintTree = renderer.toJSON()
-  assert.equal(hasButton(hintTree, '结束流程'), false, '快捷入口不能绕开例外确认')
+  const hintLabels = buttons(hintTree).map((node) => flat(node))
+  assert.equal(hintLabels.includes('结束流程'), false, '快捷入口不能绕开例外确认')
+  assert.ok(hintLabels.includes('结束流程（需确认）'), '有缺口时先摊开缺口，再点第二次确认')
   assert.ok(buttonByText(hintTree, '退回开发修复'), '带缺口时仍能退回修复')
   // 两本账并排写在一行：只报测试要点会让人把「0 失败」读成验收通过。
   assert.match(flat(hintTree), /验收标准：通过 0 · 未通过 1 · 未覆盖 0 · 待验证 0（共 1 条）/, '快捷入口要说清 AC 账本')
   assert.match(flat(hintTree), /测试要点：通过 0 · 失败 0 · 未覆盖 0 · 环境受限 0（共 0 个）/, '快捷入口要并排报测试要点')
-  assert.match(flat(hintTree), /带缺口结束要在「出口门禁」里看清缺口并确认接受/)
+  assert.match(flat(hintTree), /带缺口结束要先看清缺口，再点「结束流程（需确认）」/)
   assert.equal(posted.length, 0, '摆说明本身不投递任何请求')
   // 放弃：两次确认后才真的投递 cancel。
   await click(buttonByText(renderer.toJSON(), '放弃这次流程'))
@@ -878,7 +882,7 @@ await check('阶段提示：投递失败要留下可诊断的错误行，认不�
   }
   // stage 认不出来时工作台落到最后一档，dock 给出同一组按钮。
   currentView = baseView('S9', { waiting: true, waitingKind: 'gate' })
-  assert.deepEqual(buttons(nodeByClass((await render(stageHint, {})).toJSON(), 'fg-hint-actions')).map((node) => flat(node)), ['结束流程', '退回开发修复', '跳过测试门禁', '放弃这次流程'])
+  assert.deepEqual(buttons(nodeByClass((await render(stageHint, {})).toJSON(), 'fg-hint-actions')).map((node) => flat(node)), ['结束流程', '放弃这次流程'])
 })
 
 await check('阶段提示：各阶段左侧内容保持两行，右侧独立承载按钮', async () => {
@@ -4350,17 +4354,24 @@ await check('S4全部通过时沿用原按钮且不发送例外许可', async ()
   assert.equal(posted.find((item) => item.action === 'gate').payload.acceptUncovered, undefined)
 })
 
-await check('退回开发附可选说明，留空时交由宿主自动修复清单', async () => {
-  for (const note of ['', '修复边界并补验证']) {
-    currentView = baseView('S3', { waiting: true })
+await check('退回开发不再要求用户写说明，原因由宿主按未通过项生成', async () => {
+  // 退回原因服务端已经知道（remediationList 按 AC 列出未通过项）：
+  // 再让用户重述一遍，只是把系统已知的事变成一道必填题。
+  // S3：任何情况都能退回修复；S4 只有带缺口时才有可修的东西。
+  const cases = [
+    ['S3', {}],
+    ['S4', { acceptance: { items: [{ id: 'AC-1', status: 'fail', reason: '返回 500' }], counts: { total: 1, pass: 0, fail: 1, uncovered: 0, pending: 0 } } }],
+  ]
+  for (const [stage, patch] of cases) {
+    currentView = baseView(stage, { waiting: true, ...patch })
     posted = []
     const renderer = await render(FlowDetail, {})
-    const field = findTags(renderer.toJSON(), 'textarea').find((node) => node.props['aria-label'] === '退回说明（可选）')
-    await changeValue(field, note)
+    const fields = findTags(renderer.toJSON(), 'textarea').filter((node) => node.props['aria-label'] === '退回说明（可选）')
+    assert.equal(fields.length, 0, stage + ' 不该再有退回说明输入框')
     await click(buttonByText(renderer.toJSON(), '退回开发修复'))
     const payload = posted.find((item) => item.action === 'gate').payload
     assert.equal(payload.to, 'S2')
-    assert.equal(payload.note, note || undefined)
+    assert.equal(payload.note, undefined, '不再附带用户手写的退回说明')
   }
 })
 

@@ -6,6 +6,37 @@
 
 历史记录中的 `by: 'subagents'` 仅表明调用了子代理聚合入口；聚合报告通过、`blocking: 0` 或流程走完，均不能证明真实子代理成功执行并返回有效报告。下文原有结论保留，其证据范围受此限定。
 
+## 快捷入口与工作台对齐，S1 缺口不再交给用户接受（2026-11-23）
+
+需求：用户原文（m00001）「点【批准并冻结 scope】，下方提示我这份 scope 有 2 条验收方案缺口，除此以外毫无动静，我是不是没法进行下去了？」。追问答疑后确认（m00154）「我只是希望所有在工作台能做的，快捷也能做，至于看不看缺口是用户的事，快捷入口有能看的地方不就行了」，并逐阶段提出（m00178）：S1 有缺口就该当场退回补齐、修改需求要能填意见；S2 的「跳过门禁直接评审」看不懂、「回到需求分析调整 scope」应改成就地展开的「查看 scope 问题」并与「退回 S1 补命令清单」合并说明；S3 的「退回说明」没意义，原因应由系统按未通过项自带；S4 无缺口时不该还有「退回开发修复」与「跳过测试门禁」。「查看 scope 问题」这个名字由用户在 m00277 定下，同一条消息授权直接改代码。
+
+方案：
+- **S1 缺口在提交时退回，不摆到批准按钮前**：`flowgate_doc` 的 `scopeReadiness` 原先只拒 `blockers`，`risks` 写进 `pendingScopeRisks` 后照常挂门禁，于是缺口变成「用户点接受」的事。现在 `risks` 也当场退回，文案要求 Agent 自己补 scope。同一批缺口按签名（缺口 `code` 去重排序拼接）计数，连续三次 `cancelFlow` 结束流程，避免 Agent 反复重交同一份 scope 让用户干等。计数与缺口原文存 `flow.scopeRiskStrikes` / `flow.scopeRiskLast`，视图为 `doc.scopeRiskStrikes` / `doc.scopeRiskLast`，提交成功或从冻结态退回补命令清单时一起归零。
+- **`decideDoc` 的 `acceptScopeRisks` 路径保留但不再走**：冻结前重算与落盘（`scope.data.scope_risks`、`scope.risks_accepted` 事件）原样保留，供冷恢复或旧客户端调用。
+- **S2 删「跳过门禁直接评审」**：`gateValidation` 对 S2 不校验任何产物，`pass` 与 `skip` 只差一个阶段标记，留着只会让人以为跳过省掉了什么。
+- **S2 的「回到需求分析调整 scope」收进「查看 scope 问题」**：快捷条与工作台都改成一个按钮，展开后按原因给两个出口——「只补这条命令」（`reopenScopeForCommands`，保留文档、追加命令、按新清单重算缺口）与「重做文档（回 S1）」（会清掉现有文档）。命令被拒的提示条也并进这个框。
+- **S3 / S4 删「退回说明」**：`rollbackTo` 的 `remediationList` 已按未通过项生成修复清单，让用户再打一段说明既非必填也无处消费。`GatePanel` 的 `returnNote` 状态与 `payload.note` 拼接一并删除。
+- **S4 按钮收窄**：无缺口时只留「结束流程」；有缺口时给「结束流程（需确认）」与「退回开发修复」，前者就地摊开缺口清单再确认。「跳过测试门禁」整条删除——它照样要过缺口校验，结果还比「结束流程」更差（`closure.kind = 'skipped'`）。
+- **快捷条补齐工作台的能力**：`HintActions` 补上「修改需求」的意见输入、缺口确认区、scope 问题框、S4 账本行与缺口清单，就地展开，不再因为「一排按钮摆不下」把能力留在工作台里。
+
+改动范围：`lib/index.js`（`SCOPE_RISK_STRIKE_LIMIT`、`createFlow` 两个字段、`repairFlow` 白名单、`flowgate_doc` 提交侧退回与计数、视图 `doc.scopeRiskLast` / `doc.scopeRiskStrikes`、工具提示词、`reopenScopeForCommands` 重置计数）、`lib/client.js`（`SCOPE_RISK_STRIKE_MAX`、`DocGate` 的退回说明区、`GatePanel` 删 `returnNote` 与 S2 跳过键与 S4 跳过键、`HintActions` 四个就地展开面板与按钮分流、`.fg-quick-panel` 样式）、`test/client.test.mjs`、`test/host.test.mjs`、`test/gatemode.test.mjs`、`test/integration.test.mjs`、`README.md`、`docs/development.md`、`CHANGELOG.md`、本文件。
+
+| 验收项 | 状态 | 证据与限制 |
+| :--- | :--- | :--- |
+| AC-1 提交带缺口 scope 被退回，且不进待批准 | 通过 | `test/host.test.mjs` 缺口组：首次提交抛 `/验收方案缺口/` 与 `/提交被退回（第 1\/3 次）/`，`state.doc.pending === false`、`pendingScopeRisks` 为空、`scopeRiskStrikes.count === 1`、`scopeRiskLast[0].code === 'procedure-file-outside-scope'` |
+| AC-2 同一批缺口连续三次自动结束流程 | 通过 | 新增 `sess-scope-strike` 组：三次提交分别匹配 `/第 1\/3 次/`、`/第 2\/3 次/`、`/连续 3 次没能补齐，这条流程已自动结束/`，随后 `state.finished === true`、`cancelReason` 含 `/scope 缺口/`、两个字段归零 |
+| AC-3 补齐后直接进入门禁，不残留缺口 | 通过 | 同组：把缺的文件补进 scope 后 `pendingScopeRisks` 空、`scopeRiskStrikes === null`、`approve` 返回 200 且阶段进 S2、`scope.data.scope_risks` 为 `undefined` |
+| AC-4 S2 不再有「跳过门禁直接评审」 | 通过 | `test/client.test.mjs` 的 S2 按钮集合断言为 `['完成开发','查看 scope 问题','放弃这次流程']`；`test/gatemode.test.mjs` 与 `test/host.test.mjs` 中依赖该按钮的用例已改写 |
+| AC-5 「查看 scope 问题」就地展开两个出口 | 通过 | `test/client.test.mjs` 断言「查看 scope 问题」不随门禁就绪置灰，展开后含「只补这条命令」与「重做文档（回 S1）」；命令被拒场景由「被拒命令给出退回 S1 补清单的入口」覆盖 |
+| AC-6 S3 / S4 不再要求用户写退回说明 | 通过 | 「退回开发不再要求用户写说明，原因由宿主按未通过项生成」遍历 S3 与带失败 AC 的 S4，断言没有「退回说明（可选）」文本框且 `payload.note === undefined` |
+| AC-7 S4 无缺口只留「结束流程」，有缺口给确认键 | 通过 | 同文件断言 S4 无缺口时为 `['结束流程','放弃这次流程']`，有缺口时出现「结束流程（需确认）」，文案为「带缺口结束要先看清缺口，再点「结束流程（需确认）」」 |
+| AC-8 快捷条能就地确认缺口并接受 | 通过 | `HintActions` 的缺口确认区提交 `acceptUncovered: true`；`test/client.test.mjs` 的 S1 缺口组断言确认按钮可用、区内无 `textarea`、`acceptScopeRisks` 只在 `decideDoc` 路径出现 |
+| AC-9 无回归 | 通过 | 九套测试 758 项全通过（内容快照 20、验收账本 35、运行版本 18、宿主 318、门禁模式 10、子代理 74、集成 33、客户端 233、安装 17）；`node scripts/stamp-revisions.mjs --check` 输出 `Module revisions verified (7 modules).`；七个模块 `node --check` 通过 |
+
+### 真实视觉未覆盖
+
+本轮没有已认证的桌面端接入与真实页面 CDP，快捷条的就地展开面板（修改意见、缺口清单、scope 问题框、S4 账本行）只在组件树层面核对文案、禁用态与提交载荷，未在真实工作台里加载测量宽度与折行。
+
 ## 权限勾选退场：命令清单是唯一通道（2026-11-22）
 
 需求：用户原文（m00863）「我记得我说过不要让用户来勾选权限，用户不懂要什么权限，开发过程提示要勾选用户也会直接勾选，所以这个是不是有必要换种方式」。追问答疑后确认（m00883、m00906 后的选择）：照做，清单命中就放行、勾选全部退场；清单写漏时不给「临时放行」，唯一出口是「退回 S1 补命令清单」并预填被拒命令；测试方向的「写权限」概念整个删掉。

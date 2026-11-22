@@ -3754,79 +3754,39 @@ for (const [kind, reason, expected] of [
         verification: { method: 'integration', procedure: '先改 test/fixtures/session.ts，再运行集成用例' },
       }],
     })
-    const riskDoc = rx.tool('flowgate_doc', { html: riskHtml, scope: riskScope() })
-    await tick()
-    const riskState = await rx.request('/api/flowgate/state?sessionId=sess-scope-risk')
-    // 注意：doc 工具调用要等门禁决策才会 settle，这里先读视图，批准后再 await。
-    check('提交时就体检出验收方案缺口，并随待批准 scope 一起展示', () => {
-      const risks = riskState.body.doc.pendingScopeRisks
-      assert.ok(Array.isArray(risks) && risks.length === 1, JSON.stringify(risks))
-      assert.equal(risks[0].code, 'procedure-file-outside-scope')
-      assert.deepEqual(risks[0].acs, ['AC-1'])
-      assert.match(risks[0].message, /test\/fixtures\/session\.ts/)
+    // 带缺口的提交一定会抛错：把错误文案当返回值取出来，用例才好断言它说了什么。
+    const rejected = async (scope) => {
+      try {
+        await rx.tool('flowgate_doc', { html: riskHtml, scope })
+      } catch (error) {
+        return String(error?.message ?? error)
+      }
+      throw new Error('这份 scope 有缺口，本应被退回，却提交成功了')
+    }
+
+    const firstError = await rejected(riskScope())
+    const firstState = await rx.request('/api/flowgate/state?sessionId=sess-scope-risk')
+    check('提交时就体检出验收方案缺口，直接退回，不摆到批准按钮前', () => {
+      assert.match(firstError, /验收方案缺口/)
+      assert.match(firstError, /提交被退回（第 1\/3 次）/)
+      assert.match(firstError, /test\/fixtures\/session\.ts/)
+      assert.match(firstError, /不要让用户来接受这些缺口/)
+      assert.equal(firstState.body.doc.pending, false, '带缺口的草稿不进待批准状态')
+      assert.deepEqual(firstState.body.doc.pendingScopeRisks, [])
+      assert.equal(firstState.body.doc.scopeRiskStrikes.count, 1)
+      assert.equal(firstState.body.doc.scopeRiskLast[0].code, 'procedure-file-outside-scope')
+      assert.deepEqual(firstState.body.doc.scopeRiskLast[0].acs, ['AC-1'])
     })
 
-    const riskNoAccept = await act('doc', { decision: 'approve' })
-    check('有缺口时不能一键批准，必须先显式接受', () => {
-      assert.equal(riskNoAccept.status, 409)
-      assert.match(String(riskNoAccept.body?.error ?? riskNoAccept.body), /验收方案缺口/)
-      assert.match(String(riskNoAccept.body?.error ?? riskNoAccept.body), /acceptScopeRisks/)
+    const secondError = await rejected(riskScope())
+    const secondState = await rx.request('/api/flowgate/state?sessionId=sess-scope-risk')
+    check('同一批缺口再交一次，计数累加并预告下一次就结束', () => {
+      assert.match(secondError, /第 2\/3 次/)
+      assert.match(secondError, /同一批缺口再出现一次，这条流程会被自动结束/)
+      assert.equal(secondState.body.doc.scopeRiskStrikes.count, 2)
     })
 
-    const rejectedState = await rx.request('/api/flowgate/state?sessionId=sess-scope-risk')
-    check('被拒之后界面能拿到缺口清单：否则那个确认按钮永远不会出现', () => {
-      const risks = rejectedState.body.doc.pendingScopeRisks
-      assert.ok(Array.isArray(risks) && risks.length === 1, JSON.stringify(risks))
-      assert.equal(risks[0].code, 'procedure-file-outside-scope')
-      assert.equal(rejectedState.body.doc.pending, true)
-    })
-
-    await act('reopenScopeForCommands', { command: 'npm test' })
-    const reopenedState = await rx.request('/api/flowgate/state?sessionId=sess-scope-risk')
-    check('退回 S1 补命令后缺口按新清单重算，不会凭空清空', () => {
-      const risks = reopenedState.body.doc.pendingScopeRisks
-      assert.ok(Array.isArray(risks) && risks.length === 1, JSON.stringify(risks))
-      assert.equal(risks[0].code, 'procedure-file-outside-scope')
-      assert.ok(reopenedState.body.doc.pendingScope.commands.includes('npm test'))
-    })
-
-    const riskOk = await act('doc', { decision: 'approve', acceptScopeRisks: true })
-    await riskDoc
-    check('明确接受就能冻结，不要求用户写说明；缺口随冻结凭据落盘', () => {
-      assert.equal(riskOk.status, 200)
-      assert.equal(riskOk.body.stage, 'S2')
-      const accepted = riskOk.body.scope.data.scope_risks
-      assert.equal(accepted.accepted, true)
-      // 没写原因时不塞一个空字段：缺口清单与计数才是事后能核的东西。
-      assert.equal(accepted.note, undefined)
-      assert.deepEqual(accepted.risks.map((item) => item.code), ['procedure-file-outside-scope'])
-      assert.equal(riskOk.body.scopeRisksAccepted.accepted, true)
-    })
-
-    const riskEvents = readFileSync(join(riskCwd, '.dsh-flowgate', 'flows.jsonl'), 'utf8')
-      .split('\n')
-      .filter(Boolean)
-      .map((line) => JSON.parse(line))
-    check('缺口接受单独留痕：事件里能追溯接受了哪些缺口', () => {
-      const event = riskEvents.find((item) => item.type === 'scope.risks_accepted')
-      assert.ok(event, '缺少 scope.risks_accepted 事件')
-      assert.deepEqual(event.detail.codes, ['procedure-file-outside-scope'])
-      assert.deepEqual(event.detail.acs, ['AC-1'])
-      assert.equal(event.detail.decision, 'approve')
-      assert.equal(event.detail.note, undefined, '没写原因就不留空字段')
-    })
-
-    const riskStatus = await rx.tool('flowgate_status', {})
-    check('状态摘要把缺口念给 Agent，避免它当成已经通过', () => {
-      const summary = String(riskStatus?.summary ?? riskStatus?.content?.[0]?.text ?? JSON.stringify(riskStatus))
-      assert.match(summary, /验收方案缺口（用户已明确接受 1 条）/)
-      assert.match(summary, /test\/fixtures\/session\.ts/)
-      assert.match(summary, /S4 仍严格按每条验收标准声明的方法核验证据/)
-      assert.ok(!summary.includes('接受原因：'), '没写原因时摘要不该摆一个「接受原因」空位')
-    })
-
-    // 补全 scope 后应能正常推进：退回 S1 重新提交，把夹具补进白名单。
-    await act('gate', { decision: 'back', to: 'S1' })
+    // 补全 scope 后应能正常推进：把夹具补进白名单，缺口消失。
     const fixedDoc = rx.tool('flowgate_doc', { html: riskHtml, scope: riskScope(['test/fixtures/session.ts']) })
     await tick()
     const fixedState = await rx.request('/api/flowgate/state?sessionId=sess-scope-risk')
@@ -3834,46 +3794,70 @@ for (const [kind, reason, expected] of [
     await fixedDoc
     check('补全 scope 后缺口消失，不需要接受例外就能冻结', () => {
       assert.deepEqual(fixedState.body.doc.pendingScopeRisks, [])
+      assert.deepEqual(fixedState.body.doc.scopeRiskLast, [], '补齐后不再留着上一轮的缺口')
+      assert.equal(fixedState.body.doc.scopeRiskStrikes, null)
       assert.equal(fixedOk.status, 200)
       assert.equal(fixedOk.body.stage, 'S2')
       assert.equal(fixedOk.body.scope.data.scope_risks, undefined)
     })
 
-    // 原因虽然不再必填，用户主动写了仍要留下：这是事后唯一能解释「当时为什么算了」的东西。
-    await act('gate', { decision: 'back', to: 'S1' })
-    const notedDoc = rx.tool('flowgate_doc', { html: riskHtml, scope: riskScope() })
-    await tick()
-    const notedOk = await act('doc', {
-      decision: 'approve',
-      acceptScopeRisks: true,
-      scopeRiskNote: '跨模块夹具在下一轮补，本轮先用主机测试兜底',
-    })
-    await notedDoc
-    check('用户主动写的接受原因仍会随缺口一起落盘', () => {
-      assert.equal(notedOk.status, 200)
-      assert.equal(notedOk.body.scope.data.scope_risks.note, '跨模块夹具在下一轮补，本轮先用主机测试兜底')
-      const events = readFileSync(join(riskCwd, '.dsh-flowgate', 'flows.jsonl'), 'utf8')
-        .split('\n').filter(Boolean).map((line) => JSON.parse(line))
-      const noted = events.filter((item) => item.type === 'scope.risks_accepted').pop()
-      assert.equal(noted.detail.note, '跨模块夹具在下一轮补，本轮先用主机测试兜底')
-    })
-
     // 缺口补掉之后再退回补命令，重算结果应当仍是「没有缺口」：
     // 重算不是「一律报缺口」，它只是让结论跟着当前清单走。
-    await act('gate', { decision: 'back', to: 'S1' })
-    const cleanDoc = rx.tool('flowgate_doc', { html: riskHtml, scope: riskScope(['test/fixtures/session.ts']) })
-    await tick()
-    await act('reopenScopeForCommands', { command: 'npm run build' })
+    await act('reopenScopeForCommands', { command: 'npm test' })
     const cleanState = await rx.request('/api/flowgate/state?sessionId=sess-scope-risk')
     check('缺口补掉后补命令，重算不会凭空造出缺口', () => {
       assert.deepEqual(cleanState.body.doc.pendingScopeRisks, [])
-      assert.ok(cleanState.body.doc.pendingScope.commands.includes('npm run build'))
+      assert.ok(cleanState.body.doc.pendingScope.commands.includes('npm test'))
     })
-    // 文档还挂着门禁，收尾：此时没有缺口，直接放行。
+    // 退回 S1 后文档还挂着门禁，收尾：此时没有缺口，直接放行。
     await act('doc', { decision: 'approve' })
-    await cleanDoc
   } finally {
     rmSync(riskCwd, { recursive: true, force: true })
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 同一批缺口连交三次：不是 Agent 不努力，是这条路走不通。
+// 让它结束，比让同一份 scope 在人和 Agent 之间再抛三个来回更诚实。
+// ---------------------------------------------------------------------------
+{
+  const strikeCwd = mkdtempSync(join(tmpdir(), 'flowgate-scope-strike-'))
+  try {
+    const sx = makeHost(strikeCwd, 'sess-scope-strike')
+    await sx.tool('flowgate_start', { title: '缺口三振', preset: 'fast' })
+    const strikeScope = {
+      files_expected_to_change: ['test/host.test.mjs'],
+      commands: ['node test/host.test.mjs'],
+      capabilities: ['补集成测试'],
+      out_of_scope_explicitly: [],
+      acceptance_criteria: [{
+        id: 'AC-1',
+        when: '跨模块联动',
+        then: '夹具一起跑通',
+        verification: { method: 'integration', procedure: '先改 test/fixtures/session.ts，再运行集成用例' },
+      }],
+    }
+    const messages = []
+    for (let round = 0; round < 3; round += 1) {
+      try {
+        await sx.tool('flowgate_doc', { html: '<html><body><p>缺口</p></body></html>', scope: strikeScope })
+        messages.push('')
+      } catch (error) {
+        messages.push(String(error?.message ?? error))
+      }
+    }
+    const strikeState = await sx.request('/api/flowgate/state?sessionId=sess-scope-strike')
+    check('同一批缺口连交三次，流程自动结束并说清原因', () => {
+      assert.match(messages[0], /第 1\/3 次/)
+      assert.match(messages[1], /第 2\/3 次/)
+      assert.match(messages[2], /连续 3 次没能补齐，这条流程已自动结束/)
+      assert.equal(strikeState.body.finished, true)
+      assert.match(String(strikeState.body.cancelReason ?? ''), /scope 缺口/)
+      assert.deepEqual(strikeState.body.doc.scopeRiskLast, [], '结束的流程不再留待办缺口')
+      assert.equal(strikeState.body.doc.scopeRiskStrikes, null)
+    })
+  } finally {
+    rmSync(strikeCwd, { recursive: true, force: true })
   }
 }
 

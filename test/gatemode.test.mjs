@@ -167,21 +167,25 @@ await check('自动通过模式下 S1 体检干净就直接冻结，不等用户
   assert.equal(state.gateBlockers, null)
 })
 
-await check('自动通过模式下 S1 有缺口就停下并说明原因', async () => {
+await check('自动通过模式下 S1 有缺口就直接退回，不摆到批准按钮前', async () => {
   const host = makeHost(freshCwd(), 'sess-auto-s1-gap')
   await host.tool('flowgate_start', { brief: '加一个功能', preset: 'fast' })
-  const pending = host.tool('flowgate_doc', { html: '<p>需求</p>', scope: cleanScope({ commands: [] }) })
-  await tick()
+  // 缺口在提交这一步就退回给 Agent：自动模式只是少了「等人点确认」，
+  // 不会把一份体检不过的 scope 端到批准按钮前。
+  await assert.rejects(
+    () => host.tool('flowgate_doc', { html: '<p>需求</p>', scope: cleanScope({ commands: [] }) }),
+    /提交被退回（第 1\/3 次）/,
+  )
   const state = await host.state()
   assert.equal(state.stage, 'S1')
   assert.equal(state.gateMode, 'auto')
-  assert.ok(Array.isArray(state.gateBlockers?.items) && state.gateBlockers.items.length > 0, '要给出没自动过的原因')
-  assert.match(state.gateBlockers.items.join('|'), /命令|测试/)
-  assert.equal(state.doc.pending, true)
-  // 用户看清缺口后显式接受，仍能冻结（自动模式不改变「缺口必须显式接受」这条）。
-  const approved = await host.act('doc', { decision: 'approve', acceptScopeRisks: true })
-  assert.equal(approved.status, 200, JSON.stringify(approved.body))
-  assert.equal((await pending).frozen, true)
+  assert.equal(state.doc.pending, false, '带缺口的草稿不进待批准状态')
+  assert.match(state.doc.scopeRiskLast.map((item) => item.message).join('|'), /测试命令/)
+  assert.equal(state.doc.scopeRiskStrikes.count, 1)
+  // 补齐命令后照常冻结：缺口本来就该由 Agent 补，不是让用户签掉。
+  const doc = await host.tool('flowgate_doc', { html: '<p>需求</p>', scope: cleanScope() })
+  assert.equal(doc.frozen, true)
+  assert.equal((await host.state()).stage, 'S2')
 })
 
 await check('全部 AC 声明人工核验时自动通过会停下', async () => {
@@ -189,8 +193,8 @@ await check('全部 AC 声明人工核验时自动通过会停下', async () => 
   await host.tool('flowgate_start', { brief: '加一个功能', preset: 'fast' })
   const pending = host.tool('flowgate_doc', {
     html: '<p>需求</p>',
+    // 命令清单照留：人工核验不要求测试命令，有命令也不构成缺口。
     scope: cleanScope({
-      commands: [],
       acceptance_criteria: [
         { id: 'AC-1', when: '人工看', then: '看起来对', verification: { method: 'manual', procedure: '人工核验' } },
       ],
@@ -199,7 +203,7 @@ await check('全部 AC 声明人工核验时自动通过会停下', async () => 
   await tick()
   const state = await host.state()
   assert.ok(state.gateBlockers?.items?.some((item) => item.includes('人工核验')), '要说明全是人工核验')
-  await host.act('doc', { decision: 'approve', acceptScopeRisks: true })
+  await host.act('doc', { decision: 'approve' })
   assert.equal((await pending).frozen, true)
 })
 
@@ -232,7 +236,16 @@ await check('每步确认下挂起，切成自动通过后当场放行', async (
 await check('自动通过因阻塞项停下后切回每步确认仍然等用户', async () => {
   const host = makeHost(freshCwd(), 'sess-switch-to-manual')
   await host.tool('flowgate_start', { brief: '加一个功能', preset: 'fast' })
-  const pending = host.tool('flowgate_doc', { html: '<p>需求</p>', scope: cleanScope({ commands: [] }) })
+  // 用「全是人工核验」造一个能提交、但自动模式不会放行的 scope：
+  // 缺口类问题在提交这一步就退回给 Agent 了，走不到门禁。
+  const pending = host.tool('flowgate_doc', {
+    html: '<p>需求</p>',
+    scope: cleanScope({
+      acceptance_criteria: [
+        { id: 'AC-1', when: '人工看', then: '看起来对', verification: { method: 'manual', procedure: '人工核验' } },
+      ],
+    }),
+  })
   await tick()
   assert.ok((await host.state()).gateBlockers?.items?.length)
   await host.act('setGateMode', { mode: 'manual' })
@@ -240,7 +253,7 @@ await check('自动通过因阻塞项停下后切回每步确认仍然等用户'
   const state = await host.state()
   assert.equal(state.gateMode, 'manual')
   assert.equal(state.doc.pending, true, '切回手动不能顺手放行')
-  await host.act('doc', { decision: 'approve', acceptScopeRisks: true })
+  await host.act('doc', { decision: 'approve' })
   assert.equal((await pending).frozen, true)
 })
 
