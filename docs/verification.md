@@ -137,18 +137,18 @@
 
 方案：在 `conversation.input.dock` 的阶段提示里新增 `HintAnswer`，独占整行排在阶段流转按钮下面——点一下选项即提交，需要写自己的答案时展开「其他答案…」，按 `Ctrl/Cmd + Enter` 或「提交答案」提交。按用户确认，点选快捷答案只投递一条 `answer`，不额外发送用户发言（不引入「发送用户消息」依赖，只走既有 `/api/flowgate/action` 通道）。宿主侧协议、`GrillCard` 与门禁语义都不改。
 
-改动范围：`lib/client.js`（新增 `HintAnswer` 与 `waitingWhy`，`HintActions` 尾部挂载回答区，`.fg-hint-answer` 样式系列与 ≤640px 竖排规则，`fg-hint-why` 按 `waitingKind` 分流）、`test/client.test.mjs`（8 条用例 + `grillView` / `answerButtons` 两个辅助）、`docs/development.md`、`README.md`、`docs/verification.md`。
+改动范围：`lib/client.js`（新增 `HintAnswer` 与 `waitingWhy`，`HintActions` 尾部挂载回答区，`.fg-hint-answer` 样式系列（任何视口都竖排、选项整行铺满，窄屏不再单独声明），`fg-hint-why` 按 `waitingKind` 分流）、`test/client.test.mjs`（用例 + `grillView` / `answerButtons` 两个辅助）、`docs/development.md`、`README.md`、`docs/verification.md`。
 
 | 验收项 | 状态 | 证据与限制 |
 | :--- | :--- | :--- |
-| AC-1 dock 渲染回答区，选项与 `pending.options` 一一对应，推荐项用主色并标「（推荐）」 | 通过 | `test/client.test.mjs`「阶段提示：S1 决策问题在 dock 里直接作答，选项与推荐项同源」断言 `.fg-hint-answer` 存在、显示「问：…」与 `context`、两条选项文案带「（推荐）」、`opts[0].props.className` 含 `fg-hint-btn-primary`、`.fg-hint-answer-opt-note` 的文本等于 `tradeoff` 且按钮不再挂 `title`，且 `.fg-hint-actions` 里仍是 `['放弃这次流程']`（既有按钮集合不变） |
+| AC-1 dock 渲染回答区，选项与 `pending.options` 一一对应，推荐项用主色并标「（推荐）」 | 通过 | `test/client.test.mjs`「阶段提示：S1 决策问题在 dock 里直接作答，选项与推荐项同源」断言 `.fg-hint-answer` 存在、显示「问：…」与 `context`、两条选项文案带「（推荐）」、`opts[0].props.className` 含 `fg-hint-btn-primary`、`.fg-hint-answer-opt-note` 的文本等于 `tradeoff` 且按钮不再挂 `title`，且 `.fg-hint-actions` 里仍是 `['放弃这次流程']`（既有按钮集合不变）。推荐标记的唯一来源另由「阶段提示：推荐标记只追加一次，标签里不再自带」钉住：夹具标签不带「（推荐）」，断言文案为 `['方案A（推荐）', '方案B']` 且整组文案里「（推荐）」只出现一次；工作台侧对应「工作台拍板卡片：推荐标记是标签后缀，不再是独立徽标」 |
 | AC-2 点选项只投递一次 `answer`，载荷为 `{choiceIndex, customText: ''}` | 通过 | 同文件「点一下快捷答案只投递一次 answer」断言 `posted.length === 1`、`action === 'answer'`、`payload` 深等于 `{ choiceIndex: 1, customText: '' }` |
 | AC-3 允许自定义时可提交 `{choiceIndex: -1, customText}`，`allowCustom === false` 时完全不出现自定义入口 | 通过 | 同文件「自定义答案 Ctrl+Enter 与按钮同源，禁用时不出现入口」：空草稿时「提交答案」`disabled`，填入后 `Ctrl+Enter` 返回 1 并提交 `{ choiceIndex: -1, customText: '按我的方案来' }`；`allowCustom: false` 时既无「其他答案…」也无 `textarea` |
 | AC-4 在飞时按钮置灰显示「提交中…」，失败给出可读报错 | 通过 | 同文件「提交中锁住答案按钮，失败给出可读报错」：`fetch` 替身挂起后 `posted.length` 保持 1、选项与「提交答案」`disabled`、出现「提交中…」；返回 500 `{error: '宿主正忙，请稍后再试'}` 后出现 `.fg-hint-err` 且 `role === 'alert'` |
 | AC-5 问题被答掉后回答区随轮询消失，不残留答案按钮 | 通过 | 同文件「问题被答掉后回答区随轮询消失，不残留答案按钮」：把 `grill.pending` 置空并等过一轮 1.5 秒轮询后 `.fg-hint-answer` 为 `null` |
 | AC-6 等待说明按 `waitingKind` 分流，`doc` / `gate` 保持原文 | 通过 | 同文件「等待说明按 waitingKind 分流，只有可作答时才指向快捷答案」断言四种文案：可作答的 `answer` 为「点上面的快捷答案，或到「流程工作台」回答」、不可作答的 `answer` 为「到左侧栏「流程工作台」回答这个问题」、`doc` 与 `gate` 仍为「在左侧栏「流程工作台」确认后才继续」 |
-| AC-7 回答区整行铺满、窄屏单列，不改 dock 宽度契约 | 通过 | 同文件「回答区整行铺满、窄屏单列（样式契约）」对样式文本断言 `.fg-hint-answer` 含 `grid-column: 1 / -1`、`display: flex`、`flex-wrap: wrap`，`.fg-hint-answer-opts` 含 `flex-wrap: wrap`，`@media (max-width: 640px)` 内含 `.fg-hint-answer-opts > button { flex: 1 1 100%; text-align: left; }`；逐行断言 `.fg-hint-answer*` 规则里没有 `width: <像素>px`；`.fg-hint` 的 `width` / `max-width` calc 公式原样保留 |
-| AC-8 无回归 | 通过 | 八个入口逐个实跑：内容快照 20、验收账本 30、运行版本 18、宿主 349、子代理 82、集成 33、客户端 240、安装 17，合计 789 项全通过。语法与指纹：`stamp-revisions.mjs --check` 输出 `Module revisions verified (6 modules).`，`lib/index.js` / `lib/client.js` / `lib/provenance.js` / `lib/acceptance.js` / `lib/runtime.js` / `lib/revisions.js` / `docs/verify-layout.mjs` 七个文件 `node --check` 全部通过。既有「阶段提示」用例一条未改，新增 7 条全通过 |
+| AC-7 回答区选项在任何视口都竖排、整行铺满，不改 dock 宽度契约 | 通过 | 同文件「阶段提示：回答区选项在任何视口都竖排、整行铺满（样式契约）」对样式文本断言 `.fg-hint-answer` 含 `grid-column: 1 / -1`、`display: flex`、`flex-wrap: wrap`，`.fg-hint-answer-opts` 含 `display: flex`、`flex-direction: column`、`width: 100%`，且该规则不含 `flex-wrap: wrap`；`.fg-hint-answer-opts > button` 含 `text-align: left`、`width: 100%`；`.fg-hint-answer-custom` 含 `flex: 1 1 100%`；`@media (max-width: 640px)` 块内不再声明 `.fg-hint-answer-opts`（宽窄屏行为一致）；逐行断言 `.fg-hint-answer*` 规则里没有 `width: <像素>px`；`.fg-hint` 的 `width` / `max-width` calc 公式原样保留 |
+| AC-8 无回归 | 通过 | 九个入口逐个实跑：内容快照 20、验收账本 35、运行版本 18、宿主 318、门禁模式 10、子代理 74、集成 33、客户端 235、安装 17，合计 760 项全通过。语法与指纹：`stamp-revisions.mjs --check` 输出 `Module revisions verified (7 modules).`（`lib/index.js` 的 `FLOWGATE_MODULE_REVISION` 已重算为 `cb0d82f7c46e3460f844ad4252ff1632d29304e1c4ecd8df260219f8fe5b1125`），`lib/index.js` 与 `lib/client.js` 的 `node --check` 均通过。既有「阶段提示」用例只改样式契约一条，新增 3 条全通过 |
 
 ### 执行环境与方式
 

@@ -4822,11 +4822,73 @@ await check('阶段提示：等待说明按 waitingKind 分流，只有可作答
   assert.equal(why((await render(stageHint, {})).toJSON()), '在左侧栏「流程工作台」确认后才继续')
 })
 
-await check('阶段提示：回答区整行铺满、窄屏单列（样式契约）', async () => {
+await check('阶段提示：推荐标记只追加一次，标签里不再自带', async () => {
+  currentView = grillView({
+    grill: {
+      pending: {
+        id: 'q_dock_recommend',
+        question: '选哪个方案？',
+        options: [{ label: '方案A' }, { label: '方案B' }],
+        recommended: 0,
+        allowCustom: false,
+        at: '2026-11-21T10:00:00Z',
+      },
+      answeredCount: 0,
+      awaiting: true,
+    },
+  })
+  const tree = (await render(stageHint, {})).toJSON()
+  const labels = answerButtons(tree).map((node) => flat(nodeByClass(node, 'fg-hint-answer-opt-label')))
+  assert.deepEqual(labels, ['方案A（推荐）', '方案B'])
+  // 「（推荐）」只有一个来源：渲染层按 recommended 追加，标签文本原样透传。
+  assert.equal(labels.join('').split('（推荐）').length - 1, 1)
+})
+
+{
+  currentView = baseView('S1', {
+    waiting: true,
+    waitingKind: 'answer',
+    grill: {
+      pending: {
+        id: 'q_card_recommend',
+        question: '选哪个方案？',
+        options: [{ label: '方案A', tradeoff: '改动最小' }, { label: '方案B' }],
+        recommended: 0,
+        allowCustom: false,
+        at: '2026-11-21T10:00:00Z',
+      },
+      answeredCount: 0,
+      awaiting: true,
+    },
+  })
+  const renderer = await render(FlowDetail, {})
+  await check('工作台拍板卡片：推荐标记是标签后缀，不再是独立徽标', () => {
+    const tree = renderer.toJSON()
+    const opt = buttonByText(tree, '方案A')
+    assert.equal(flat(nodeByClass(opt, 'fg-opt-label')), '方案A（推荐）')
+    // 卡片标题里还有一个「S1 需求分析」徽标，所以只在选项按钮内部断言。
+    const badges = findTags(opt, 'span').filter((node) => String(node.props?.className || '').includes('fg-badge'))
+    assert.equal(badges.length, 0, '推荐项按钮内不应再有徽标')
+  })
+  await act(async () => { renderer.unmount() })
+}
+
+await check('阶段提示：回答区选项在任何视口都竖排、整行铺满（样式契约）', async () => {
   const css = styleNodes[0].textContent
   assert.match(css, /\.fg-hint-answer \{[^}]*grid-column: 1 \/ -1;[^}]*display: flex;[^}]*flex-wrap: wrap;/)
-  assert.match(css, /\.fg-hint-answer-opts \{[^}]*flex-wrap: wrap;/)
-  assert.match(css, /@media \(max-width: 640px\) \{[\s\S]*\.fg-hint-answer-opts > button \{ flex: 1 1 100%; text-align: left; \}/)
+  // 选项一律竖排：宽屏下也不并排，否则又会出现「一行两个、第二行一个」。
+  assert.match(css, /\.fg-hint-answer-opts \{[^}]*display: flex;[^}]*flex-direction: column;[^}]*width: 100%;/)
+  assert.match(css, /\.fg-hint-answer-opts > button \{[^}]*text-align: left;[^}]*width: 100%;/)
+  // 横向并排的来源就是 flex-wrap：选项容器里不许再出现它。
+  const optsRule = css.match(/\.fg-hint-answer-opts \{[^}]*\}/)
+  assert.ok(optsRule, '样式里必须有 .fg-hint-answer-opts 规则')
+  assert.doesNotMatch(optsRule[0], /flex-wrap: wrap/, '选项容器不能靠 flex-wrap 换行：' + optsRule[0])
+  // 窄屏不再单独声明：竖排已是基础规则，宽窄屏行为一致。
+  const narrow = css.match(/@media \(max-width: 640px\) \{[\s\S]*?\n\}/)
+  assert.ok(narrow, '样式里必须有窄屏媒体查询')
+  assert.doesNotMatch(narrow[0], /\.fg-hint-answer-opts/, '窄屏媒体查询不再重复声明选项布局：' + narrow[0])
+  // 自定义入口仍在独立的一行里，不和选项挤在一起。
+  assert.match(css, /\.fg-hint-answer-custom \{[^}]*flex: 1 1 100%;/)
   // 不写死布局像素宽度：只允许 min-height / max-height 这类纵向约束。
   for (const line of css.split('\n').filter((entry) => entry.includes('.fg-hint-answer'))) {
     assert.ok(!/width:\s*\d+px/.test(line), '回答区不能写死像素宽度：' + line.trim())

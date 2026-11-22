@@ -462,6 +462,18 @@ check('命令授权开关已退场，S1 也开不了', () => {
       // 探测出问题要落到清单上，不是知道了就完：这条是「S1 就该验」的收口。
       assert.match(cx.tools.get('flowgate_doc').description, /跑不通就把绝对路径或替代方案写进清单/)
     })
+    // 推荐标记只能有一个来源：标签只写文本，推荐由 recommended 表达，界面统一追加「（推荐）」。
+    // 少了这条约束，Agent 会自己往 label 里写「（推荐）」，界面上就变成「（推荐）（推荐）」。
+    check('flowgate_ask 的选项标签契约：推荐交给 recommended，标签只写文本', () => {
+      const label = cx.tools.get('flowgate_ask').parameters.properties.options.items.properties.label
+      assert.match(label.description, /不要自己加「（推荐）」/)
+      assert.match(label.description, /recommended/)
+      // 参数级描述不一定被模型读到：工具顶层 description 里也要有同一条约束，
+      // 否则只靠 schema 兜底，Agent 照样会自己往标签里写「（推荐）」。
+      const description = cx.tools.get('flowgate_ask').description
+      assert.match(description, /不要自己加「（推荐）」/)
+      assert.match(description, /recommended/)
+    })
   } finally {
     rmSync(root, { recursive: true, force: true })
     // 把插件的当前 service 切回主 host：后面所有用例都还挂在它上面。
