@@ -123,7 +123,8 @@ function makeHost(cwd, sessionId, options = {}) {
   }
   const request = async (path, body) => {
     const pathname = path.split('?')[0]
-    const spec = routes.find((r) => r.path === pathname)
+    // 取最新注册的那份：多 host 用例会重复 apply，只有最新的 service 是当前生效的。
+    const spec = routes.findLast((r) => r.path === pathname)
     assert.ok(spec, '路由未注册：' + pathname)
     const init = body === undefined ? undefined : { method: 'POST', body: JSON.stringify(body) }
     const response = await spec.fetch(new Request('http://host' + path, init))
@@ -139,8 +140,11 @@ function makeHost(cwd, sessionId, options = {}) {
     )
   }
 
-  apply({ inject: (_names, cb) => cb(scoped) })
-  return { tools, routes, handlers, shell, tool, request, guard, delivered }
+  // 插件只认最后一次 apply 的 service：用例里临时建 host 验完必须切回来，
+  // 否则后面的流程会落到别人的工作目录里。
+  const activate = () => apply({ inject: (_names, cb) => cb(scoped) })
+  activate()
+  return { tools, routes, handlers, shell, tool, request, guard, delivered, activate }
 }
 
 const cwd = mkdtempSync(join(tmpdir(), 'flowgate-'))
@@ -173,7 +177,7 @@ async function runTool(name, args = {}) {
 }
 
 function routeOf(path) {
-  const spec = host.routes.find((r) => r.path === path)
+  const spec = host.routes.findLast((r) => r.path === path)
   assert.ok(spec, '路由未注册：' + path)
   return spec
 }
@@ -453,6 +457,8 @@ check('命令授权开关已退场，S1 也开不了', () => {
     })
   } finally {
     rmSync(root, { recursive: true, force: true })
+    // 把插件的当前 service 切回主 host：后面所有用例都还挂在它上面。
+    host.activate()
   }
 }
 // 需求文档 → 批准并冻结 scope（AC-2 的对照：这里走正常批准路径）。
@@ -2863,8 +2869,9 @@ for (const [kind, reason, expected] of [
   const state = (id = sid) => cx.request('/api/flowgate/state?sessionId=' + encodeURIComponent(id))
   // 这套用例验证每步都要人点的手动门禁；fast 档默认自动通过，启动后显式切回来。
   const call = async (name, args, id = sid) => {
-    const value = await cx.tools.get(name).execute(args, {
-      name, arguments: args, agent: { session: { header: { id, cwd: sessionDirs.get(id) } } },
+    const prepared = withGrill(name, args)
+    const value = await cx.tools.get(name).execute(prepared, {
+      name, arguments: prepared, agent: { session: { header: { id, cwd: sessionDirs.get(id) } } },
     })
     if (name === 'flowgate_start') assert.equal((await act('setGateMode', { mode: 'manual' }, id)).status, 200)
     return value
@@ -3462,6 +3469,24 @@ for (const [kind, reason, expected] of [
       assert.equal(s1Sneak.kind, 'deny')
       assert.match(s1Sneak.reason, /任意代码|无法核对/)
     })
+    // 只读白名单与纯解析不再只认 node：登记表里有哪个生态，就放行哪个生态的版本探测与语法检查。
+    const multiVersion = await cx.guard('bash', { command: 'php --version' })
+    const multiVersionPy = await cx.guard('bash', { command: 'python --version' })
+    const multiWhich = await cx.guard('bash', { command: 'command -v php' })
+    const multiLint = await cx.guard('bash', { command: 'php -l index.php' })
+    const multiSyntax = await cx.guard('bash', { command: 'bash -n deploy.sh' })
+    // 内联执行是任意代码执行：php -r 原来根本不在名单里，一路放行。
+    const multiInline = await cx.guard('bash', { command: "php -r 'unlink(1);'" })
+    const multiPwsh = await cx.guard('bash', { command: 'pwsh -Command Get-Item .' })
+    check('版本探测与语法检查按生态放行，内联执行一律拒', () => {
+      for (const item of [multiVersion, multiVersionPy, multiWhich, multiLint, multiSyntax]) {
+        assert.equal(item.kind, 'allow', JSON.stringify(item))
+      }
+      for (const item of [multiInline, multiPwsh]) {
+        assert.equal(item.kind, 'deny', JSON.stringify(item))
+        assert.match(item.reason, /任意代码|无法核对/)
+      }
+    })
 
     const cmdHtml = '<html><body><p>命令清单</p></body></html>'
     const cmdScope = (commands) => ({
@@ -3491,7 +3516,7 @@ for (const [kind, reason, expected] of [
         files_expected_to_change: ['src/cmd.ts'],
         // 无效条目必须在 S1 就报错。原来空白与超长会被静默剔掉、`node -e *` 会被安静存下来：
         // 界面显示「已经授权」，实际每次都被逃逸检查拦掉，用户与 Agent 都以为放行过了。
-        commands: ['  npm test  ', 'npm test', 'npm run *'],
+        commands: ['  npm test  ', 'npm test', 'npm run *', 'node test/host.test.mjs'],
         capabilities: ['改 cmd.ts'],
         out_of_scope_explicitly: [],
         acceptance_criteria: [{ id: 'AC-1', when: '清单内命令', then: '不需要授权' }],
@@ -3501,12 +3526,16 @@ for (const [kind, reason, expected] of [
     const approvedCmd = await act('doc', { decision: 'approve' })
     await cmdDoc
     check('scope 命令清单规范化：去空、去重、保留原顺序', () => {
-      assert.deepEqual(approvedCmd.body.scope.data.in_scope.commands, ['npm test', 'npm run *'])
+      assert.deepEqual(approvedCmd.body.scope.data.in_scope.commands, ['npm test', 'npm run *', 'node test/host.test.mjs'])
     })
 
     const listExact = await cx.guard('bash', { command: 'npm test' })
     const listWild = await cx.guard('bash', { command: 'npm run build --silent' })
     const listMiss = await cx.guard('bash', { command: 'npm publish' })
+    // 清单里写的是裸 node，机器上跑的是带盘符的 node.exe：这是同一条命令。
+    // 不按解释器身份归一化，Agent 照抄 package.json 的 scripts 写清单，到 S2 就一条都放行不了。
+    const listAbs = await cx.guard('bash', { command: '"' + process.execPath + '" test/host.test.mjs' })
+    const listOther = await cx.guard('bash', { command: '"' + process.execPath + '" test/other.test.mjs' })
     const s2CmdState = await cx.request('/api/flowgate/state?sessionId=sess-scope-cmd')
     check('S2 清单内命令不需要开关就放行，清单外仍然拒', () => {
       assert.equal(s2CmdState.body.stage, 'S2')
@@ -3517,6 +3546,9 @@ for (const [kind, reason, expected] of [
       assert.equal(listMiss.kind, 'deny')
       assert.match(listMiss.reason, /scope\.commands/)
       assert.match(listMiss.reason, /退回 S1 补命令清单/)
+      // 同一条命令换个可执行体路径仍然算命中，参数不同就不算。
+      assert.equal(listAbs.kind, 'allow', JSON.stringify(listAbs))
+      assert.equal(listOther.kind, 'deny', JSON.stringify(listOther))
     })
 
     await cx.guard('bash', { command: 'npm publish ' + 'a'.repeat(300) })

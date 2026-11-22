@@ -45,6 +45,30 @@ test('冻结前的验收方案体检：集成验收缺测试文件与命令时�
   assert.match(readiness.risks[1].message, /S3 评审会要求回 S1 调 scope/)
 })
 
+test('清单写对了但机器上没有这个可执行体时给出缺口，仓库没声明该生态就不误报', () => {
+  const criteria = [{ id: 'AC-1', when: '跑测试', then: '全部通过', verification: { method: 'unit', procedure: '运行用例' } }]
+  const project = (ecosystems, found) => ({
+    ecosystems,
+    resolveExecutable: (token) => ({ found: found.includes(token), path: found.includes(token) ? '/usr/bin/' + token : null, source: 'path' }),
+  })
+  const missing = scopeReadiness(criteria, ['node test/host.test.mjs', 'php -l index.php'], ['test/host.test.mjs'], {
+    project: project(['node'], []),
+  })
+  assert.deepEqual(missing.risks.map((item) => item.code), ['command-runtime-missing'])
+  assert.deepEqual(missing.risks[0].commands, ['node test/host.test.mjs'])
+  assert.match(missing.risks[0].message, /找不到/)
+  assert.match(missing.risks[0].message, /绝对路径/)
+  // php 没在仓库里声明：空目录里写 php 命令无从判断，跳过比误报有用。
+  assert.ok(!missing.risks[0].commands.includes('php -l index.php'))
+  // 找得到就不报；绝对路径与登记名同样按可执行体核对。
+  const found = scopeReadiness(criteria, ['node test/host.test.mjs'], ['test/host.test.mjs'], {
+    project: project(['node'], ['node']),
+  })
+  assert.deepEqual(found.risks.map((item) => item.code), ['no-test-command'].filter(() => false))
+  // 没有 project 时整条检查不参与：老调用点与未知工作区不受影响。
+  assert.deepEqual(scopeReadiness(criteria, ['node test/x.mjs'], ['test/x.mjs']).risks, [])
+})
+
 test('验证步骤点名 scope 外的文件时给出缺口，点名的文件已在 scope 内就不再提示', () => {
   const criteria = [{
     id: 'AC-1',

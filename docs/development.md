@@ -180,9 +180,33 @@ S4 出口门禁有三种结束方式，状态、事件与界面文案各不相�
 | `visual-without-measurement` | 视觉验收没写明怎么测 | 缺口，需显式接受 |
 | `over-broad-command` | 出现 `npm *`、`node *`、`*` 这类通配，或条目数超过 `max(8, 可执行 AC 数 × 2)` | 缺口，需显式接受 |
 | `command-not-applicable` | `npm run <script>` 的脚本在 `package.json` 里不存在 | 缺口，需显式接受 |
+| `command-runtime-missing` | 命令用到的可执行体在当前 PATH 上找不到（`node`、`php`、`cargo`…） | 缺口，需显式接受 |
 | `command-without-ac` | 命令没挂任何 AC（可能用于构建或静态检查） | 只提示，不阻塞 |
 
 `npm run *` 不算超宽：它只能在 `package.json` 的 `scripts` 里选，范围本身有限，插件一直支持这种前缀通配。
+
+### 解释器与生态登记表
+
+`lib/ecosystems.js` 是宿主判定 shell 命令时唯一的事实来源。它把此前各自为政的四份名单收成一张表：只读白名单、纯解析命令、逃逸检查里的解释器内联名单、验收体检里的测试命令识别与超宽判定。表里每条生态记录解释器名（`runtimes`）、包管理器名（`managers`）、标志文件（`markers`）、内联执行标志（`inline`）、纯解析标志（`parse`）、版本探测参数（`version`）与测试命令正则片段（`test`）。
+
+为什么要收敛：这四份名单原本是四段写死的正则，加一个语言要改四处，改漏一处不会有任何报错。实测就是这样——`php -r 'unlink(...)'` 能执行任意代码，却因为 php 根本不在名单里而一路放行。现在新增生态只改 `lib/ecosystems.js` 一处，由插件代码维护，不暴露成用户配置项：用户不知道「本项目的解释器该不该算登记过」，让他勾选只会变成另一种照勾。
+
+表里已登记 Node.js、Deno、Python、PHP、Go、Rust、Java、.NET、Ruby、Elixir、Perl、Lua、Shell、PowerShell、Windows 命令解释器、Make / CMake。任何一项写错只会收紧或放宽「识别」，不会放宽「写盘检查」：逃逸字符那部分与这张表无关。
+
+两条派生规则值得单独说明：
+
+- **只读命令不再只认 node**。`node --version` 之外，登记过的生态都能跑自己的版本探测（`php --version`、`python -V`、`cargo --version`），也能跑纯解析命令（`node --check`、`php -l`、`bash -n`、`tsc --noEmit`）。非 JS 项目在 S1 连 `php --version` 都跑不了的日子结束了。
+- **解释器身份归一化**。清单里写 `node test/host.test.mjs`、实际执行时是 `C:\...\node.exe test/host.test.mjs`，这是同一条命令，只因为路径写法不同不该被判成「清单外」。`scopeCommandMatches` 按登记过的可执行名归一化后再比参数；没登记的名字仍按原文精确比较，否则任意同名脚本都能借用清单里的授权。
+
+### 可执行性体检
+
+清单写对不等于跑得起来。`projectProfile` 会读 `package.json` 的 `scripts`、`tsconfig`、`Makefile` 与各测试框架配置，据此判断命令「该不该存在」；但很长一段时间里，没有任何一处判断这个可执行文件「这台机器上有没有」。于是裸 `node test/x.mjs` 一路通过 S1 体检、在 S1 门禁上被批准，到 S2 才被 shell 自己以 127 拒绝——那时用户已经批过 scope 了。
+
+现在 S1 提交 scope 时多一道 `command-runtime-missing`：对清单里每条命令取首个 token，若该名字属于登记表、且仓库里确实声明了对应生态（`markers` 命中），就用宿主进程的 PATH 与 `PATHEXT` 解析它是否存在（绝对路径则直接 `existsSync`）。找不到就记一条缺口，提示把绝对路径写进清单或先装好它。
+
+刻意收窄的两处：只核对「仓库里声明了这个生态」的命令，空目录里写 `node test/x.mjs` 无从判断，跳过比误报有用；只取首个 token，`npm` 在而它内部拉起的 `node` 不在这种子进程缺失仍然查不出来。
+
+用风险码而不是阻塞项，是因为它不该拦住流程：用户可能就想先批准、到 S2 再装环境。但 `fast` 档的自动通过会把风险一起算进门禁项，所以它一定会停在门禁卡上被看见一次，不会静默滑进开发阶段。
 
 ## 打回预算
 
