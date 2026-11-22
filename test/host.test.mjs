@@ -29,7 +29,9 @@ function makeHost(cwd, sessionId, options = {}) {
   const delivered = []
   // sess-late-agent 用它模拟「第一次拿不到、之后拿得到」：验证重复点开始会重试唤醒。
   const agentLookups = new Map()
-  const shell = {
+  // options.shell 用来模拟慢采集：S2 采集变更摘要最长有 10 秒窗口，
+  // 期间用户点门禁会把阶段推进掉，用例要能停在这个窗口里断言。
+  const shell = options.shell ?? {
     resolve(request) {
       return { ...request, resolved: true }
     },
@@ -1782,8 +1784,12 @@ rmSync(cwd, { recursive: true, force: true })
   await tick()
   gateSignal.abort()
   const waited = await gateCall
-  check('门禁调用中断后返回 wait 而不是报错', () => {
+  check('门禁调用中断后返回 wait，并且明确要求 Agent 停下来等确认', () => {
     assert.equal(waited.decision, 'wait')
+    // 按钮仍然可点是为了不剥夺用户确认的权利；Agent 不能因此自己往下做。
+    assert.match(waited.message, /停下来等确认/)
+    assert.match(waited.message, /不要继续做后续阶段的工作/)
+    assert.doesNotMatch(waited.message, /门禁还在等待用户操作/)
   })
   const view = await cx.request('/api/flowgate/state?sessionId=sess-gate')
   check('门禁中断后仍停在 S2 并标记可确认', () => {
@@ -1821,6 +1827,99 @@ rmSync(cwd, { recursive: true, force: true })
   check('S3 还没有评审报告时重复点击会被拒绝并说明原因', () => {
     assert.equal(again.status, 409)
     assert.match(again.body.error, /可确认的产物/)
+  })
+}
+
+// 用户点击与 Agent 采集撞在一起：S2 采集变更摘要最长有 10 秒窗口，
+// 期间用户点「完成开发」会把阶段推进到 S3。采集返回后若照写开发摘要再挂门禁，
+// Agent 会以一个按钮永远不会再出现的阶段身份等下去——卡到工具超时。
+{
+  const cwd = join(testRoot, 'sess-stale-gate')
+  const fastResult = {
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    aborted: false,
+    timeoutMs: 0,
+    stdout: { text: ' M src/auth/session.ts\n---numstat---\n1\t2\tsrc/auth/session.ts\n', truncated: false },
+    stderr: { text: '', truncated: false },
+  }
+  // 第一次采集立刻返回（上一轮开发摘要已经落地），第二次挂起，用来停住「采集窗口」。
+  let calls = 0
+  let release = null
+  const twoStepShell = {
+    resolve(request) {
+      return { ...request, resolved: true }
+    },
+    run() {
+      calls += 1
+      if (calls === 1) return Promise.resolve(fastResult)
+      return new Promise((resolve) => { release = () => resolve(fastResult) })
+    },
+  }
+  const cx = makeHost(cwd, 'sess-stale-gate', { shell: twoStepShell })
+  await cx.tool('flowgate_start', { title: '撞车', preset: 'fast' })
+  const scope = {
+    commands: [], files_expected_to_change: ['src/auth/session.ts'],
+    capabilities: ['会话过期检测'],
+    out_of_scope_explicitly: [],
+    acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
+  }
+  const docCall = cx.tool('flowgate_doc', { html: '<html><body><p>撞车</p></body></html>', scope })
+  await tick()
+  await cx.request('/api/flowgate/action', { sessionId: 'sess-stale-gate', action: 'doc', payload: { decision: 'approve' } })
+  await docCall
+  // 上一轮门禁被中断：开发摘要已经写进流程，按钮因此可点。
+  const firstSignal = new AbortController()
+  const firstGate = cx.tool('flowgate_gate', {}, { signal: firstSignal.signal })
+  await tick()
+  firstSignal.abort()
+  await firstGate
+
+  const gateCall = cx.tool('flowgate_gate', { summary: '改完了' })
+  await tick()
+  // 采集还卡着，用户先点了「完成开发」。
+  const passed = await cx.request('/api/flowgate/action', {
+    sessionId: 'sess-stale-gate',
+    action: 'gate',
+    payload: { decision: 'pass' },
+  })
+  check('采集窗口里点门禁：阶段照常推进到 S3', () => {
+    assert.equal(passed.status, 200)
+    assert.equal(passed.body.stage, 'S3')
+  })
+  release()
+  const stale = await gateCall
+  check('采集回来发现阶段已经变了：返回 stale，不再挂到一个没有按钮的阶段上', () => {
+    assert.equal(stale.decision, 'stale')
+    assert.equal(stale.stage, 'S2')
+    assert.equal(stale.next, 'S3')
+    assert.match(stale.message, /阶段已推进到 S3/)
+    assert.match(stale.message, /读取 flowgate_status/)
+  })
+  const after = await cx.request('/api/flowgate/state?sessionId=sess-stale-gate')
+  check('撞车后停在 S3，开发摘要仍是上一轮那份', () => {
+    assert.equal(after.body.stage, 'S3')
+    assert.ok(after.body.devChanges, '第一轮的开发摘要不该被清掉')
+    assert.equal(after.body.devChanges.files.length, 1)
+  })
+  const events = readFileSync(join(cwd, '.dsh-flowgate', 'flows.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+  // 同一处的另一种表现：撞车之后已经站在 S3，但评审报告还没交。
+  // S3 的门禁按钮要等评审报告才出现，此时挂起就是在等一个不会来的按钮。
+  const noArtifact = await cx.tool('flowgate_gate', {})
+  check('本阶段还没有产物就调用门禁：当场返回 stale，不挂起', () => {
+    assert.equal(noArtifact.decision, 'stale')
+    assert.equal(noArtifact.stage, 'S3')
+    assert.equal(noArtifact.next, 'S3')
+    assert.match(noArtifact.message, /评审报告（flowgate_review）/)
+    assert.match(noArtifact.message, /门禁按钮不会出现/)
+  })
+
+  check('撞车不写第二条 dev.summary：审计里不能出现没生效的开发摘要', () => {
+    assert.equal(events.filter((item) => item.type === 'dev.summary').length, 1)
   })
 }
 

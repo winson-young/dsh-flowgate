@@ -2071,8 +2071,10 @@ const HubPanelIcon = componentOf('sidebar.panellist')
   })
   const renderer = await render(FlowDetail, {})
   const tree = renderer.toJSON()
-  await check('门禁中断后按钮仍然可点并说明原因', async () => {
+  await check('门禁中断后按钮仍然可点，并说明 Agent 已经停下', async () => {
     assert.ok(flat(tree).includes('上次的门禁请求被中断'))
+    // 按钮可点是为了不剥夺用户确认的权利；文案必须说清 Agent 已经停了，不是还在后台干活。
+    assert.ok(flat(tree).includes('Agent 已停下等你确认'), flat(tree))
     await click(buttonByText(tree, '完成开发'))
     const last = posted[posted.length - 1]
     assert.equal(last.action, 'gate')
