@@ -83,10 +83,17 @@ function makeHost(cwd, sessionId) {
     signal,
   })
 
+  // flowgate_doc 必须交代追问结果；这套用例验门禁模式，追问内容给一份默认清单。
+  const GRILL = {
+    decisions: [{ question: '这次要改到什么程度？', answer: '把追问纪律写进工具文案与提交校验' }],
+    assumptions: [],
+    open_questions: [],
+  }
   const tool = (name, args, opts = {}) => {
     const definition = tools.get(name)
     assert.ok(definition, '工具未注册：' + name)
-    return definition.execute(args, execOf(name, args, opts.signal))
+    const prepared = name === 'flowgate_doc' ? { ...GRILL, ...args } : args
+    return definition.execute(prepared, execOf(name, prepared, opts.signal))
   }
 
   const request = async (path, body) => {

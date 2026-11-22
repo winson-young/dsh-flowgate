@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { normalizeCriteria, acceptanceLedger, remediationList, scopeReadiness, stageSummary } from '../lib/acceptance.js'
+import { normalizeCriteria, acceptanceLedger, grillReadiness, remediationList, scopeReadiness, stageSummary } from '../lib/acceptance.js'
 
 const snapshot = { id: 'a'.repeat(64), complete: true }
 const runtime = { status: 'verified', hostRevision: 'host-v1', clientRevision: 'client-v1', pageId: 'page-1', viewport: { width: 1440, height: 900 } }
@@ -89,6 +89,32 @@ test('视觉验收没写测量方式时给出缺口，写了就不再提示', ()
   assert.deepEqual(scopeReadiness(vague, [], []).risks.map((item) => item.code), ['visual-without-measurement'])
   const measured = [{ id: 'AC-1', when: '打开界面', then: '按钮居中', verification: { method: 'visual', procedure: '用 getBoundingClientRect 量左右边界，容差 1px' } }]
   assert.deepEqual(scopeReadiness(measured, [], []).risks, [])
+})
+
+test('追问体检：未决问题没问完、决策缺半边、什么都没澄清都直接拒绝提交', () => {
+  const agreed = grillReadiness(
+    [{ question: '追问纪律落在哪一层？', answer: '工具参数加提交校验，不只写在提示词里' }],
+    ['不新增依赖'],
+    [],
+  )
+  assert.deepEqual(agreed.blockers, [])
+  assert.equal(agreed.decisions[0].question, '追问纪律落在哪一层？')
+  assert.deepEqual(agreed.assumptions, ['不新增依赖'])
+
+  const pending = grillReadiness([{ question: '问什么', answer: '定什么' }], [], ['失败后要不要自动重试'])
+  assert.deepEqual(pending.blockers.map((item) => item.code), ['open-questions-remain'])
+  assert.match(pending.blockers[0].message, /失败后要不要自动重试/)
+  assert.match(pending.blockers[0].message, /需求文档不是记录待定的地方/)
+
+  const half = grillReadiness([{ question: '只问了问题' }, { answer: '只写了结论' }], [], [])
+  assert.deepEqual(half.blockers.map((item) => item.code), ['incomplete-decision'])
+  assert.match(half.blockers[0].message, /缺 question 或 answer/)
+
+  assert.deepEqual(grillReadiness([], [], []).blockers.map((item) => item.code), ['nothing-clarified'])
+  // 只写假设、一条决策都没有也算澄清过：确实无需追问时允许这么提交。
+  assert.deepEqual(grillReadiness([], ['沿用现有门禁语义'], []).blockers, [])
+  // 空白条目不算数，别让空字符串把 open_questions 骗成已问清。
+  assert.deepEqual(grillReadiness([{ question: '问', answer: '答' }], [], ['  ']).blockers, [])
 })
 
 test('id 缺失或重复是硬阻塞，不是风险', () => {

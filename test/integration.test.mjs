@@ -113,8 +113,17 @@ const execFor = (sessionId, name, args) => ({
 const actionRouteRef = () => host.routes.get('/api/flowgate/action')
 // 本文件的用例验证「每一步都停下来等确认」的手动门禁语义：门禁模式默认随档位
 // （fast 档是自动通过），启动后显式切成每步确认。自动通过的行为在 test/gatemode.test.mjs 里覆盖。
+// flowgate_doc 必须交代追问结果；这套用例验的是流程串联，追问内容给一份默认清单。
+const DEFAULT_GRILL = {
+  decisions: [{ question: '这次要改到什么程度？', answer: '把追问纪律写进工具文案与提交校验' }],
+  assumptions: [],
+  open_questions: [],
+}
+const withGrill = (name, args) => (name === 'flowgate_doc' ? { ...DEFAULT_GRILL, ...args } : args)
+
 const call = async (name, args, sessionId = SESSION) => {
-  const value = await host.tools.get(name).execute(args, execFor(sessionId, name, args))
+  const prepared = withGrill(name, args)
+  const value = await host.tools.get(name).execute(prepared, execFor(sessionId, name, prepared))
   if (name === 'flowgate_start') {
     const res = await actionRouteRef().fetch(new Request('http://host/api/flowgate/action', {
       method: 'POST', body: JSON.stringify({ sessionId, action: 'setGateMode', payload: { mode: 'manual' } }),
@@ -350,6 +359,13 @@ await check('需求文档门禁：批准后 scope 冻结并进入 S2', async () 
     html: '<!doctype html><html><body><h1>需求</h1></body></html>',
     recommendedPreset: 'fast',
     reason: '只改一个中间件，范围可控',
+    // AC-4：三份清单齐备、open_questions 为空、decisions 有两条 —— 走完整条 start → ask → doc 路径。
+    decisions: [
+      { question: '过期后是返回 401 还是静默续期？', answer: '返回 401' },
+      { question: '过期检测放在中间件还是网关？', answer: '放在中间件' },
+    ],
+    assumptions: ['客户端会自己跳转登录页'],
+    open_questions: [],
     scope: {
       files_expected_to_change: ['src/auth/session.ts'],
       commands: [],
@@ -367,6 +383,13 @@ await check('需求文档门禁：批准后 scope 冻结并进入 S2', async () 
   const view = await getState()
   assert.equal(view.stage, 'S2')
   assert.equal(view.scope.frozen, true)
+  // AC-4：决策清单随文档落盘，批准后仍能从状态里查到「问了什么、定了什么」。
+  assert.equal(view.doc.grill.decisions.length, 2)
+  assert.equal(view.doc.grill.decisions[0].question, '过期后是返回 401 还是静默续期？')
+  assert.equal(view.doc.grill.decisions[1].answer, '放在中间件')
+  assert.deepEqual(view.doc.grill.assumptions, ['客户端会自己跳转登录页'])
+  assert.deepEqual(view.doc.grill.openQuestions, [])
+  assert.deepEqual(view.doc.grill.blockers, [])
   assert.deepEqual(view.scope.data.in_scope.files_expected_to_change, ['src/auth/session.ts'])
 })
 

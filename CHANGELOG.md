@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **需求分析不能问一句就收工：追问纪律从提示词变成提交门槛**：此前 S1 的追问是「建议」——`flowgate_ask` 的描述只说「一次只问一个问题」，`flowgate_doc` 对「到底问出了什么」一无所知，于是 Agent 问一个不痛不痒的问题就能提交需求文档，模糊表述、隐含假设和关键取舍全部原样进入开发，直到 S3 评审或 S4 测试才炸。
+  现在 `flowgate_doc` 的参数契约加了三份必填清单：`decisions`（已经问定的事项，每条 `{ question, answer }`）、`assumptions`（没问、由 Agent 自行补全的前提）、`open_questions`（还没问清的问题），三者与 `html`、`scope` 并列进入 `required`，`additionalProperties` 仍为 `false`——旧调用方不补齐会在参数校验层直接报错，而不是被静默当成「没追问也算过」。提交前由新增的 `grillReadiness(decisions, assumptions, openQuestions)` 硬校验，三条阻塞各自点名：`open-questions-remain`（未决问题非空，逐条列出并说明「需求文档不是记录待定的地方」）、`incomplete-decision`（某条决策缺 `question` 或 `answer`，看不出问了什么定了什么）、`nothing-clarified`（`decisions` 与 `assumptions` 同时为空，说明这次根本没澄清）。三条都是拒绝提交，不是记一条风险放行——风险提示挡不住「差不多了」的判断。
+  提示词侧同步收口：`BUILTIN_ANALYSIS_RULES` 新增 `grill-until-agreed`（「追问到共识再动手」），`fast` 档的 `analysisRules` 显式加入该 id（它是显式列表，不加就不生效；`strict` 走全量 `map` 自动包含）；`flowgate_ask` 的描述改为一次解决一个分歧、答完接着问下一个，明确「没把握的写进 `assumptions`，问不清的留 `open_questions` 继续问」；`flowgate_start` 的返回消息与 S1 唤醒消息都补上「问一句就收工不算做完 S1」。三份清单随文档一起落进 `flow.doc.grill`，`doc.submitted` 事件记录决策与假设条数。
+  测试：`test/host.test.mjs`、`test/integration.test.mjs`、`test/gatemode.test.mjs` 的夹具统一在 `flowgate_doc` 调用处注入一份默认追问清单（`withGrill` / `GRILL`），`test/subagents.test.mjs` 的黑盒调用内联补齐，避免 55 处调用点逐个改写；`test/acceptance.test.mjs` 新增 `grillReadiness` 的三条阻塞与通过路径用例，`test/host.test.mjs` 在 S1 段新增三条拒绝文案与 `flow.doc.grill` 落盘的用例。
+
 - **权限不再由用户勾选：命令清单是唯一通道**：此前要跑构建或测试，用户得在 S2「开发变更」或 S4「测试命令」卡片里勾「允许执行构建/测试命令」，测试方向还要先「声明需要写权限」、再在 S4 逐个方向勾「授权执行变更性命令」。三处勾选全是空转：用户不知道自己要什么权限，Agent 说一句「需要授权」他就会照勾，勾完的责任却落在他身上。而 S1 批准 `scope.commands` 时，清单和验收标准是摆在一起看的——那一次才是真正有上下文的授权。
   现在放行只有一个来源：需求文档里那份已批准的 `scope.commands`。`shellGrant`、`writeGrants`、`needsWrite`、`directionWriteDeclared` 四个字段从数据模型删除，`toggleShellGrant`、`toggleWriteGrant`、`declareDirectionWrite` 三个 hub 动作一并移除（调用会得到「未知操作」），`repairFlow` 负责清洗旧快照里的残留字段，`hydrate` 再把清洗结果写回磁盘——否则文件里一直留着 `shellGrant: true`，读的人分不清它还算不算数。冷恢复因此不再涉及任何「重新授权」。
   清单写漏时唯一的出口是补清单，不是临时放行：`shellDenial` 拒绝时把命令原文记进 `flow.lastDeniedCommand`（截断到 300 字），视图新增 `deniedCommand`，工作台在「开发变更」「测试命令」卡片和快捷入口里显示被拒命令，并给出「退回 S1 补命令清单」按钮；它调新增的 `reopenScopeForCommands`，带着那条命令退回 S1、预填进清单草稿，用户确认后重新批准，代价是本轮评审与测试要重跑。界面把这条代价写在按钮旁边。

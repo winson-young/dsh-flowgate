@@ -275,6 +275,10 @@ function makeHost(options = {}) {
       await host.action('setGateMode', { mode: 'manual' })
       const doc = host.call('flowgate_doc', {
         html: '<!doctype html><html><body>fixture requirements</body></html>',
+        // 这套黑盒用例验子代理与门禁，追问内容给一份能过校验的清单。
+        decisions: [{ question: '这次要改到什么程度？', answer: '把追问纪律写进工具文案与提交校验' }],
+        assumptions: [],
+        open_questions: [],
         scope: {
           files_expected_to_change: ['src/auth/session.ts'], commands, capabilities: ['fixture'],
           out_of_scope_explicitly: [], acceptance_criteria: criteria ?? [{ id: 'AC-1', when: '运行', then: '可验证' }],

@@ -11,6 +11,16 @@ import { prepareRequirement, SYSTEM_PROMPT, TIMEOUT_MS } from '../lib/requiremen
 // 宿主端 mock：只实现插件实际用到的 ctx 成员。
 // ---------------------------------------------------------------------------
 
+// flowgate_doc 现在必须交代追问结果（decisions / assumptions / open_questions）。
+// 本文件多数用例关心的是门禁与 scope 语义，不是追问内容，所以夹具补一份默认清单；
+// 追问校验本身的用例也走 runTool，在调用处覆盖对应清单来打三条阻塞。
+const DEFAULT_GRILL = {
+  decisions: [{ question: '这次要改到什么程度？', answer: '把追问纪律写进工具文案与提交校验' }],
+  assumptions: [],
+  open_questions: [],
+}
+const withGrill = (name, args) => (name === 'flowgate_doc' ? { ...DEFAULT_GRILL, ...args } : args)
+
 function makeHost(cwd, sessionId, options = {}) {
   const tools = new Map()
   const routes = []
@@ -92,9 +102,10 @@ function makeHost(cwd, sessionId, options = {}) {
   const tool = (name, args, opts = {}) => {
     const definition = tools.get(name)
     assert.ok(definition, '工具未注册：' + name)
-    const value = definition.execute(args, {
+    const prepared = withGrill(name, args)
+    const value = definition.execute(prepared, {
       name,
-      arguments: args,
+      arguments: prepared,
       agent: { session: { header: { id: sessionId, cwd } } },
       signal: opts.signal,
     })
@@ -146,10 +157,11 @@ const execOf = (name, args) => ({
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 5))
 
-async function runTool(name, args) {
+async function runTool(name, args = {}) {
   const definition = host.tools.get(name)
   assert.ok(definition, '工具未注册：' + name)
-  const value = await definition.execute(args, execOf(name, args))
+  const prepared = withGrill(name, args)
+  const value = await definition.execute(prepared, execOf(name, prepared))
   // 本文件的用例全部验证「每一步都停下来等用户确认」的手动门禁语义。
   // 门禁模式默认随档位（fast 档是自动通过），夹具里显式切成每步确认；
   // 自动通过的行为在 test/gatemode.test.mjs 里单独覆盖。
@@ -355,6 +367,94 @@ check('命令授权开关已退场，S1 也开不了', () => {
     assert.match(String(bigScope?.message ?? bigScope), /40000/)
   })
 }
+// 追问纪律是提交门槛，不是提示词里的建议：没问到共识的三种形态都在 submit 之前被拦下。
+{
+  const grillScope = {
+    commands: [], files_expected_to_change: ['src/auth/session.ts'],
+    capabilities: ['追问门槛'], out_of_scope_explicitly: [],
+    acceptance_criteria: [{ id: 'AC-1', when: '追问没问到共识', then: '提交被拒绝' }],
+  }
+  const askDoc = (overrides) =>
+    runTool('flowgate_doc', {
+      html: '<html><body><h1>需求文档</h1></body></html>',
+      scope: grillScope,
+      ...overrides,
+    }).catch((error) => error)
+  const stillOpen = await askDoc({ open_questions: ['两处数据冲突时以哪份为准'] })
+  const halfDecision = await askDoc({ decisions: [{ question: '只问了问题没有结论' }] })
+  const nothingClarified = await askDoc({ decisions: [], assumptions: [] })
+  check('未问清的三种形态都在提交前被拒', () => {
+    assert.match(String(stillOpen?.message ?? stillOpen), /还有 1 个未决问题没有问清/)
+    assert.match(String(stillOpen?.message ?? stillOpen), /两处数据冲突时以哪份为准/)
+    assert.match(String(halfDecision?.message ?? halfDecision), /缺 question 或 answer/)
+    assert.match(String(nothingClarified?.message ?? nothingClarified), /没有澄清任何东西/)
+  })
+}
+// AC-2：三份清单任意一份缺失都在提交前被拦，报错点名缺了哪份——schema 层拦不住直接调 execute 的宿主。
+{
+  const missingScope = {
+    commands: [], files_expected_to_change: ['src/auth/session.ts'],
+    capabilities: ['追问门槛'], out_of_scope_explicitly: [],
+    acceptance_criteria: [{ id: 'AC-1', when: '清单缺失', then: '提交被拒绝' }],
+  }
+  // 夹具默认会补一份清单，这里显式给 undefined 覆盖掉，模拟调用方根本没传这个字段。
+  const dropDoc = (key) => runTool('flowgate_doc', {
+    html: '<html><body><h1>需求文档</h1></body></html>',
+    scope: missingScope,
+    decisions: [{ question: '问什么', answer: '定什么' }],
+    assumptions: [],
+    open_questions: [],
+    [key]: undefined,
+  }).catch((error) => error)
+  const missing = {
+    decisions: await dropDoc('decisions'),
+    assumptions: await dropDoc('assumptions'),
+    open_questions: await dropDoc('open_questions'),
+  }
+  check('三份追问清单缺一份就拒绝提交，并点名缺了哪个', () => {
+    for (const [key, value] of Object.entries(missing)) {
+      const message = String(value?.message ?? value)
+      assert.match(message, /三份追问清单/, key)
+      assert.match(message, new RegExp('缺少 ' + key), key)
+      for (const name of ['decisions', 'assumptions', 'open_questions']) {
+        assert.ok(message.includes(name), key + ' 的报错里必须出现 ' + name)
+      }
+    }
+  })
+}
+// AC-5：追问纪律要出现在 Agent 真正读得到的地方，不能只写进一条提示词。
+{
+  const root = mkdtempSync(join(tmpdir(), 'flowgate-grill-'))
+  const ws = join(root, 'workspace')
+  mkdirSync(ws)
+  const cx = makeHost(ws, 'sess-grill')
+  // 工具启动与界面启动是两条路径：唤醒消息只有界面启动才会投递，工具返回的文案单独验。
+  mkdirSync(join(root, 'tool'))
+  const viaTool = makeHost(join(root, 'tool'), 'sess-grill-tool')
+  try {
+    const started = await viaTool.tool('flowgate_start', { preset: 'fast', brief: '把追问纪律写进 S1' })
+    // 全新工作区没有规则覆盖，S1 走档位默认——fast 档也必须带上追问规则。
+    await cx.request('/api/flowgate/action', {
+      sessionId: 'sess-grill', action: 'start', payload: { preset: 'fast', brief: '把追问纪律写进 S1' },
+    })
+    await tick()
+    const view = await cx.request('/api/flowgate/state?sessionId=sess-grill')
+    const ask = cx.tools.get('flowgate_ask').description
+    const wake = cx.delivered.map((item) => item.message.content.map((block) => block.text).join('\n')).join('\n')
+    check('追问纪律在 S1 规则、唤醒消息、ask 描述与 start 返回消息四处都写明', () => {
+      assert.ok(view.body.stageConfigs.S1.ids.includes('grill-until-agreed'), JSON.stringify(view.body.stageConfigs.S1.ids))
+      assert.ok(view.body.stageConfigs.S1.items.some((item) => item.name === '追问到共识再动手'))
+      assert.match(wake, /追问到共识再动手/)
+      assert.match(wake, /一次只问一个关键决策/)
+      assert.match(ask, /追问要问到共识/)
+      assert.match(ask, /open_questions 非空时提交会被拒绝/)
+      assert.match(started.message, /一次只解决一个分歧/)
+      assert.match(started.message, /答完接着问下一个/)
+    })
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+}
 // 需求文档 → 批准并冻结 scope（AC-2 的对照：这里走正常批准路径）。
 const scopeInput = {
   // P0-4：scope 由 Agent 自报。绝对路径与项目根之外的条目必须在提交时就被剔除，
@@ -387,6 +487,17 @@ check('提交的 scope 里越界条目被剔除并回报给界面', () => {
   assert.equal(docState.body.doc.droppedScopeEntries.length, 2)
   assert.ok(docState.body.doc.droppedScopeEntries.includes('../outside/evil.ts'))
   assert.ok(docState.body.doc.droppedScopeEntries.includes('D:/absolute/evil.ts'))
+})
+// 追问结果是文档的一部分，不是提交后即弃的对话记录：批准前就该能从落盘状态里查。
+check('追问结果随文档一起落盘', () => {
+  const dir = join(cwd, '.dsh-flowgate', 'flows')
+  const name = fs.readdirSync(dir).find((item) => item.endsWith('.json'))
+  assert.ok(name, '没有流程落盘文件')
+  const saved = JSON.parse(readFileSync(join(dir, name), 'utf8'))
+  assert.equal(saved.doc.grill.decisions.length, 1)
+  assert.equal(saved.doc.grill.decisions[0].question, '这次要改到什么程度？')
+  assert.deepEqual(saved.doc.grill.openQuestions, [])
+  assert.deepEqual(saved.doc.grill.blockers, [])
 })
 const approved = await postAction('doc', { decision: 'approve' })
 check('点「批准并冻结 scope」成功', () => assert.equal(approved.status, 200))
