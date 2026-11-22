@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { normalizeCriteria, acceptanceLedger, grillReadiness, remediationList, scopeReadiness, stageSummary } from '../lib/acceptance.js'
+import { needsOf, resolveExecutable } from '../lib/ecosystems.js'
+import { join } from 'node:path'
 
 const snapshot = { id: 'a'.repeat(64), complete: true }
 const runtime = { status: 'verified', hostRevision: 'host-v1', clientRevision: 'client-v1', pageId: 'page-1', viewport: { width: 1440, height: 900 } }
@@ -67,6 +69,78 @@ test('清单写对了但机器上没有这个可执行体时给出缺口，仓�
   assert.deepEqual(found.risks.map((item) => item.code), ['no-test-command'].filter(() => false))
   // 没有 project 时整条检查不参与：老调用点与未知工作区不受影响。
   assert.deepEqual(scopeReadiness(criteria, ['node test/x.mjs'], ['test/x.mjs']).risks, [])
+})
+
+test('每个生态都登记了「它靠谁才能跑」：包管理器指向解释器，自包含的留空', () => {
+  for (const [name, deps] of [
+    ['npm', ['node']], ['pnpm', ['node']], ['yarn', ['node']], ['npx', ['node']], ['corepack', ['node']],
+    ['composer', ['php']],
+    ['pip', ['python', 'python3', 'py']], ['poetry', ['python', 'python3', 'py']], ['uv', ['python', 'python3', 'py']],
+    ['bundle', ['ruby']], ['gem', ['ruby']],
+    ['mvn', ['java']], ['gradlew', ['java']],
+    ['prove', ['perl']],
+    ['luarocks', ['lua', 'luajit']],
+    ['cargo', ['rustc']],
+    ['mix', ['elixir']],
+  ]) {
+    assert.deepEqual(needsOf(name), deps, name)
+  }
+  // 自包含的生态留空：解释器就是那个工具本身，没有额外一层可查。
+  for (const name of ['go', 'dotnet', 'deno', 'bash', 'pwsh', 'cmd', 'make']) {
+    assert.deepEqual(needsOf(name), [], name)
+  }
+  // 名字先归一化再查表：带目录、带 Windows 扩展名的写法认得出同一条。
+  assert.deepEqual(needsOf('C:/tools/npm.cmd'), ['node'])
+  assert.deepEqual(needsOf('C:\\tools\\npm.cmd'), ['node'])
+  assert.deepEqual(needsOf('"npm"'), ['node'])
+  // 没登记的名字不猜。
+  assert.deepEqual(needsOf('some-unknown-tool'), [])
+})
+
+test('带目录的写法相对仓库根解析：宿主进程 cwd 不是仓库根时也不误报', () => {
+  const root = process.cwd()
+  // 相对路径按调用方给的 cwd 解析，而不是按宿主进程的 cwd。
+  const here = resolveExecutable('./package.json', { cwd: root })
+  assert.equal(here.found, true)
+  assert.equal(here.source, 'relative')
+  assert.equal(here.path, join(root, 'package.json'))
+  // 换个 cwd 就找不到：证明用的是传入的 cwd，不是 process.cwd()。
+  assert.equal(resolveExecutable('./package.json', { cwd: join(root, 'lib') }).found, false)
+  // 绝对路径直接查，不走 cwd。
+  const absolute = resolveExecutable(process.execPath, { cwd: join(root, 'lib') })
+  assert.equal(absolute.found, true)
+  assert.equal(absolute.source, 'absolute')
+  // 空 token 不猜。
+  assert.equal(resolveExecutable('   ').source, 'empty')
+})
+
+test('工具在、它依赖的解释器不在时照样报缺口，并点名缺的是哪一层', () => {
+  const criteria = [{ id: 'AC-1', when: '跑测试', then: '全部通过', verification: { method: 'unit', procedure: '运行用例' } }]
+  const project = (ecosystems, found) => ({
+    ecosystems,
+    resolveExecutable: (token) => ({ found: found.includes(token), path: found.includes(token) ? '/usr/bin/' + token : null, source: 'path' }),
+  })
+  // npm 本身是 node 程序：npm 在、node 不在，命令到 S2 照样 127。
+  const viaTool = scopeReadiness(criteria, ['npm test'], [], { project: project(['node'], ['npm']) })
+  assert.deepEqual(viaTool.risks.map((item) => item.code), ['command-runtime-missing'])
+  assert.deepEqual(viaTool.risks[0].commands, ['npm test'])
+  assert.match(viaTool.risks[0].message, /npm 在，但它需要的 node 不在/)
+  // 依赖也在就不报。
+  const both = scopeReadiness(criteria, ['npm test'], [], { project: project(['node'], ['npm', 'node']) })
+  assert.ok(!both.risks.some((item) => item.code === 'command-runtime-missing'))
+  // 候选写法任一存在即算通过：python / python3 的命名差异不该判成缺。
+  const candidate = scopeReadiness(criteria, ['uv sync'], [], { project: project(['python'], ['uv', 'python3']) })
+  assert.ok(!candidate.risks.some((item) => item.code === 'command-runtime-missing'))
+  const candidateGone = scopeReadiness(criteria, ['uv sync'], [], { project: project(['python'], ['uv']) })
+  assert.match(candidateGone.risks[0].message, /uv 在，但它需要的 python 或 python3 或 py 不在/)
+  // 首 token 也不在时第一层就收下，不再顺依赖查第二层：缺口只出一条，命令不重复记。
+  const headGone = scopeReadiness(criteria, ['npm test', 'npm run build'], [], { project: project(['node'], []) })
+  assert.equal(headGone.risks.filter((item) => item.code === 'command-runtime-missing').length, 1)
+  assert.deepEqual(headGone.risks[0].commands, ['npm test', 'npm run build'])
+  assert.match(headGone.risks[0].message, /命令本身找不到/)
+  // 仓库没声明这个生态：跳过比误报有用。
+  const skipped = scopeReadiness(criteria, ['composer install'], [], { project: project(['node'], ['composer']) })
+  assert.ok(!skipped.risks.some((item) => item.code === 'command-runtime-missing'))
 })
 
 test('验证步骤点名 scope 外的文件时给出缺口，点名的文件已在 scope 内就不再提示', () => {

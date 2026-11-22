@@ -454,6 +454,11 @@ check('命令授权开关已退场，S1 也开不了', () => {
       assert.match(ask, /open_questions 非空时提交会被拒绝/)
       assert.match(started.message, /一次只解决一个分歧/)
       assert.match(started.message, /答完接着问下一个/)
+      // 清单里的命令能不能跑，S1 就该验一次：这条要求写在 doc 工具描述里，Agent 才读得到。
+      assert.match(cx.tools.get('flowgate_doc').description, /提交 scope 前先对清单里每个工具跑一次版本探测/)
+      assert.match(cx.tools.get('flowgate_doc').description, /绝对路径的探测/)
+      // 探测出问题要落到清单上，不是知道了就完：这条是「S1 就该验」的收口。
+      assert.match(cx.tools.get('flowgate_doc').description, /跑不通就把绝对路径或替代方案写进清单/)
     })
   } finally {
     rmSync(root, { recursive: true, force: true })

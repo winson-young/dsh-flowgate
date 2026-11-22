@@ -180,7 +180,7 @@ S4 出口门禁有三种结束方式，状态、事件与界面文案各不相�
 | `visual-without-measurement` | 视觉验收没写明怎么测 | 缺口，需显式接受 |
 | `over-broad-command` | 出现 `npm *`、`node *`、`*` 这类通配，或条目数超过 `max(8, 可执行 AC 数 × 2)` | 缺口，需显式接受 |
 | `command-not-applicable` | `npm run <script>` 的脚本在 `package.json` 里不存在 | 缺口，需显式接受 |
-| `command-runtime-missing` | 命令用到的可执行体在当前 PATH 上找不到（`node`、`php`、`cargo`…） | 缺口，需显式接受 |
+| `command-runtime-missing` | 命令用到的可执行体在当前 PATH 上找不到（`node`、`php`、`cargo`…），或者它本身在、它依赖的解释器不在（`npm` 在而 `node` 不在） | 缺口，需显式接受 |
 | `command-without-ac` | 命令没挂任何 AC（可能用于构建或静态检查） | 只提示，不阻塞 |
 
 `npm run *` 不算超宽：它只能在 `package.json` 的 `scripts` 里选，范围本身有限，插件一直支持这种前缀通配。
@@ -202,9 +202,15 @@ S4 出口门禁有三种结束方式，状态、事件与界面文案各不相�
 
 清单写对不等于跑得起来。`projectProfile` 会读 `package.json` 的 `scripts`、`tsconfig`、`Makefile` 与各测试框架配置，据此判断命令「该不该存在」；但很长一段时间里，没有任何一处判断这个可执行文件「这台机器上有没有」。于是裸 `node test/x.mjs` 一路通过 S1 体检、在 S1 门禁上被批准，到 S2 才被 shell 自己以 127 拒绝——那时用户已经批过 scope 了。
 
-现在 S1 提交 scope 时多一道 `command-runtime-missing`：对清单里每条命令取首个 token，若该名字属于登记表、且仓库里确实声明了对应生态（`markers` 命中），就用宿主进程的 PATH 与 `PATHEXT` 解析它是否存在（绝对路径则直接 `existsSync`）。找不到就记一条缺口，提示把绝对路径写进清单或先装好它。
+现在 S1 提交 scope 时多一道 `command-runtime-missing`：对清单里每条命令取首个 token，若该名字属于登记表、且仓库里确实声明了对应生态（`markers` 命中），就用宿主进程的 PATH 与 `PATHEXT` 解析它是否存在（带目录的写法直接 `existsSync`：绝对路径原样查，`./gradlew`、`tools/node` 这类相对路径相对仓库根解析，不按宿主进程的 cwd）。找不到就记一条缺口，提示把绝对路径写进清单或先装好它。
 
-刻意收窄的两处：只核对「仓库里声明了这个生态」的命令，空目录里写 `node test/x.mjs` 无从判断，跳过比误报有用；只取首个 token，`npm` 在而它内部拉起的 `node` 不在这种子进程缺失仍然查不出来。
+只查第一个 token 有个明显的洞：`npm` 本身就是个 node 程序，`composer` 是个 php 程序，`prove` 是个 perl 程序——包管理器在、解释器不在的机器上，首 token 查得到，命令照样跑不起来。所以登记表每条生态多一个 `needs` 字段，写清「这个名字必须先有谁才能跑起来」（`npm` / `pnpm` / `yarn` / `npx` / `corepack` → `node`，`composer` → `php`，`pip` 家族 → `python` / `python3` / `py`，`bundle` 家族 → `ruby`，`mvn` 家族 → `java`，`prove` / `cpanm` / `carton` → `perl`，`luarocks` → `lua`，`cargo` → `rustc`，`mix` → `elixir`；`go`、`dotnet`、`deno`、shell、PowerShell、`cmd`、`make` 是自包含的，留空）。体检顺着查一层，缺了就并进同一条缺口，并在文案里点名缺的是哪一层：「`npm` 在，但它需要的 `node` 不在」。
+
+依赖写成候选列表而不是单一名字，是因为同一个东西有多个叫法：`python` / `python3` / `py`、`lua` / `luajit`。**任一存在即算通过**——Windows 上只有 `py` 启动器的机器不该被判成缺依赖。未登记的名字一律返回空列表，不猜。
+
+刻意收窄的两处：只核对「仓库里声明了这个生态」的命令，空目录里写 `node test/x.mjs` 无从判断，跳过比误报有用；只往下查一层依赖，`npm` 拉起的 `node` 里再 `require` 了什么、`mvn` 要的 JDK 版本够不够，静态都看不出来。
+
+静态体检管不到的那半，交给 S1 的版本探测：`node --version`、`php --version` 这类命令属于只读白名单，任何阶段都放行，提交 scope 前对清单里每个工具跑一次，跑不通就把绝对路径或替代方案写进清单。这一步是 `flowgate_doc` 工具描述里的硬要求，不是可选建议——文件在不在能查，跑起来报不报错只有真跑一次才知道。绝对路径的探测（`C:/…/node.exe --version`）不在只读白名单里，S1 会被拒；所以探测要用裸名，报「找不到」恰好说明该把绝对路径写进清单，交给 S2 按清单放行。
 
 用风险码而不是阻塞项，是因为它不该拦住流程：用户可能就想先批准、到 S2 再装环境。但 `fast` 档的自动通过会把风险一起算进门禁项，所以它一定会停在门禁卡上被看见一次，不会静默滑进开发阶段。
 
