@@ -132,7 +132,10 @@ test('工具在、它依赖的解释器不在时照样报缺口，并点名缺�
   const candidate = scopeReadiness(criteria, ['uv sync'], [], { project: project(['python'], ['uv', 'python3']) })
   assert.ok(!candidate.risks.some((item) => item.code === 'command-runtime-missing'))
   const candidateGone = scopeReadiness(criteria, ['uv sync'], [], { project: project(['python'], ['uv']) })
-  assert.match(candidateGone.risks[0].message, /uv 在，但它需要的 python 或 python3 或 py 不在/)
+  // uv sync 不是测试命令，会先多出一条 no-test-command：按 code 取，不赌顺序。
+  const candidateRisk = candidateGone.risks.find((item) => item.code === 'command-runtime-missing')
+  assert.ok(candidateRisk, JSON.stringify(candidateGone.risks))
+  assert.match(candidateRisk.message, /uv 在，但它需要的 python 或 python3 或 py 不在/)
   // 首 token 也不在时第一层就收下，不再顺依赖查第二层：缺口只出一条，命令不重复记。
   const headGone = scopeReadiness(criteria, ['npm test', 'npm run build'], [], { project: project(['node'], []) })
   assert.equal(headGone.risks.filter((item) => item.code === 'command-runtime-missing').length, 1)
