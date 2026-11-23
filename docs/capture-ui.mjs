@@ -3,7 +3,12 @@
  * Node 22+ and existing React dev dependencies are required. Connect Chrome CDP
  * with file access enabled, then run: node docs/capture-ui.mjs [--verify-only]
  * FLOWGATE_CDP overrides http://127.0.0.1:9229. Workspace and rules images are written.
- * A dedicated tab is created and closed without navigating existing tabs.
+ * A dedicated tab is created and closed without navigating existing tabs when the
+ * browser supports PUT /json/new. Electron-based DSH desktop does not (it answers
+ * HTTP 500 / "Not supported"), so the script then reuses one existing page target,
+ * navigates it to the fixtures and navigates it back to its original URL afterwards.
+ * That reuse mode discards unsaved input in that window: point it at a throwaway
+ * instance started by scripts/start-cdp.mjs rather than your daily window.
  */
 import { writeFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
@@ -17,7 +22,18 @@ const json = async (path, options) => {
   return response.json()
 }
 const originalPages = (await json('/json/list')).filter(page => page.type === 'page')
-const target = await json('/json/new?about:blank', { method: 'PUT' })
+// Electron 不支持 PUT /json/new（返回 HTTP 500 / Not supported），此时复用已有页面。
+let target = null, createdTab = false, reusedUrl = null
+try {
+  target = await json('/json/new?about:blank', { method: 'PUT' })
+  createdTab = true
+} catch (error) {
+  const reusable = originalPages.find(page => page.webSocketDebuggerUrl)
+  if (!reusable) throw Error('CDP 既不能新建标签，也没有可复用的页面：请先在目标实例里打开一个页面。原始错误：' + error.message)
+  target = reusable
+  reusedUrl = reusable.url
+  console.error('CDP 不支持新建标签（' + error.message + '），改用复用模式：' + reusable.url + '，结束时导航回该地址。')
+}
 let ws = null, nextId = 0, currentCase = null
 const pending = new Map(), events = new Map(), errors = [], cases = [], layoutIssues = [], checks = [], screenshots = []
 const onMessage = event => {
@@ -52,6 +68,13 @@ const key = async (name, modifiers = 0) => {
   const text = !modifiers && (name === 'Enter' || name === ' ') ? (name === 'Enter' ? String.fromCharCode(13) : ' ') : undefined
   await send('Input.dispatchKeyEvent', { type: 'keyDown', ...params, ...(text ? { text, unmodifiedText: text } : {}) })
   await send('Input.dispatchKeyEvent', { type: 'keyUp', ...params })
+}
+let restored = false
+const restoreOriginalPage = async () => {
+  if (createdTab || restored || !reusedUrl) return
+  restored = true
+  await send('Page.navigate', { url: reusedUrl })
+  await new Promise(resolve => setTimeout(resolve, 800))
 }
 const check = (name, pass, detail) => {
   checks.push({ case: currentCase, name, pass, ...(detail === undefined ? {} : { detail }) })
@@ -141,9 +164,10 @@ const startWithKeyboard = async theme => {
   const actions = await evaluate('window.fixtureActions.filter(a=>a.action==="start")')
   const prepared = await evaluate('window.fixtureRequests.filter(r=>r.route.includes("/hub/prepare"))')
   check('clicking start prepares once with the raw requirement', prepared.length === 1 && prepared[0].body.brief === brief, prepared.length)
-  check(theme === 'light' ? 'Ctrl+Enter starts once with original and prepared summary' : 'Enter starts once with original and prepared summary', actions.length === 1 && actions[0].payload.brief === brief && actions[0].payload.title.startsWith('新需求') && actions[0].payload.summary.startsWith('目标与要求'))
+  // 启动请求只带标题、档位与原文：整理稿由宿主在启动时生成，不再随请求提交。
+  check(theme === 'light' ? 'Ctrl+Enter starts once with the original requirement' : 'Enter starts once with the original requirement', actions.length === 1 && actions[0].payload.brief === brief && actions[0].payload.title.startsWith('新需求') && !('summary' in actions[0].payload))
   check('start form shows no preparation status copy', await evaluate('!document.body.textContent.includes("自动生成暂不可用") && !document.body.textContent.includes("本地整理") && !document.body.textContent.includes("重新生成标题与整理稿")'))
-  check('current flow shows prepared content and expandable original', await evaluate('document.querySelector(".fg-current-flow .fg-requirement-text")?.textContent.startsWith("目标与要求") && document.querySelector(".fg-current-flow .fg-requirement-original")?.textContent.includes("C:/Projects/atlas-console")'))
+  check('current flow shows the original requirement', await evaluate('document.querySelector(".fg-current-flow .fg-requirement-text")?.textContent===' + JSON.stringify(brief)))
   await evaluate('window.fixturePrepare.delay=80')
 }
 const inspectRules = async () => {
@@ -179,7 +203,6 @@ const inspectRules = async () => {
   await click('添加规则', modal)
   await fill('[role=dialog] input[placeholder="规则名称"]', '检查会话恢复')
   await fill('[role=dialog] textarea[placeholder="检查要点，每行一条"]', '保留 30 分钟与 401\n写入仅在单独授权后执行')
-  await evaluate(modal + '.querySelector(".fg-modal-form input[type=checkbox]").click()')
   await click('加入列表', modal)
   await inspectLayout('custom test direction added')
   await click(stageLabels[0], modal)
@@ -269,14 +292,20 @@ try {
       errors.push({ case: currentCase, error: error.message })
     }
   }
+  await restoreOriginalPage()
   const after = await json('/json/list')
   const result = { preview: 'file fixtures, not deployed DSH', scenarios: scenarios.length * widths.length * themes.length, layoutSnapshots: cases.length, checks: checks.length, failedChecks: checks.filter(item => !item.pass), errors, overflows: cases.filter(item => item.overflow.length), layoutIssues, screenshots, originalTabsPreserved: originalPages.every(page => after.some(item => item.id === page.id && item.url === page.url)) }
   console.log(JSON.stringify(result, null, 2))
   if (errors.length || result.overflows.length || layoutIssues.length) process.exitCode = 1
 } finally {
+  try {
+    await restoreOriginalPage()
+  } catch (error) {
+    console.error('恢复原页面失败：' + error.message)
+  }
   ws?.close()
   for (const item of pending.values()) { clearTimeout(item.timer); item.reject(Error('Preview connection closed')) }
-  if (target.id) {
+  if (createdTab && target.id) {
     const closed = await fetch(endpoint + '/json/close/' + target.id, { signal: AbortSignal.timeout(10000) })
     if (!closed.ok) throw Error('Could not close dedicated preview tab: HTTP ' + closed.status)
   }

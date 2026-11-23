@@ -40,7 +40,10 @@
     "test:integration": "node test/integration.test.mjs",
     "test:install": "node test/install.test.mjs",
     "stamp": "node scripts/stamp-revisions.mjs",
-    "check": "node scripts/stamp-revisions.mjs --check && node --check lib/index.js && node --check lib/client.js && node --check lib/provenance.js && node --check lib/acceptance.js && node --check lib/ecosystems.js && node --check lib/runtime.js && node --check lib/revisions.js && node --check docs/verify-layout.mjs"
+    "cdp": "node scripts/start-cdp.mjs",
+    "ui": "node docs/capture-ui.mjs",
+    "ui:verify": "node docs/capture-ui.mjs --verify-only",
+    "check": "node scripts/stamp-revisions.mjs --check && node --check lib/index.js && node --check lib/client.js && node --check lib/provenance.js && node --check lib/acceptance.js && node --check lib/ecosystems.js && node --check lib/runtime.js && node --check lib/revisions.js && node --check docs/verify-layout.mjs && node --check docs/capture-ui.mjs && node --check scripts/start-cdp.mjs"
   },
   "dsh": {
     "bundle": {

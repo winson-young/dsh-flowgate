@@ -6,6 +6,30 @@
 
 历史记录中的 `by: 'subagents'` 仅表明调用了子代理聚合入口；聚合报告通过、`blocking: 0` 或流程走完，均不能证明真实子代理成功执行并返回有效报告。下文原有结论保留，其证据范围受此限定。
 
+## CDP 调试通道与界面验证脚本落地（2026-11-23）
+
+需求：用户提问「这个插件做测试经常遇到实机没办法走，或者 ui 没办法实测，这种有办法解决吗？我应该装什么插件或者做什么设置能解决呢？告诉我方案，不改东西」（m00297），随后授权开 CDP 试跑（m00321），再授权「先把现有的代码提交一下，然后固化和改造」（m00477）。
+
+**根因：桌面端默认没有 CDP，而手动加参数会立刻退出。** 直接在命令行给 `[DSH].exe` 传 `--remote-debugging-port` 会报 `bad option` 后秒退。扫二进制确认 `bad option: ` 来自 Node 解释器的参数解析（邻近 `node.cc:260`），不是 Electron 的 switch 表；再查环境发现 `ELECTRON_RUN_AS_NODE=1` 在会话环境里——该变量让 Electron 二进制退化成纯 Node，调试端口参数自然成了非法参数。启动子进程前删掉 `ELECTRON_RUN_AS_NODE`（连同 `DSH_NODE_EXECUTABLE`、`ELECTRON_NO_ATTACH_CONSOLE`）即可正常起调试端口。
+
+**固化：新增 [启动脚本](../scripts/start-cdp.mjs)。** 参数 `--port`（默认 9222）、`--exe`、`--profile`（默认 `.dsh-flowgate/cdp-profile`）、`--timeout`（默认 30）、`--dry-run`、`--help`。可执行文件按 `.exe` 后缀加排除 `uninstall` 查找——安装目录里的文件名带方括号，用通配符拼路径会被 shell 当 glob 解析。端口已就绪时只探测并报告，不重复启动。
+
+**改造：[截图脚本](capture-ui.mjs) 支持复用模式。** Electron 不支持 `Target.createTarget`，`PUT /json/new` 返回 HTTP 500 / `Not supported`，原实现直接抛错退出。现在优先新建标签（`createdTab`），失败则复用已有 page target 并记下 `reusedUrl`，结束时 `Page.navigate` 回原地址；关闭标签只在真的新建过时执行。复用模式会丢弃该窗口未保存的输入，脚本头注释与开发文档都写明了这一点。
+
+**同轮修掉三处过时断言**（与本次改造无关，是此前改组件后没跟着改的）：启动请求不再带 `summary`（整理稿由宿主在启动时生成）；「当前流程」卡片显示需求原文而不是整理稿，且没有 `fg-requirement-original` 节点；规则弹窗里已没有「新增自定义」表单的复选框。
+
+| 验收项 | 状态 | 证据与限制 |
+| :--- | :--- | :--- |
+| AC-1 桌面端能起 CDP | 通过 | `node scripts/start-cdp.mjs` 后 `http://127.0.0.1:9222/json/version` 返回 `Chrome/152.0.7977.130` / `Electron/44.7.0` / `@deepseek-ai/dsh-desktop/0.2.2-rc.5` |
+| AC-2 版本核对链路在真实桌面端成立 | 通过 | `node docs/verify-layout.mjs --cdp http://127.0.0.1:9222 --page-url "dsh-app://app/" …` 退出码 0，`runtime.status: "verified"`，`hostRevision` 与 `diskHostRevision` 同为 `03b67705f8026e59593238035b0cd794a32d018a960d3781ba34e96d0475b3d6`，`clientRevision` 与 `expectedClientRevision` 同为 `a127aa6095ef2531d8d4259fbd259f9c3365f5a5c6bfe9749acbe350f3b4f639`，viewport 1280×820 |
+| AC-3 capture-ui 在 Electron 上能跑完 | 通过 | 复用模式：130 个场景、260 次布局快照、652 项检查，`failedChecks` / `errors` / `overflows` / `layoutIssues` 全为空，`originalTabsPreserved: true`，退出码 0 |
+| AC-4 capture-ui 在普通 Chrome 上仍走新建标签 | 通过 | headless Chrome 157.0.8103.79（9229）同样 130 / 260 / 652，无异常，退出码 0；该路径下未触发复用分支 |
+| AC-5 三处过时断言已修正 | 通过 | 修正前两处必错（`startsWith` of undefined、`null.click`），修正后两处环境 0 失败 |
+| AC-6 `npm run check` 覆盖新脚本 | 通过 | `package.json` 的 `check` 追加 `docs/capture-ui.mjs` 与 `scripts/start-cdp.mjs` 的 `node --check`，输出 `Module revisions verified (7 modules).` 后退出码 0 |
+| AC-7 真实门禁元素的视觉取证 | 未执行 | 当前 `.dsh-flowgate/flows/` 没有未完成流程，取不到真实门禁元素；`inspectLayout` 在无 sessionId 时按设计返回 `status: uncovered`（reason「必须明确指定真实任务的 sessionId。」）。截图本轮用 `--verify-only`，未覆盖 `docs/images/` 下的既有图片 |
+
+限制：以上界面结果全部来自 `file:` 预览加载源码组件与模拟接口，不证明真实 DSH 已加载本轮改动；`verify-layout` 那次取证用的是已认证的真实桌面端页面，只证明版本核对与布局测量链路可用，不证明门禁交互通过。
+
 ## 补命令清单只在门禁上二选一（2026-11-23）
 
 需求：用户原文（m00001）「现在流程还是有混乱的地方，比如开发过程发现有命令清单需要加，会有一个【查看】按钮，点进去看到命令之后再点击单独加这个命令到这个清单，但是好像任何时候都可以加这个命令进去清单，最好是这个阶段一开始就查询有没有需要补的清单，如果有就阻塞等待用户选择，只给两个按钮，一个是补，一个是不补，然后再根据选择情况继续进行流程」。方案经三轮问答定稿后授权改代码（m00085）。

@@ -361,6 +361,14 @@ desktop profile 使用 `link:D:/Projects/dsh-flowgate` 时会直接指向本项�
 
 [布局取证脚本](verify-layout.mjs) 复用[截图脚本](capture-ui.mjs) 的 CDP 连接及异步求值基础，只连接用户明确提供的**已有、已认证 DSH 桌面端页面**。脚本要求 Node >=22 的内置 WebSocket；插件运行要求仍是 Node >=20，无新增依赖。请从该桌面端现有开发者工具取得实际调试地址、完整页面 URL、会话 ID、任务条与目标条的唯一真实选择器，不要求另行启动 `dsh web` 或提供不存在的启动链接。
 
+调试地址通常得自己开。桌面端默认不监听 CDP，用[启动脚本](../scripts/start-cdp.mjs)起一个带调试端口的独立实例（独立用户目录，不影响日常窗口）：
+
+```bash
+node scripts/start-cdp.mjs --port 9222
+```
+
+脚本会先探测端口，已就绪就只报告不重复启动。关键一步是启动子进程前**删掉 `ELECTRON_RUN_AS_NODE`**：该变量一旦存在，Electron 二进制会退化成纯 Node 解释器，`--remote-debugging-port` 被当成 Node 的非法参数，进程报 `bad option` 后立刻退出。脚本同时清掉 `DSH_NODE_EXECUTABLE` 与 `ELECTRON_NO_ATTACH_CONSOLE`。安装目录里可执行文件名带方括号，脚本按 `.exe` 后缀加排除 `uninstall` 的方式查找，不要用通配符直接拼路径。
+
 先运行 `node docs/verify-layout.mjs --help` 查看中文参数说明，再使用实际值替换以下占位符：
 
 ```bash
@@ -390,8 +398,8 @@ JSON 默认输出到标准输出，`--out` 可额外写入指定文件。没有 
 
 README 的界面图使用真实插件组件与示例数据；[预览页](ui-preview.html) 以 `file:` 加载组件，不代表真实 DSH 已部署或加载新代码。[截图脚本](capture-ui.mjs) 更新 [工作区截图](images/workspace.png) 与 [规则截图](images/rules.png)，其他界面仅验证，不覆盖已有图片。使用现有开发依赖与 Node 22 或更新版本（需要内置 WebSocket）：
 
-1. 连接已有 Chrome CDP，或启动独立调试实例，传入 `--headless=new --remote-debugging-port=9229 --allow-file-access-from-files --user-data-dir=<独立临时目录>`，不要使用日常浏览器的用户目录。
-2. 在项目根运行 `node docs/capture-ui.mjs`；只验证、不改图片时运行 `node docs/capture-ui.mjs --verify-only`。调试地址可通过 `FLOWGATE_CDP` 覆盖。脚本新建独立标签，完成后关闭，保留原有标签与页面。
+1. 准备一个带调试端口的浏览器。首选桌面端自己：`node scripts/start-cdp.mjs`（默认 9222）。需要无头环境时用独立 Chrome：`--headless=new --remote-debugging-port=9229 --allow-file-access-from-files --user-data-dir=<独立临时目录>`，不要使用日常浏览器的用户目录。
+2. 在项目根运行 `npm run ui`；只验证、不改图片时运行 `npm run ui:verify`。调试地址通过 `FLOWGATE_CDP` 覆盖（默认 `http://127.0.0.1:9229`）。脚本优先新建独立标签，完成后关闭，保留原有标签与页面；浏览器不支持新建标签时（Electron 的 `PUT /json/new` 返回 HTTP 500 / `Not supported`）自动改为复用已有页面，并在结束时导航回原地址——复用模式会丢掉那个窗口里未保存的输入，所以只指向 `scripts/start-cdp.mjs` 起的临时实例。整套用例接近 5 分钟，前台运行容易撞上工具超时，长跑请放到后台。
 3. 脚本在 264 / 320 / 390 / 768 / 1280 像素、明暗主题下检查空闲但有已结束历史、进行中、完成后与放弃后的布局，同时验证历史展开/收起、每页 10 条分页，以及键盘启动、继续和历史操作。预览可用 `?stage=workspace&state=idle|active|finished|cancelled&theme=light|dark` 切换；进行中样例位于历史第三页，用于检查主入口独立于分页。
 4. 同时验证四阶段规则切换、默认原文对照、恢复与统一保存、Esc 取消，以及标题和整理稿自动生成、迟到响应隔离与失败重试。人工核对生成的两张图；真实 DSH 仍需按宿主方式构建并刷新其原有 GUI 地址，再单独验证。
 
