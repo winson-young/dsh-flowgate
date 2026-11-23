@@ -92,7 +92,7 @@ const navigate = async (stage, state, theme) => {
   await ready('document.querySelector(".fg-root") && !document.body.textContent.includes("正在连接宿主端")')
 }
 const inspectLayout = async phase => {
-  const info = await evaluate('(()=>({overflow:[...document.querySelectorAll(".fg-root,.fg-content,.fg-head,.fg-card,.fg-opt,.fg-hub-ws,.fg-stage-list,.fg-gate,.fg-workspace-overview,.fg-workspace-primary,.fg-workspace-card,.fg-pagination,.fg-modal,.fg-workspace-rule-row,.fg-workspace-rule-body,.fg-workspace-rule-footer,.fg-requirement")].filter(el=>el.getClientRects().length&&el.scrollWidth>el.clientWidth+2).map(el=>({class:el.className,width:el.clientWidth,scroll:el.scrollWidth})),background:getComputedStyle(document.querySelector(".fg-root")).backgroundColor}))()')
+  const info = await evaluate('(()=>({overflow:[...document.querySelectorAll(".fg-root,.fg-content,.fg-head,.fg-card,.fg-opt,.fg-hub-ws,.fg-stage-list,.fg-gate,.fg-workspace-overview,.fg-workspace-primary,.fg-workspace-card,.fg-pagination,.fg-modal,.fg-workspace-rule-row,.fg-workspace-rule-body,.fg-workspace-rule-footer,.fg-requirement,.fg-disclosure,.fg-disclosure-body")].filter(el=>el.getClientRects().length&&el.scrollWidth>el.clientWidth+2).map(el=>({class:el.className,width:el.clientWidth,scroll:el.scrollWidth})),background:getComputedStyle(document.querySelector(".fg-root")).backgroundColor}))()')
   cases.push({ ...currentCase, phase, ...info })
 }
 const inspectWorkspace = async state => {
@@ -106,6 +106,8 @@ const historyAndKeyboard = async state => {
   await ready('document.querySelector(".fg-flow-history").open')
   check('Enter expands history', true)
   await inspectLayout('history expanded')
+  const reachability = await evaluate('(()=>{const main=document.querySelector(".fg-hub > .fg-main"),list=document.querySelector(".fg-flow-history .fg-flow-list"),pagination=document.querySelector(".fg-pagination");pagination.scrollIntoView({block:"end"});const p=pagination.getBoundingClientRect(),m=main.getBoundingClientRect();return {width:document.querySelector(".fg-root").clientWidth,overflow:getComputedStyle(main).overflowY,listOverflow:getComputedStyle(list).overflowY,top:p.top,bottom:p.bottom,mainTop:m.top,mainBottom:m.bottom}})()')
+  check('history pagination is reachable through the workspace scroll area', reachability.overflow === 'auto' && reachability.top >= reachability.mainTop - 1 && reachability.bottom <= reachability.mainBottom + 1 && (reachability.width > 480 || reachability.listOverflow === 'visible'), reachability)
   for (const [label, page, rows] of [['下一页', 2, 10], ['下一页', 3, 3], ['上一页', 2, 10], ['上一页', 1, 10]]) {
     await evaluate('(' + button(label, 'document.querySelector(".fg-pagination")') + ').focus()')
     await key('Enter')
@@ -193,6 +195,12 @@ const inspectRules = async () => {
   const original = modal + '.querySelector("button[aria-label^=恢复内置规则]").closest(".fg-workspace-rule-item").querySelector("details")'
   await evaluate('(' + original + ').querySelector("summary").focus()'); await key('Enter')
   check('builtin original expands for comparison', await evaluate('(' + original + ').open'))
+  const disclosure = await evaluate('(()=>{const el=(' + original + '),head=el.querySelector("summary"),body=el.querySelector(".fg-disclosure-body"),h=head.getBoundingClientRect(),b=body.getBoundingClientRect(),r=el.getBoundingClientRect();return {height:h.height,display:getComputedStyle(head).display,outline:getComputedStyle(head).outlineStyle,focus:document.activeElement===head,padding:parseFloat(getComputedStyle(body).paddingLeft),bodyInside:b.left>=r.left&&b.right<=r.right,title:body.querySelector("strong")?.textContent,content:body.textContent,points:body.querySelectorAll("li").length,compact:h.width<r.width,border:getComputedStyle(el).borderTopWidth,rail:getComputedStyle(body).borderLeftWidth,background:getComputedStyle(head).backgroundColor,overflow:el.scrollWidth>el.clientWidth+2}})()')
+  check('builtin disclosure has a compact keyboard trigger and unboxed inset content', disclosure.height >= 32 && disclosure.display === 'flex' && disclosure.focus && disclosure.outline === 'solid' && disclosure.padding >= 10 && disclosure.bodyInside && disclosure.compact && disclosure.border === '0px' && disclosure.rail === '1px' && disclosure.background === 'rgba(0, 0, 0, 0)' && disclosure.points > 0 && !disclosure.overflow, disclosure)
+  await key(' '); await ready('!(' + original + ').open')
+  check('Space collapses builtin original without changing its content', await evaluate('(' + original + ').querySelector(".fg-disclosure-body").textContent===' + JSON.stringify(disclosure.content)))
+  await key('Enter'); await ready('(' + original + ').open')
+  await evaluate('(' + original + ').scrollIntoView({block:"center"})')
   await inspectLayout('builtin original expanded')
   await saveScreenshot('rules')
   await click('恢复内置', modal)

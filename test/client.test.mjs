@@ -885,17 +885,17 @@ await check('阶段提示：投递失败要留下可诊断的错误行，认不�
   assert.deepEqual(buttons(nodeByClass((await render(stageHint, {})).toJSON(), 'fg-hint-actions')).map((node) => flat(node)), ['结束流程', '放弃这次流程'])
 })
 
-await check('阶段提示：各阶段左侧内容保持两行，右侧独立承载按钮', async () => {
+await check('阶段提示：标题计时与待办分组，右侧独立承载按钮', async () => {
   for (const stage of ['S1', 'S2', 'S3', 'S4']) {
     currentView = baseView(stage, { elapsedMs: 96000 })
     const tree = (await render(stageHint, {})).toJSON()
     const hint = nodeByClass(tree, 'fg-hint')
     const content = nodeByClass(hint, 'fg-hint-content')
     const head = nodeByClass(content, 'fg-hint-head')
-    assert.ok(nodeByClass(head, 'fg-hint-title'), stage + ' 标题保留在左侧第一行')
-    assert.ok(nodeByClass(head, 'fg-hint-elapsed'), stage + ' 时长保留在左侧第一行')
-    assert.deepEqual(head.children.map((node) => node.props.className), ['fg-hint-elapsed', 'fg-hint-title'], stage + ' 计时应贴在标题左侧')
-    assert.ok(nodeByClass(content, 'fg-hint-info'), stage + ' 阶段详情保留在左侧第二行')
+    assert.ok(nodeByClass(head, 'fg-hint-title'), stage + ' 标题保留在左侧辅助信息组')
+    assert.ok(nodeByClass(head, 'fg-hint-elapsed'), stage + ' 时长保留在左侧辅助信息组')
+    assert.deepEqual(head.children.map((node) => node.props.className), ['fg-hint-title', 'fg-hint-elapsed'], stage + ' 标题在前，辅助计时在后')
+    assert.ok(nodeByClass(content, 'fg-hint-info'), stage + ' 阶段与待办保留在独立信息组')
     assert.equal(nodeByClass(content, 'fg-hint-actions'), null, '按钮不应挤进左侧内容')
     assert.ok(nodeByClass(hint, 'fg-hint-actions'), stage + ' 右侧应有操作按钮')
   }
@@ -913,7 +913,7 @@ function quickDialog(renderer) { return findTags(renderer.toJSON(), 'dialog')[0]
 await check('阶段提示：左右列自适应、按钮换排且颜色区分（样式契约）', async () => {
   const css = styleNodes[0].textContent
   assert.match(css, /\.fg-hint\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(0, 1fr\) fit-content\(65%\);[^}]*align-items:\s*center;/)
-  assert.match(css, /@media \(max-width: 640px\) \{\s*\.fg-hint \{ grid-template-columns: minmax\(0, 1fr\); \}\s*\.fg-hint-actions \{ justify-content: flex-start; \}/)
+  assert.match(css, /@media \(max-width: 640px\) \{\s*\.fg-hint \{ grid-template-columns: minmax\(0, 1fr\); \}\s*\.fg-hint-actions \{[^}]*justify-content: flex-start;[^}]*\}/)
   assert.match(css, /\.fg-hint-content\s*\{[^}]*flex-direction:\s*column;[^}]*justify-content:\s*center;/)
   assert.match(css, /\.fg-hint-title\s*\{[^}]*min-width:\s*0;[^}]*text-overflow:\s*ellipsis;/)
   assert.match(css, /\.fg-hint-actions\s*\{[^}]*justify-content:\s*flex-end;[^}]*flex-wrap:\s*wrap;/)
@@ -2590,8 +2590,8 @@ await check('接受风险阶段标识与接受原因不同于评审通过或跳�
 
   await check('窄屏下弹窗分组导航改横向、卡片占满高度', () => {
     const css = styleNodes[0].textContent
-    const at = css.indexOf('@container flowgate (max-width: 720px)')
-    assert.ok(at >= 0, '缺少 720px 容器查询')
+    const at = css.indexOf('@media (max-width: 720px)')
+    assert.ok(at >= 0, '弹窗应按视口宽度响应，而非宿主侧栏宽度')
     const block = css.slice(at, css.indexOf('@container flowgate (max-width: 480px)', at))
     assert.ok(/\.fg-modal-nav \{[^}]*flex-direction: row/.test(block), '窄屏分组导航应横排')
     assert.ok(/\.fg-modal-body \{[^}]*grid-template-columns: minmax\(0, 1fr\)/.test(block), '窄屏应改成单列')
