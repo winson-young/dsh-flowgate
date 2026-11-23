@@ -357,7 +357,7 @@ S3 评审留下 6 条非阻塞发现，其中两条是实现缺陷，按用户�
 
 ### 已知未通过项
 
-`npm test` 三次均在 `test/provenance.test.mjs:211` 失败，首轮报错 `ENOTEMPTY: directory not empty, rmdir 'C:\\Users\\lonsdor\\AppData\\Local\\Temp\\dsh-U05QNJ\\flowgate-provenance-jemCK5\\workspace'`，抛出点在 `test/provenance.test.mjs:32` 的 `fixture` 收尾 `fs.rmSync(home, { recursive: true, force: true })`。该文件与本轮 dock 改动无关（`lib/client.js` 未被它引入），是 junction 用例清理临时目录时的 Windows 竞态；其余 19 项在该文件内通过，后续七组测试因 `npm test` 用 `&&` 串联而未执行。本轮未修该文件（不在冻结 scope 内），如实记为未通过。
+`npm test` 三次均在 `test/provenance.test.mjs:211` 失败，首轮报错 `ENOTEMPTY: directory not empty, rmdir 'C:\\Users\\lonsdor\\AppData\\Local\\Temp\\dsh-U05QNJ\\flowgate-provenance-jemCK5\\workspace'`，抛出点在 `test/provenance.test.mjs:32` 的 `fixture` 收尾 `fs.rmSync(home, { recursive: true, force: true })`。该文件与本轮 dock 改动无关（`lib/client.js` 未被它引入），是 junction 用例清理临时目录时的 Windows 竞态；其余 19 项在该文件内通过，后续七组测试因 `npm test` 用 `&&` 串联而未执行。本轮未修该文件（不在冻结 scope 内），如实记为未通过。此后在 Windows + node v26.13.1 环境复测，九套测试逐套通过、`npm test` 退出码 0，本条未复现；报错信息中的用户目录属于旧验证环境。
 
 ### 真实视觉未覆盖
 
