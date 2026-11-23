@@ -311,24 +311,137 @@ check('未登记进白名单的工具默认被拒绝', () => {
   assert.match(unknownTool.reason, /只读登记表/)
 })
 
-// P1-5：用户自己 spawn 的普通子代理不会登记进 childOwner，
-// 它在同一个项目里写代码时必须按 cwd 兜底找到运行中的流程再过一次 scope。
+// G07 / P1-5：防绕过以真实父链为界，同目录不代表同一条需求。
 {
-  const siblingCwd = cwd
-  const runSibling = (name, args, id, dir) => host.handlers.get('tools/pre-execute')(
-    { name, arguments: args, agent: { session: { header: { id, cwd: dir } } }, signal: undefined },
-    async () => ({ kind: 'allow' }),
+  const ws = mkdtempSync(join(tmpdir(), 'flowgate-归属-'))
+  const owner = '流程 owner'
+  const headers = new Map()
+  const child = (id, parentSession, cwd = ws, delegationDepth = 1) => ({ id, cwd, parentSession, delegationDepth, origin: 'subagent' })
+  const services = { sessions: { get: (id) => headers.has(id) ? { header: headers.get(id) } : undefined }, agents: { get: () => undefined } }
+  const run = (cx, header, name = 'write', args = { file_path: join(ws, 'x'), content: 'x' }) => cx.handlers.get('tools/pre-execute')(
+    { name, arguments: args, agent: { session: { header } } }, async () => ({ kind: 'allow' }),
   )
-  const siblingDenied = await runSibling('write', { file_path: join(siblingCwd, 'src/auth/session.ts'), content: 'x' }, 'sess_sibling', siblingCwd)
-  const siblingNested = await runSibling('write', { file_path: join(siblingCwd, 'src/auth/session.ts'), content: 'x' }, 'sess_nested', join(siblingCwd, 'packages/app'))
-  const unrelated = await runSibling('write', { file_path: join(siblingCwd, 'src/auth/session.ts'), content: 'x' }, 'sess_unrelated', mkdtempSync(join(tmpdir(), 'flowgate-other-')))
-  check('未登记的普通子代理按 cwd 纳入 scope 守卫', () => {
-    assert.equal(siblingDenied.kind, 'deny')
-    assert.match(siblingDenied.reason, /S1|需求分析/)
-    // 子代理把 cwd 指到项目子目录也还在项目里，不能因为路径不同就漏判。
-    assert.equal(siblingNested.kind, 'deny')
-  })
-  check('项目外目录的会话不受这条流程约束', () => assert.equal(unrelated.kind, 'allow', JSON.stringify(unrelated)))
+  try {
+    const cx = makeHost(ws, owner, { services })
+    await cx.tool('flowgate_start', { title: '归属隔离' })
+    const service = currentService()
+    const flow = service.get(owner)
+    headers.set(owner, { id: owner, cwd: ws, delegationDepth: 0 })
+    headers.set('middle', child('middle', owner))
+    headers.set('other', { id: 'other', cwd: ws, delegationDepth: 0 })
+    headers.set('other-middle', child('other-middle', 'other'))
+    const ordinary = [
+      { id: 'top', cwd: ws, delegationDepth: 0 }, { id: 'legacy', cwd: ws },
+      { id: 'nested', cwd: join(ws, 'nested'), delegationDepth: 0 },
+      child('other-child', 'other'), child('other-grandchild', 'other-middle', ws, 2),
+    ]
+    const operations = [
+      ['read', { file_path: join(ws, 'x') }], ['ops_bash', { command: 'git status' }],
+      ['ops_bash', { command: 'npm test' }], ['ops_bash', { command: 'npm install left-pad' }],
+      ['write', { file_path: join(ws, 'x'), content: 'x' }], ['some_future_write_tool', {}],
+    ]
+    for (const stage of ['S1', 'S2', 'S3', 'S4']) {
+      flow.stage = stage
+      flow.scope = { frozen: true, data: { commands: ['npm test'], files_expected_to_change: ['allowed.js'] } }
+      const before = JSON.stringify(flow.pendingCommands)
+      service.noteActivity(owner, { name: 'read', arguments: { path: 'owner-marker' } }, stage)
+      const activity = service.activity.get(owner)
+      for (const header of ordinary) {
+        for (const [name, args] of operations) assert.equal((await run(cx, header, name, args)).kind, 'allow', `${stage}: ${header.id}: ${name}`)
+        cx.handlers.get('agent/status')({ status: 'idle', agent: { session: { header } } })
+      }
+      check(`G07 ${stage} 无关顶层与子代理普通操作全部放行且不污染清单或进度`, () => {
+        assert.equal(JSON.stringify(flow.pendingCommands), before)
+        assert.equal(service.activity.get(owner), activity)
+      })
+      for (const header of [child('sess_sibling', owner), child('sess_nested', owner, join(ws, 'nested')), child('moved', owner, tmpdir()), child('grandchild', 'middle', ws, 2)]) {
+        assert.equal((await run(cx, header)).kind, 'deny', `${stage}: ${header.id}`)
+        assert.notEqual(service.activity.get(owner), activity)
+        cx.handlers.get('agent/status')({ status: 'idle', agent: { session: { header } } })
+        assert.equal(service.activity.has(owner), false)
+      }
+    }
+    check('G07 同目录、子目录、跨目录和多级真实后代始终受流程约束', () => assert.ok(flow))
+    flow.stage = 'S1'
+    const invalid = [undefined, null, 0, -1, 1.5, '1', NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]
+    for (const depth of invalid) assert.equal((await run(cx, { ...child('invalid', owner), delegationDepth: depth })).kind, 'allow')
+    for (const header of [
+      child('', owner), child('self', 'self'), child('broken', 'missing'),
+      { ...child('no-origin', owner), origin: undefined }, child('blank-parent', ''),
+      child('null-parent', null), { id: 'top-parent', cwd: ws, parentSession: owner, delegationDepth: 0 },
+    ]) assert.equal((await run(cx, header)).kind, 'allow', header.id)
+    headers.set('cycle-a', child('cycle-a', 'cycle-b'))
+    headers.set('cycle-b', child('cycle-b', 'cycle-a'))
+    assert.equal((await run(cx, headers.get('cycle-a'))).kind, 'allow')
+    for (const id of ['ASCII', '会话 🧪', 'x'.repeat(10000)]) {
+      assert.equal((await run(cx, child(id, owner))).kind, 'deny')
+      assert.equal((await run(cx, { id, cwd: ws, delegationDepth: 0 })).kind, 'allow')
+    }
+    services.sessions.get = () => { throw new Error('session store unavailable') }
+    services.agents.get = (id) => id === 'middle' ? { session: { header: headers.get(id) } } : undefined
+    assert.equal((await run(cx, child('agent-fallback', 'middle', ws, 2))).kind, 'deny')
+    services.agents.get = () => { throw new Error('agent store unavailable') }
+    assert.equal((await run(cx, child('unresolved', 'middle', ws, 2))).kind, 'allow')
+    services.sessions.get = (id) => headers.has(id) ? { header: headers.get(id) } : undefined
+    services.agents.get = () => undefined
+    service.flows.set('finished-middle', { sessionId: 'finished-middle', finished: true })
+    headers.set('finished-middle', child('finished-middle', owner))
+    assert.equal((await run(cx, child('after-finish', 'finished-middle', ws, 2))).kind, 'allow')
+    check('G07 异常元数据、循环、断链、服务异常与已结束最近流程安全终止', () => assert.ok(true))
+
+    // 全新服务第一次执行的就是守卫，不先调用任何工作台或 flowgate 查询。
+    for (const header of [headers.get(owner), child('cold-direct', owner), child('cold-grandchild', 'middle', ws, 2), child('cold-moved', 'middle', tmpdir(), 2)]) {
+      const cold = makeHost(ws, owner, { services })
+      assert.equal((await run(cold, header)).kind, 'deny', header.id)
+    }
+    for (const header of [...ordinary, child('cold-missing', 'missing', ws, 2)]) {
+      const cold = makeHost(ws, owner, { services })
+      assert.equal((await run(cold, header)).kind, 'allow', header.id)
+    }
+    check('G07 冷启动先恢复再核对身份：本人和完整后代受限，无关及缺失链放行', () => assert.ok(true))
+
+    flow.stage = 'S2'
+    flow.scope.data = { in_scope: { commands: ['npm test'], files_expected_to_change: ['allowed.js', 'nested/allowed-nested.js'] } }
+    const nested = child('relative-child', owner, join(ws, 'nested'))
+    const outside = child('relative-outside', owner, tmpdir())
+    const writes = [
+      ['write', { file_path: 'allowed.js', content: 'x' }, 'deny'],
+      ['write', { file_path: '../allowed.js', content: 'x' }, 'allow'],
+      ['edit', { file_path: 'allowed-nested.js', old_string: 'a', new_string: 'b' }, 'allow'],
+      ['write', { file_path: join(ws, 'allowed.js'), content: 'x' }, 'allow'],
+      ['write', { file_path: join(ws, 'nested', 'allowed.js'), content: 'x' }, 'deny'],
+      ['ops_move', { path: '../allowed.js', to: 'allowed.js' }, 'deny'],
+      ['ops_copy', { path: '../allowed.js', to: 'allowed-nested.js' }, 'allow'],
+      ['ops_batch', { root: '.', operations: [{ kind: 'write', path: 'allowed.js', content: 'x' }] }, 'deny'],
+      ['ops_batch', { root: '..', operations: [{ kind: 'write', path: 'allowed.js', content: 'x' }] }, 'allow'],
+      ['decompress', { toFile: 'allowed.js' }, 'deny'],
+      ['run_code', { code: 'return await tools.write({"file_path":"allowed.js","content":"x"})' }, 'deny'],
+      ['run_code', { code: 'return await tools.write({"file_path":"../allowed.js","content":"x"})' }, 'allow'],
+    ]
+    for (const [name, args, expected] of writes) assert.equal((await run(cx, nested, name, args)).kind, expected, name + ': ' + JSON.stringify(args))
+    assert.equal((await run(cx, outside, 'write', { file_path: 'allowed.js', content: 'x' })).kind, 'deny')
+    assert.equal((await run(cx, outside, 'write', { file_path: join(ws, 'allowed.js'), content: 'x' })).kind, 'allow')
+    check('G07 后代相对目标按执行目录解析，嵌套调用和批量 root 不得绕出 scope', () => assert.ok(true))
+
+    // 最近已结束的流程是父链边界；热态与第一次调用即守卫的冷态必须一致。
+    const endedCwd = join(ws, 'ended workspace')
+    mkdirSync(endedCwd)
+    const endedHost = makeHost(endedCwd, 'finished-middle', { services })
+    await endedHost.tool('flowgate_start', { title: '已经结束的最近流程' })
+    await endedHost.tool('flowgate_cancel', { reason: '结束边界回归' })
+    headers.set('finished-middle', child('finished-middle', owner, endedCwd))
+    for (const header of [headers.get('finished-middle'), child('cold-after-finish', 'finished-middle', endedCwd, 2)]) {
+      assert.equal((await run(cx, header)).kind, 'allow')
+      const cold = makeHost(ws, owner, { services })
+      assert.equal((await run(cold, header)).kind, 'allow', header.id)
+      assert.equal(currentService().get('finished-middle'), null, '不改变 hydrate 对结束快照的处理')
+      assert.equal((await run(cold, child('still-owned', owner))).kind, 'deny', '其他真实后代仍受活动流程约束')
+    }
+    check('G07 已结束最近流程的持久化边界在冷热态一致，不套用更远祖先', () => assert.ok(true))
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+    host.activate()
+  }
 }
 
 // git branch 有删除与创建模式：通用只读白名单允许尾部任意参数，
@@ -705,6 +818,12 @@ check('run_code 里组合只读工具照常放行', () => assert.equal(allowRead
 }
 
 // 放行按阶段判定：只有 S2 / S4 认 scope 清单，S1 与 S3 一律只接受只读命令（AC4）。
+check('G07 执行目录参数保留空流程与结束流程的放行契约', () => {
+  for (const flow of [null, undefined, { finished: true }]) {
+    assert.equal(scopeDenial(flow, 'write', { file_path: 'ordinary.js' }), null)
+  }
+})
+
 // scope 未冻结分支：直接构造 flow 验证守卫文案。
 check('scope 未冻结时 S2 写操作返回「scope 未冻结」', () => {
   const flow = { cwd, finished: false, stage: 'S2', scope: { frozen: false, data: null } }
@@ -2699,6 +2818,21 @@ for (const [kind, reason, expected] of [
       }
       syncBuiltinESMExports()
       const restarted = makeHost(ws, 'read-new')
+      const readService = currentService()
+      for (const header of [
+        { id: 'independent', cwd: ws, delegationDepth: 0 },
+        { id: 'independent-child', cwd: ws, delegationDepth: 1, origin: 'subagent', parentSession: 'independent' },
+        { id: 'unconfirmed-child', cwd: ws, delegationDepth: 1, origin: 'subagent', parentSession: 'read-existing' },
+      ]) {
+        const result = await restarted.handlers.get('tools/pre-execute')(
+          { name: 'write', arguments: { file_path: 'ordinary.js', content: 'x' }, agent: { session: { header } } },
+          async () => ({ kind: 'allow' }),
+        )
+        assert.equal(result.kind, 'allow', kind + ': ' + header.id)
+      }
+      assert.equal(readService.activity.size, 0)
+      assert.equal(readService.loaded.has(ws), false, '读失败不标记已恢复，权限修复后必须能重试')
+      check('G07 ' + kind + '失败不打断无关或归属无法确认的普通操作，不污染进度', () => assert.ok(true))
       for (let retry = 0; retry < 2; retry++) {
         const page = await restarted.request('/api/flowgate/hub/flows', { path: ws })
         assert.equal(page.status, 500)
