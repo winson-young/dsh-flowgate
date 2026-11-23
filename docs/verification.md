@@ -6,6 +6,31 @@
 
 历史记录中的 `by: 'subagents'` 仅表明调用了子代理聚合入口；聚合报告通过、`blocking: 0` 或流程走完，均不能证明真实子代理成功执行并返回有效报告。下文原有结论保留，其证据范围受此限定。
 
+## 补命令清单只在门禁上二选一（2026-11-23）
+
+需求：用户原文（m00001）「现在流程还是有混乱的地方，比如开发过程发现有命令清单需要加，会有一个【查看】按钮，点进去看到命令之后再点击单独加这个命令到这个清单，但是好像任何时候都可以加这个命令进去清单，最好是这个阶段一开始就查询有没有需要补的清单，如果有就阻塞等待用户选择，只给两个按钮，一个是补，一个是不补，然后再根据选择情况继续进行流程」。方案经三轮问答定稿后授权改代码（m00085）。
+
+方案：
+- **被拒即入队，不进清单**：`shellDenial` 仅在 S2 / S4 且确实拒绝时调 `rememberDeniedCommand`，写进 `flow.pendingCommands`（`{ command, reason, stage, at }`，去重、`SCOPE_COMMAND_MAX` 封顶、跨阶段保留）。单值 `flow.lastDeniedCommand` 与视图 `deniedCommand` 删除，`repairFlow` 清洗残留。拒绝文案改为「已记进待补清单」并禁止 Agent 换写法重试。
+- **候选只来自实际拒绝**：静态体检的 `command-not-applicable` / `command-runtime-missing` / `over-broad-command` 不进队列——那是 Agent 自己该修的技术问题，用户没有信息判断，沿用 `flowgate_doc` 提交侧「缺口不交给用户」的口径。用户**有**信息判断的是「这条命令授不授权」。
+- **门禁出口二选一**：`gateBlockers` 拆两层，外层在队列非空时最前面插一条阻塞项，四个阶段出口都会停；内层 `stageGateBlockers` 原有逻辑不变。门禁卡新增 `CommandGapDecision`：逐条列命令、默认全选、可取消勾选，两个按钮「补进清单并重新批准」/「不补，继续」（后者二次确认）。
+- **补 = 回 S1 重新批准**：`supplementScopeCommands` 只接受队列内命令原文（`resolveChosenCommands` 逐条核对），追加进 `pendingScope`、退回 S1、按新清单重算 `pendingScopeRisks`；auto 档无缺口则当场冻结并记 `auto: true`，有缺口则挂在 S1 门禁等用户，不把用户选的模式悄悄改回 manual。
+- **不补 = 记账继续**：`declineScopeCommands` 写 `flow.declinedCommands`（同一条不再弹窗）、清队列、推进门禁；命令之后仍被拒，相关 AC 在 S3 / S4 账本记未覆盖。
+- **界面收口**：`CommandAccess` 只读化（清单 + 待补 + 已明确不补），「查看 scope 问题」删「只补这条命令」只留「重做文档（回 S1）」。`awaitGate` 把 `commands-decided` 视为继续重判信号。
+
+改动范围：`lib/index.js`（`createFlow` 两个字段、`repairFlow`、`shellDenial`、`rememberDeniedCommand`、`gateBlockers` / `stageGateBlockers`、视图 `pendingCommands` / `declinedCommands`、新增 `resolveChosenCommands` / `supplementScopeCommands` / `declineScopeCommands`、act 分发 `reopenScopeForCommands` 收窄与新增 `declineScopeCommands`、`awaitGate` 循环条件）、`lib/client.js`（新增 `CommandGapDecision`、`CommandAccess` 只读化、`GatePanel` 四阶段插入、`HintActions` 改用队列、`scopePanel` 删按钮）、`test/host.test.mjs`、`test/client.test.mjs`、`README.md`、`docs/development.md`、`CHANGELOG.md`、本文件。
+
+| 验收项 | 状态 | 证据与限制 |
+| :--- | :--- | :--- |
+| AC-1 被拒命令进待补队列，不再是单值字段 | 通过 | `test/host.test.mjs:569` 断言 `pendingCommands` 含 `git checkout -- src/api/middleware.ts` 且 `stage === 'S2'`，并断言 `'deniedCommand' in body === false` |
+| AC-2 拒绝文案指向待补决定，且禁止换写法重试 | 通过 | `test/host.test.mjs:561`、`:885`、`:3664` 三处断言 /已记进待补清单/；S2 那处另断言 /不要换别的写法再试一次/ |
+| AC-3 门禁只给补 / 不补两个按钮 | 通过 | `test/client.test.mjs` 「被拒命令在门禁上给出补 / 不补二选一」断言命令原文、「本轮评审与测试需要重跑」、「这些命令之后仍然会被拒」，点「补进清单并重新批准」提交 `reopenScopeForCommands` 且 `payload.commands === ['npm run build']` |
+| AC-4 不补要二次确认，确认后记账继续 | 通过 | `test/client.test.mjs` 「点「不补」先要确认」断言首次点击不发请求、确认区含「依赖它们的验收标准会记成未覆盖」，确认后提交 `declineScopeCommands` |
+| AC-5 勾选可去掉某条，只补剩下的 | 通过 | `test/client.test.mjs` 「取消勾选后只补剩下的那条，按钮文案跟着变」：两条待补命令两个勾选框、默认全选，取消第一条后按钮变「补进清单（1 条）并重新批准」，提交只剩第二条 |
+| AC-6 补清单没有旁路：队列外的命令加不进去 | 通过 | `supplementScopeCommands` 经 `resolveChosenCommands` 逐条核对，队列外的命令抛「只能补待补清单里的命令」；队列为空时抛「没有「顺手加一条」的旁路」。由 `test/host.test.mjs:3818` 组的改写作前提（先让命令真被拒再补） |
+| AC-7 流程结束后视图不再带队列 | 通过 | `test/host.test.mjs:975` 断言 `pendingCommands` 与 `declinedCommands` 均为空数组 |
+| 实机点击验证 | 未执行 | 需要在运行中的宿主里重载插件后手动走一遍「被拒 → 门禁二选一」；本轮只做自动化验证 |
+
 ## 快捷入口与工作台对齐，S1 缺口不再交给用户接受（2026-11-23）
 
 需求：用户原文（m00001）「点【批准并冻结 scope】，下方提示我这份 scope 有 2 条验收方案缺口，除此以外毫无动静，我是不是没法进行下去了？」。追问答疑后确认（m00154）「我只是希望所有在工作台能做的，快捷也能做，至于看不看缺口是用户的事，快捷入口有能看的地方不就行了」，并逐阶段提出（m00178）：S1 有缺口就该当场退回补齐、修改需求要能填意见；S2 的「跳过门禁直接评审」看不懂、「回到需求分析调整 scope」应改成就地展开的「查看 scope 问题」并与「退回 S1 补命令清单」合并说明；S3 的「退回说明」没意义，原因应由系统按未通过项自带；S4 无缺口时不该还有「退回开发修复」与「跳过测试门禁」。「查看 scope 问题」这个名字由用户在 m00277 定下，同一条消息授权直接改代码。
@@ -27,7 +52,7 @@
 | AC-2 同一批缺口连续三次自动结束流程 | 通过 | 新增 `sess-scope-strike` 组：三次提交分别匹配 `/第 1\/3 次/`、`/第 2\/3 次/`、`/连续 3 次没能补齐，这条流程已自动结束/`，随后 `state.finished === true`、`cancelReason` 含 `/scope 缺口/`、两个字段归零 |
 | AC-3 补齐后直接进入门禁，不残留缺口 | 通过 | 同组：把缺的文件补进 scope 后 `pendingScopeRisks` 空、`scopeRiskStrikes === null`、`approve` 返回 200 且阶段进 S2、`scope.data.scope_risks` 为 `undefined` |
 | AC-4 S2 不再有「跳过门禁直接评审」 | 通过 | `test/client.test.mjs` 的 S2 按钮集合断言为 `['完成开发','查看 scope 问题','放弃这次流程']`；`test/gatemode.test.mjs` 与 `test/host.test.mjs` 中依赖该按钮的用例已改写 |
-| AC-5 「查看 scope 问题」就地展开两个出口 | 通过 | `test/client.test.mjs` 断言「查看 scope 问题」不随门禁就绪置灰，展开后含「只补这条命令」与「重做文档（回 S1）」；命令被拒场景由「被拒命令给出退回 S1 补清单的入口」覆盖 |
+| AC-5 「查看 scope 问题」就地展开两个出口 | 通过（补命令那一半已被上文取代） | `test/client.test.mjs` 断言「查看 scope 问题」不随门禁就绪置灰，展开后含「只补这条命令」与「重做文档（回 S1）」；命令被拒场景由「被拒命令给出退回 S1 补清单的入口」覆盖。这两处按钮与用例现已改成门禁上的补 / 不补二选一，见上文「补命令清单只在门禁上二选一」 |
 | AC-6 S3 / S4 不再要求用户写退回说明 | 通过 | 「退回开发不再要求用户写说明，原因由宿主按未通过项生成」遍历 S3 与带失败 AC 的 S4，断言没有「退回说明（可选）」文本框且 `payload.note === undefined` |
 | AC-7 S4 无缺口只留「结束流程」，有缺口给确认键 | 通过 | 同文件断言 S4 无缺口时为 `['结束流程','放弃这次流程']`，有缺口时出现「结束流程（需确认）」，文案为「带缺口结束要先看清缺口，再点「结束流程（需确认）」」 |
 | AC-8 快捷条能就地确认缺口并接受 | 通过 | `HintActions` 的缺口确认区提交 `acceptUncovered: true`；`test/client.test.mjs` 的 S1 缺口组断言确认按钮可用、区内无 `textarea`、`acceptScopeRisks` 只在 `decideDoc` 路径出现 |
@@ -44,7 +69,7 @@
 方案：
 - **权限只来自 S1 批准的 `scope.commands`**：`shellDenial` 的判定顺序收成「逃逸痕迹 → 只读白名单 → 纯解析命令 → scope 清单」，删除末位的阶段授权分支；清单外一律拒绝。
 - **数据模型删除四个字段**：`shellGrant`、`writeGrants`、`needsWrite`、`directionWriteDeclared`；hub 动作 `toggleShellGrant`、`toggleWriteGrant`、`declareDirectionWrite` 一并移除，调用返回「未知操作」。`repairFlow` 清洗旧快照残留，`hydrate` 把清洗结果写回磁盘。
-- **补清单入口**：`shellDenial` 拒绝时写 `flow.lastDeniedCommand`（命令截断到 300 字），视图暴露 `deniedCommand`；新增 hub 动作 `reopenScopeForCommands`，带该命令退回 S1 并预填进 `pendingScope.commands`，保留已保存的需求文档、清空待定缺口，写 `scope.reopened` 事件。
+- **补清单入口**（已被上文「补命令清单只在门禁上二选一」取代：`lastDeniedCommand` 与 `deniedCommand` 已删除，改为 `pendingCommands` 队列 + 门禁二选一，`scope.reopened` 事件改为 `scope.command_supplemented`）：`shellDenial` 拒绝时写 `flow.lastDeniedCommand`（命令截断到 300 字），视图暴露 `deniedCommand`；新增 hub 动作 `reopenScopeForCommands`，带该命令退回 S1 并预填进 `pendingScope.commands`，保留已保存的需求文档、清空待定缺口，写 `scope.reopened` 事件。
 - **子代理同口径**：`registerChild` 只记 `flowId` / `directionId` / `readAttempts` / `signal`，`childDenial` 用当前流程的 `scope.commands` 判定 shell；方向级没有任何权限位。
 - **界面**：`ShellGrantToggle` 换成 `CommandAccess`（列清单原文、被拒命令与补清单按钮，无勾选框），挂在 S2 开发卡与 S4「测试命令」卡；测试方向面板的写权限分支整段删除；追加自定义方向表单与工作区规则 S4 组的写权限勾选框删除；快捷入口在被拒时给出提示条与「退回 S1 补命令清单」按钮。
 

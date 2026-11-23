@@ -558,17 +558,24 @@ const allowIn = await guard('edit', { file_path: join(cwd, 'src/auth/session.ts'
 check('scope 内 edit 放行', () => assert.equal(allowIn.kind, 'allow'))
 // 变更性 shell 无法逐条核对 scope，S2 也必须拒绝——放行等于给 scope 边界开后门。
 const denyShell = await guard('bash', { command: 'git checkout -- src/api/middleware.ts' })
-check('变更性 shell 在 S2 被拒，并指向 scope 清单与退回入口', () => {
+check('变更性 shell 在 S2 被拒，并指向 scope 清单与待补决定', () => {
   assert.equal(denyShell.kind, 'deny')
   assert.match(denyShell.reason, /只允许只读 shell 命令/)
   // 唯一通道是 S1 批准过的 scope 清单，界面上没有别的授权开关。
   assert.match(denyShell.reason, /变更性命令只有一条通道/)
-  assert.match(denyShell.reason, /退回 S1 补命令清单/)
+  // 补清单不再是「点一下就把这条加进去」：命令先进待补队列，由用户在门禁上二选一。
+  assert.match(denyShell.reason, /已记进待补清单/)
+  assert.match(denyShell.reason, /不要换别的写法再试一次/)
 })
 const deniedView = await getState()
-check('被拒命令记进视图，供界面预填补清单入口', () => {
-  assert.equal(deniedView.body.deniedCommand.command, 'git checkout -- src/api/middleware.ts')
-  assert.equal(deniedView.body.deniedCommand.stage, 'S2')
+check('被拒命令进待补队列，供门禁二选一', () => {
+  const pending = deniedView.body.pendingCommands
+  assert.ok(Array.isArray(pending), 'pendingCommands 应为数组')
+  const entry = pending.find((one) => one.command === 'git checkout -- src/api/middleware.ts')
+  assert.ok(entry, '被拒的命令应进待补队列')
+  assert.equal(entry.stage, 'S2')
+  // 单值字段已退场：一个「最近一条」装不下开发期间连拒的多条命令。
+  assert.equal('deniedCommand' in deniedView.body, false)
   assert.equal('shellGrant' in deniedView.body, false)
 })
 const denyShellOps = await guard('ops_bash', { command: 'rm -rf src/api' })
@@ -587,7 +594,7 @@ const unlistedView = await getState()
 check('清单外的构建命令被拒，没有可勾选的授权通道', () => {
   assert.equal(unlistedBuild.kind, 'deny')
   assert.match(unlistedBuild.reason, /只允许只读 shell 命令/)
-  assert.equal(unlistedView.body.deniedCommand.command, 'npm run build')
+  assert.ok(unlistedView.body.pendingCommands.some((one) => one.command === 'npm run build'))
   assert.equal('shellGrant' in unlistedView.body, false)
 })
 // 解释器内联执行始终拒绝：那等价于任意代码执行，与清单无关。
@@ -882,9 +889,9 @@ check('零阻塞评审仍按普通通过落状态并写入评审通过事件', (
 // S4 要跑测试命令，入口仍然只有 scope 清单：清单里没有的命令照样拒绝。
 const s4Shell = await guard('bash', { command: 'npm test' })
 const s4Escape = await guard('bash', { command: 'node -e "process.exit(0)"' })
-check('S4 清单外的测试命令被拒，只给补清单入口', () => {
+check('S4 清单外的测试命令被拒，只给待补队列', () => {
   assert.equal(s4Shell.kind, 'deny')
-  assert.match(s4Shell.reason, /退回 S1 补命令清单/)
+  assert.match(s4Shell.reason, /已记进待补清单/)
 })
 check('S4 解释器内联执行仍被拒绝', () => {
   assert.equal(s4Escape.kind, 'deny')
@@ -975,8 +982,9 @@ check('AC-8 流程结束且显式跳过 S4 的计数为 1', () => {
 check('AC6 流程结束后视图不再有授权字段', () => {
   assert.equal('shellGrant' in finalState.body, false)
   assert.equal('writeGrants' in finalState.body, false)
-  // 被拒命令的提示也不该跟到流程结束后。
-  assert.equal(finalState.body.deniedCommand, null)
+  // 待补命令与已拒命令都不该跟到流程结束后。
+  assert.deepEqual(finalState.body.pendingCommands, [])
+  assert.deepEqual(finalState.body.declinedCommands, [])
 })
 check('AC-8 flows.jsonl 记录完整阶段事件', () => {
   const file = join(cwd, '.dsh-flowgate', 'flows.jsonl')
@@ -3661,7 +3669,7 @@ for (const [kind, reason, expected] of [
       assert.equal(listWild.kind, 'allow', JSON.stringify(listWild))
       assert.equal(listMiss.kind, 'deny')
       assert.match(listMiss.reason, /scope\.commands/)
-      assert.match(listMiss.reason, /退回 S1 补命令清单/)
+      assert.match(listMiss.reason, /已记进待补清单/)
       // 同一条命令换个可执行体路径仍然算命中，参数不同就不算。
       assert.equal(listAbs.kind, 'allow', JSON.stringify(listAbs))
       assert.equal(listOther.kind, 'deny', JSON.stringify(listOther))
@@ -3815,7 +3823,10 @@ for (const [kind, reason, expected] of [
 
     // 缺口补掉之后再退回补命令，重算结果应当仍是「没有缺口」：
     // 重算不是「一律报缺口」，它只是让结论跟着当前清单走。
-    await act('reopenScopeForCommands', { command: 'npm test' })
+    // 先让这条命令真的被拒一次：待补队列只收实际拒绝过的命令，
+    // 「随手加一条进清单」的入口已经不存在了。
+    await rx.guard('bash', { command: 'npm test' })
+    await act('reopenScopeForCommands', {})
     const cleanState = await rx.request('/api/flowgate/state?sessionId=sess-scope-risk')
     check('缺口补掉后补命令，重算不会凭空造出缺口', () => {
       assert.deepEqual(cleanState.body.doc.pendingScopeRisks, [])

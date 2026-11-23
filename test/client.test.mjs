@@ -2044,23 +2044,68 @@ const HubPanelIcon = componentOf('sidebar.panellist')
   })
 }
 
-// 清单写漏时的唯一出口：退回 S1 补清单，并把被拒的那条命令预填进去。
+// 清单写漏时的唯一出口：被拒的命令进待补队列，补与不补只能在门禁上二选一。
 {
   posted = []
   currentView = baseView('S4', {
-    deniedCommand: { command: 'npm run build', at: '2026-11-17T10:05:00Z' },
+    pendingCommands: [{ command: 'npm run build', stage: 'S4', at: '2026-11-17T10:05:00Z' }],
   })
   const renderer = await render(FlowDetail, {})
   const tree = renderer.toJSON()
-  await check('被拒命令给出退回 S1 补清单的入口', async () => {
+  await check('被拒命令在门禁上给出补 / 不补二选一', async () => {
     const all = flat(tree)
     assert.ok(all.includes('npm run build'), '要显示被拒的那条命令')
-    assert.ok(all.includes('不在 scope 命令清单里'))
-    assert.ok(all.includes('本轮评审与测试需要重跑'), '要说清代价')
-    await click(buttonByText(tree, '退回 S1 补命令清单'))
+    assert.ok(all.includes('不在冻结 scope 清单里'))
+    assert.ok(all.includes('本轮评审与测试需要重跑'), '要说清补的代价')
+    assert.ok(all.includes('这些命令之后仍然会被拒'), '要说清不补的后果')
+    await click(buttonByText(tree, '补进清单并重新批准'))
     const call = posted.find((item) => item.action === 'reopenScopeForCommands')
     assert.ok(call, '必须提交 reopenScopeForCommands')
-    assert.equal(call.payload.command, 'npm run build')
+    // 只提交勾选的那几条：整份清单是 S1 的事，这里只补被拒的。
+    assert.deepEqual(call.payload.commands, ['npm run build'])
+  })
+}
+
+// 「不补」要把缺口记进结项账本，点一下就落定太轻：先二次确认。
+{
+  posted = []
+  currentView = baseView('S4', {
+    pendingCommands: [{ command: 'npm run build', stage: 'S4', at: '2026-11-17T10:05:00Z' }],
+  })
+  const renderer = await render(FlowDetail, {})
+  await check('点「不补」先要确认，确认后才提交 declineScopeCommands', async () => {
+    await click(buttonByText(renderer.toJSON(), '不补，继续'))
+    assert.equal(posted.length, 0, '第一次点击不该直接提交')
+    const confirmTree = renderer.toJSON()
+    assert.ok(flat(confirmTree).includes('依赖它们的验收标准会记成未覆盖'), '要预告结项后果')
+    await click(buttonByText(confirmTree, '确认不补'))
+    const call = posted.find((item) => item.action === 'declineScopeCommands')
+    assert.ok(call, '必须提交 declineScopeCommands')
+    assert.deepEqual(call.payload.commands, ['npm run build'])
+  })
+}
+
+// 勾选可以去掉某一条：补清单不该变成「要么全补要么全不补」。
+{
+  posted = []
+  currentView = baseView('S2', {
+    pendingCommands: [
+      { command: 'npm run build', stage: 'S2', at: '2026-11-17T10:05:00Z' },
+      { command: 'git checkout -- src/api/middleware.ts', stage: 'S2', at: '2026-11-17T10:06:00Z' },
+    ],
+  })
+  const renderer = await render(FlowDetail, {})
+  const tree = renderer.toJSON()
+  await check('取消勾选后只补剩下的那条，按钮文案跟着变', async () => {
+    const boxes = checkboxNodes(tree)
+    assert.equal(boxes.length, 2, '每条待补命令一个勾选框')
+    assert.equal(boxes[0].props.checked, true, '默认全选')
+    await changeValue(boxes[0], false)
+    const nextTree = renderer.toJSON()
+    await click(buttonByText(nextTree, '补进清单（1 条）并重新批准'))
+    const call = posted.find((item) => item.action === 'reopenScopeForCommands')
+    assert.ok(call, '必须提交 reopenScopeForCommands')
+    assert.deepEqual(call.payload.commands, ['git checkout -- src/api/middleware.ts'])
   })
 }
 
