@@ -205,7 +205,7 @@ await check('未启动时 status 给出引导', async () => {
 })
 
 await check('未启动时 S1 之外的写操作不被守卫拦截（无流程即不管）', async () => {
-  const d = await guard('write', { path: 'src/anything.ts' })
+  const d = await guard('write', { file_path: 'src/anything.ts' })
   assert.equal(d.kind, 'allow')
 })
 
@@ -279,7 +279,7 @@ await check('工作区所有会话读取同一条流程，工具与界面均拒�
 })
 
 await check('S1 阶段的写操作被拒绝', async () => {
-  const d = await guard('write', { path: 'src/auth/session.ts' })
+  const d = await guard('write', { file_path: 'src/auth/session.ts' })
   assert.equal(d.kind, 'deny')
   assert.match(d.reason, /S1/)
   assert.match(d.reason, /批准并冻结 scope/)
@@ -300,7 +300,8 @@ await check('AC-4 子代理会话的写工具被工具层拒绝', async () => {
   service.registerChild(SESSION, 'sess-review')
   try {
     for (const name of ['write', 'edit', 'str_replace_editor']) {
-      const d = await guard(name, { path: 'src/auth/session.ts' }, 'sess-review')
+      const args = name === 'str_replace_editor' ? { path: 'src/auth/session.ts' } : { file_path: 'src/auth/session.ts' }
+      const d = await guard(name, args, 'sess-review')
       assert.equal(d.kind, 'deny', name + ' 必须被拒绝')
       assert.match(d.reason, /只读/)
     }
@@ -330,7 +331,7 @@ await check('D2 非 S4 的手工写权限标志仍拒绝变更性 shell', async 
   try {
     const shell = await guard('bash', { command: 'pnpm migrate && pnpm migrate:rollback' }, 'sess-test')
     assert.equal(shell.kind, 'deny', '只有实际 S4 的已授权方向才能放行变更性 shell')
-    const write = await guard('write', { path: 'src/auth/session.ts' }, 'sess-test')
+    const write = await guard('write', { file_path: 'src/auth/session.ts' }, 'sess-test')
     assert.equal(write.kind, 'deny', '写权限例外不覆盖代码写工具')
   } finally {
     service.unregisterChild('sess-test')
@@ -340,7 +341,7 @@ await check('D2 非 S4 的手工写权限标志仍拒绝变更性 shell', async 
 // 解绑只读权限后仍保留真实父链：普通流程后代也必须过 scope，不能靠解绑绕过。
 await check('AC-4 子会话解绑后仍按真实父链所属流程判 scope', async () => {
   assert.equal(mod.currentService().childOwner.has('sess-review'), false)
-  const d = await guard('write', { path: 'src/auth/session.ts' }, 'sess-review')
+  const d = await guard('write', { file_path: 'src/auth/session.ts' }, 'sess-review')
   assert.equal(d.kind, 'deny', '真实流程后代解绑后仍不能绕过 S1 的写限制')
   assert.match(d.reason, /S1|需求分析/)
 })
@@ -349,7 +350,7 @@ await check('S1 同 cwd 独立顶层会话及其子代理放行', async () => {
   host.sessions.set('sess-independent', { header: { id: 'sess-independent', cwd: CWD, delegationDepth: 0 } })
   host.sessions.set('sess-independent-child', { header: { id: 'sess-independent-child', cwd: CWD, delegationDepth: 1, origin: 'subagent', parentSession: 'sess-independent' } })
   for (const id of ['sess-independent', 'sess-independent-child']) {
-    assert.equal((await guard('write', { path: 'src/outside.ts' }, id)).kind, 'allow', id + ' 不属于流程，应放行')
+    assert.equal((await guard('write', { file_path: 'src/outside.ts' }, id)).kind, 'allow', id + ' 不属于流程，应放行')
     assert.equal((await guard('bash', { command: 'pnpm run independent' }, id)).kind, 'allow')
   }
 })
@@ -430,7 +431,7 @@ await check('S2 无关会话或不完整父链放行，不污染所属流程台�
   ]
   for (const [id, header] of unrelated) {
     host.sessions.set(id, { header: { id, cwd: CWD, ...header } })
-    assert.equal((await guard('write', { path: 'src/outside.ts' }, id)).kind, 'allow', id + ' 不应借 cwd 归入流程')
+    assert.equal((await guard('write', { file_path: 'src/outside.ts' }, id)).kind, 'allow', id + ' 不应借 cwd 归入流程')
     assert.equal((await guard('bash', { command: 'pnpm run ' + id }, id)).kind, 'allow', id + ' 命令应放行')
   }
   assert.deepEqual(flow.pendingCommands, pending, '无关命令不能进入流程待补清单')
@@ -444,7 +445,7 @@ await check('S2 未登记真实后代沿 sessions 与 agents 父链拒绝越界�
   host.sessions.set('sess-grandchild', { header: { id: 'sess-grandchild', cwd: CWD, delegationDepth: 2, origin: 'subagent', parentSession: 'sess-agent-parent' } })
   for (const id of ['sess-review', 'sess-grandchild']) {
     assert.equal(service.childOwner.has(id), false, '用例必须走未登记会话父链')
-    const denied = await guard('write', { path: 'src/outside.ts' }, id)
+    const denied = await guard('write', { file_path: 'src/outside.ts' }, id)
     assert.equal(denied.kind, 'deny')
     assert.match(denied.reason, /不在冻结 scope 内/)
     const command = 'pnpm run blocked-' + id
@@ -462,14 +463,14 @@ await check('S2 未登记真实后代沿 sessions 与 agents 父链拒绝越界�
 })
 
 await check('S2 放行 scope 内的写操作', async () => {
-  const d = await guard('write', { path: 'src/auth/session.ts' })
+  const d = await guard('write', { file_path: 'src/auth/session.ts' })
   assert.equal(d.kind, 'allow')
   const e = await guard('edit', { file_path: 'src/auth/session.ts' })
   assert.equal(e.kind, 'allow')
 })
 
 await check('S2 越界写被拒绝并给出回退指引', async () => {
-  const d = await guard('write', { path: 'src/api/middleware.ts' })
+  const d = await guard('write', { file_path: 'src/api/middleware.ts' })
   assert.equal(d.kind, 'deny')
   assert.match(d.reason, /不在冻结 scope 内/)
   assert.match(d.reason, /src\/auth\/session\.ts/)
@@ -478,10 +479,10 @@ await check('S2 越界写被拒绝并给出回退指引', async () => {
 
 // P0-2：数据目录由插件自己维护。以前是无条件放行，等于让 Agent 改自己的 scope 与状态快照。
 await check('数据目录不接受工具写入（含 S2 内部台账）', async () => {
-  const d = await guard('write', { path: '.dsh-flowgate/notes.md' })
+  const d = await guard('write', { file_path: '.dsh-flowgate/notes.md' })
   assert.equal(d.kind, 'deny')
   assert.match(d.reason, /由插件自身维护/)
-  const snapshot = await guard('write', { path: '.dsh-flowgate/flows/f_x.json' })
+  const snapshot = await guard('write', { file_path: '.dsh-flowgate/flows/f_x.json' })
   assert.equal(snapshot.kind, 'deny')
 })
 
@@ -603,7 +604,7 @@ await check('测试汇总通过不能替代 AC 证据，明确接受缺口后结
 })
 
 await check('流程结束后写操作不再受 scope 限制', async () => {
-  const d = await guard('write', { path: 'src/anything.ts' })
+  const d = await guard('write', { file_path: 'src/anything.ts' })
   assert.equal(d.kind, 'allow')
 })
 

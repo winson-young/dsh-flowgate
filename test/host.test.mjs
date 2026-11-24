@@ -412,8 +412,8 @@ check('未登记进白名单的工具默认被拒绝', () => {
       ['write', { file_path: join(ws, 'nested', 'allowed.js'), content: 'x' }, 'deny'],
       ['ops_move', { path: '../allowed.js', to: 'allowed.js' }, 'deny'],
       ['ops_copy', { path: '../allowed.js', to: 'allowed-nested.js' }, 'allow'],
-      ['ops_batch', { root: '.', operations: [{ kind: 'write', path: 'allowed.js', content: 'x' }] }, 'deny'],
-      ['ops_batch', { root: '..', operations: [{ kind: 'write', path: 'allowed.js', content: 'x' }] }, 'allow'],
+      ['ops_batch', { root: '.', action: 'run', operations: [{ op: 'remove', path: 'allowed.js' }] }, 'deny'],
+      ['ops_batch', { root: '..', action: 'run', operations: [{ op: 'remove', path: 'allowed.js' }] }, 'allow'],
       ['decompress', { toFile: 'allowed.js' }, 'deny'],
       ['run_code', { code: 'return await tools.write({"file_path":"allowed.js","content":"x"})' }, 'deny'],
       ['run_code', { code: 'return await tools.write({"file_path":"../allowed.js","content":"x"})' }, 'allow'],
@@ -3722,7 +3722,7 @@ for (const [kind, reason, expected] of [
     const s1Sneak = await cx.guard('bash', { command: 'node --check a.js; rm -rf src' })
     check('A 档纯解析命令不需要授权就放行，夹带逃逸的照样拒', () => {
       assert.equal(s1Parse.kind, 'allow', JSON.stringify(s1Parse))
-      assert.equal(s1Tsc.kind, 'allow', JSON.stringify(s1Tsc))
+      assert.equal(s1Tsc.kind, 'deny', JSON.stringify(s1Tsc))
       assert.equal(s1Build.kind, 'deny')
       assert.equal(s1Sneak.kind, 'deny')
       assert.match(s1Sneak.reason, /任意代码|无法核对/)
@@ -3873,8 +3873,8 @@ for (const [kind, reason, expected] of [
       assert.match(scopeDenial(base, 'unlag_refresh', {}), /只读登记表/)
       assert.equal(scopeDenial({ ...base, toolAllowlist: ['unlag_refresh'] }, 'unlag_refresh', {}), null)
       // 写工具仍然按 scope 判：S2 里写 scope 内的文件本来就允许，写 scope 外照样拒。
-      assert.equal(scopeDenial({ ...base, toolAllowlist: ['write'] }, 'write', { path: 'src/a.ts' }), null)
-      assert.ok(scopeDenial({ ...base, toolAllowlist: ['write'] }, 'write', { path: 'src/b.ts' }))
+      assert.equal(scopeDenial({ ...base, toolAllowlist: ['write'] }, 'write', { file_path: 'src/a.ts' }), null)
+      assert.ok(scopeDenial({ ...base, toolAllowlist: ['write'] }, 'write', { file_path: 'src/b.ts' }))
       assert.ok(scopeDenial({ ...flowOf('S1', []), toolAllowlist: ['str_replace_editor'] }, 'str_replace_editor', { path: 'src/a.ts' }))
       assert.ok(scopeDenial({ ...base, toolAllowlist: ['ops_bash'] }, 'ops_bash', { command: 'npm publish' }))
     })
@@ -4491,6 +4491,262 @@ for (const listedCommands of [[], ['node --check lib/index.js']]) {
       assert.deepEqual(frozen.in_scope.commands, listedCommands)
     })
     await host.tool('flowgate_cancel', {})
+  } finally { rmSync(ws, { recursive: true, force: true }) }
+}
+
+// 正式字段与三类目标结果：缺目标必须拒绝，确定没有写入才可跨阶段放行。
+{
+  const ws = mkdtempSync(join(tmpdir(), 'flowgate-target-contract-'))
+  mkdirSync(join(ws, 'src', 'tree'), { recursive: true })
+  const flowOf = (stage, files = ['src/a.js', 'src/b.js', 'src/目标.js', 'src/tree/']) => ({
+    id: 'target-contract', sessionId: 'target-contract', cwd: ws, finished: false, stage, events: [],
+    scope: { frozen: true, data: { in_scope: { files_expected_to_change: files, commands: [] } } },
+  })
+  const batch = (operations, extra = {}) => ({ action: 'run', operations, ...extra })
+  const legitimateWrites = [
+    ['write', { file_path: 'src/a.js' }], ['edit', { file_path: 'src/a.js' }],
+    ['str_replace_editor', { path: 'src/a.js' }],
+    ...['ops_write_file', 'ops_edit_file', 'ops_remove', 'ops_replace'].map((name) => [name, { path: 'src/a.js' }]),
+    ...['ops_copy', 'ops_move'].map((name) => [name, { path: 'src/a.js', to: 'src/b.js' }]),
+    ['ops_batch', batch([{ op: 'copy', path: 'src/a.js', to: 'src/b.js' },
+      { op: 'move', path: 'src/b.js', to: 'src/目标.js' }, { op: 'remove', path: 'src/目标.js' }])],
+    ['decompress', { toFile: 'src/a.js' }],
+  ]
+  try {
+    for (const stage of ['S1', 'S2', 'S3', 'S4']) {
+      const flow = flowOf(stage)
+      check(stage + ' 正式字段写目标只在冻结 S2 放行', () => {
+        for (const [name, args] of legitimateWrites) {
+          const denial = scopeDenial(flow, name, args)
+          if (stage === 'S2') assert.equal(denial, null, name + ': ' + denial)
+          else assert.ok(denial, stage + ': ' + name)
+        }
+      })
+      check(stage + ' tsc/deno 复杂命令只按批准清单在 S2/S4 准入', () => {
+        const commands = ['tsc --noEmit -p tsconfig.json', 'deno check source.ts']
+        const listed = { ...flow, scope: { frozen: true, data: { in_scope: { commands } } } }
+        for (const command of commands) {
+          const denial = shellDenial(listed, { command })
+          if (stage === 'S2' || stage === 'S4') assert.equal(denial, null, command)
+          else assert.ok(denial, command)
+          assert.ok(shellDenial(flow, { command }), '未批准：' + command)
+        }
+        for (const command of ['tsc --noEmit -p other.json', 'deno check other.ts']) {
+          assert.ok(shellDenial(listed, { command }), '参数不匹配：' + command)
+        }
+      })
+      check(stage + ' 明确无写入的 plan、空 run 与普通 decompress 放行', () => {
+        for (const [name, args] of [
+          ['ops_batch', { action: 'plan' }],
+          ['ops_batch', { action: 'plan', root: '..', operations: 'invalid', operationsRef: 'ref://opaque' }],
+          ['ops_batch', batch([])], ['decompress', {}], ['decompress', { blockId: 'b1' }],
+          ['decompress', { imageRef: 'list' }],
+        ]) assert.equal(scopeDenial(flow, name, args), null, name + ': ' + JSON.stringify(args))
+      })
+      check(stage + ' 未知工具只读豁免不吞掉已知工具的无效目标', () => {
+        assert.ok(scopeDenial(flow, 'future_reader', {}))
+        assert.equal(scopeDenial({ ...flow, toolAllowlist: ['future_reader'] }, 'future_reader', {}), null)
+        for (const [name] of legitimateWrites.filter(([tool]) => tool !== 'decompress')) {
+          assert.ok(scopeDenial({ ...flow, toolAllowlist: [name] }, name, {}), name)
+        }
+        for (const [name] of legitimateWrites) {
+          for (const args of [null, [], '', 42]) assert.ok(scopeDenial(flow, name, args), name + ': 非 record')
+        }
+      })
+    }
+    const flow = flowOf('S2')
+    check('write/edit 只接受 file_path；其他正式写工具只接受 path', () => {
+      for (const name of ['write', 'edit']) {
+        for (const args of [{}, { path: 'src/a.js' }, { filePath: 'src/a.js' },
+          { dest: 'outside.js' }, { file: 'outside.js' }, { filename: 'outside.js' },
+          { file_path: '' }, { file_path: '   ' }, { file_path: null }, { file_path: 42 }, { file_path: [] },
+          { file_path: '', path: 'src/a.js' }]) assert.ok(scopeDenial(flow, name, args), name + ': ' + JSON.stringify(args))
+        assert.equal(scopeDenial(flow, name, { file_path: 'src/a.js', path: 'outside.js' }), null)
+        assert.ok(scopeDenial(flow, name, { file_path: 'outside.js', path: 'src/a.js' }))
+      }
+      for (const name of ['str_replace_editor', 'ops_write_file', 'ops_edit_file', 'ops_remove', 'ops_replace']) {
+        for (const args of [{}, { file_path: 'src/a.js' },
+          { dest: 'outside.js' }, { file: 'outside.js' }, { filename: 'outside.js' },
+          { path: '' }, { path: null }, { path: 42 }, { path: [] }]) {
+          assert.ok(scopeDenial(flow, name, args), name + ': ' + JSON.stringify(args))
+        }
+        assert.equal(scopeDenial(flow, name, { path: 'src/a.js', file_path: 'outside.js' }), null)
+        assert.ok(scopeDenial(flow, name, { path: 'outside.js', file_path: 'src/a.js' }))
+      }
+    })
+    check('move/copy 必须完整提供正式 path/to 且两端都在 scope', () => {
+      for (const name of ['ops_move', 'ops_copy']) {
+        for (const args of [{ path: 'src/a.js' }, { to: 'src/b.js' },
+          { path: 'src/a.js', dest: 'outside.js' }, { path: 'src/a.js', file: 'outside.js' },
+          { path: 'src/a.js', filename: 'outside.js' }, { dest: 'outside.js', to: 'src/b.js' },
+          { file: 'outside.js', to: 'src/b.js' }, { filename: 'outside.js', to: 'src/b.js' },
+          { source: 'src/a.js', destination: 'src/b.js' }, { from: 'src/a.js', to: 'src/b.js' },
+          { path: '', to: 'src/b.js' }, { path: 'src/a.js', to: '' },
+          { path: null, to: 'src/b.js' }, { path: 'src/a.js', to: 42 },
+          { path: 'src/a.js\u0000', to: 'src/b.js' }, { path: 'src/a.js', to: 'src/b.js\u0000' },
+          { path: 'outside.js', to: 'src/b.js' }, { path: 'src/a.js', to: 'outside.js' }]) {
+          assert.ok(scopeDenial(flow, name, args), name + ': ' + JSON.stringify(args))
+        }
+      }
+    })
+    check('ops_replace 仅精确文件，目录 scope、点根、缺省与文件后代均拒绝', () => {
+      for (const args of [{}, { path: '.' }, { path: './' }, { path: ws }, { path: 'src/tree' },
+        { path: 'src/tree/' }, { path: 'src/tree/new.js' }, { path: 'src/a.js/descendant' }]) {
+        assert.ok(scopeDenial(flow, 'ops_replace', args), JSON.stringify(args))
+      }
+      assert.equal(scopeDenial(flow, 'ops_replace', { path: 'src/目标.js' }), null)
+    })
+    check('batch run 无法完整枚举操作与路径时 fail closed', () => {
+      for (const args of [{}, { operations: [] }, { action: 'run' },
+        batch(null), batch({}), batch('operations'), batch([null]), batch([42]), batch([{}]),
+        batch([{ op: null }]), batch([{ op: [] }]), batch([{ op: {} }]),
+        batch([{ op: { toString: null }, path: 'src/a.js' }]),
+        batch([{ op: 'remove', path: 'src/a.js\u0000' }]),
+        batch([{ op: 'copy', path: 'src/a.js', to: 'src/b.js\u0000' }]),
+        batch([{ op: 'write', path: 'src/a.js' }]), batch([{ kind: 'remove', path: 'src/a.js' }]),
+        batch([{ op: 'future', path: 'src/a.js' }]), batch([{ op: 'remove' }]),
+        batch([{ op: 'copy', path: 'src/a.js' }]), batch([{ op: 'move', to: 'src/a.js' }]),
+        batch([{ op: 'remove', path: 'outside.js' }]),
+        batch([{ op: 'copy', path: 'outside.js', to: 'src/a.js' }]),
+        batch([{ op: 'move', path: 'src/a.js', to: 'outside.js' }]),
+        batch([], { operationsRef: 'ref://opaque' }), batch([], { operationsRef: '' }),
+        { action: 'resume' }, { action: 'resume', operations: [] }, { action: 'future', operations: [] }]) {
+        assert.ok(scopeDenial(flow, 'ops_batch', args), JSON.stringify(args))
+      }
+    })
+    check('decompress 显式无效 toFile 与隐式图片落盘不能冒充只读', () => {
+      for (const args of [{ toFile: '' }, { toFile: '   ' }, { toFile: null }, { toFile: 42 },
+        { toFile: [] }, { toFile: {} }, { imageRef: 'm00001' }, { imageRef: 'm00001', toFile: 'src/a.js' }]) {
+        assert.ok(scopeDenial(flow, 'decompress', args), JSON.stringify(args))
+      }
+    })
+    check('ASCII/Unicode、正反斜杠、UNC、盘根、超长及数据目录隔离', () => {
+      for (const path of ['src/a.js', 'src/目标.js', './src/a.js', join(ws, 'src', 'a.js')]) {
+        assert.equal(scopeDenial(flow, 'write', { file_path: path }), null, path)
+      }
+      if (process.platform === 'win32') {
+        assert.equal(scopeDenial(flow, 'write', { file_path: 'src\\目标.js' }), null)
+        for (const path of ['C:/', 'C:\\', '\\\\server\\share\\outside.js', '//server/share/outside.js']) {
+          assert.ok(scopeDenial(flow, 'write', { file_path: path }), path)
+        }
+      }
+      for (const path of ['../outside.js', 'src/a.js/child', 'src/a.js\u0000', 'x'.repeat(10000)]) {
+        assert.ok(scopeDenial(flow, 'write', { file_path: path }), path.slice(0, 80))
+      }
+      const internal = '.dsh-flowgate/scope.json'
+      assert.ok(scopeDenial(flowOf('S2', [internal]), 'write', { file_path: internal }))
+      assert.ok(scopeDenial({ ...flow, scope: { ...flow.scope, frozen: false } }, 'write', { file_path: 'src/a.js' }))
+    })
+    check('batch root 与执行 cwd 按流程根 scope 隔离', () => {
+      const nested = join(ws, 'src')
+      assert.equal(scopeDenial(flow, 'ops_batch', batch([{ op: 'remove', path: 'a.js' }]), nested), null)
+      assert.ok(scopeDenial(flow, 'ops_batch', batch([{ op: 'remove', path: 'src/a.js' }]), nested))
+      assert.equal(scopeDenial(flow, 'ops_batch', batch([{ op: 'remove', path: 'src/a.js' }], { root: '..' }), nested), null)
+      assert.ok(scopeDenial(flow, 'ops_batch', batch([{ op: 'remove', path: 'src/a.js' }], { root: '..' })))
+      assert.ok(scopeDenial(flow, 'write', { file_path: 'src/a.js' }, tmpdir()))
+      assert.equal(scopeDenial(flow, 'write', { file_path: join(ws, 'src/a.js') }, tmpdir()), null)
+    })
+  } finally { rmSync(ws, { recursive: true, force: true }) }
+}
+
+// 这组命令确实可以写盘：只用字符串断言不能证明 --check 是纯解析。
+{
+  const ws = mkdtempSync(join(tmpdir(), 'flowgate-node-check-'))
+  const marker = join(ws, 'preload-wrote.txt')
+  const bodyMarker = join(ws, 'body-wrote.txt')
+  const preload = join(ws, 'preload.cjs')
+  const source = join(ws, '语法 检查.cjs')
+  try {
+    writeFileSync(preload, 'require("node:fs").writeFileSync(' + JSON.stringify(marker) + ', "preload")\n')
+    writeFileSync(source, 'require("node:fs").writeFileSync(' + JSON.stringify(bodyMarker) + ', "body")\n')
+    const options = { cwd: ws, env: { ...process.env, NODE_OPTIONS: '' }, stdio: 'pipe' }
+    execFileSync(process.execPath, ['--check', source], options)
+    check('真实 Node --check 单文件只解析，不执行正文', () => {
+      assert.equal(existsSync(bodyMarker), false)
+      assert.equal(existsSync(marker), false)
+    })
+    execFileSync(process.execPath, ['--check', '--require', preload, source], options)
+    check('真实 Node --check --require 仍执行 preload 并写盘', () => {
+      assert.equal(readFileSync(marker, 'utf8'), 'preload')
+      assert.equal(existsSync(bodyMarker), false)
+    })
+    rmSync(marker)
+    const cx = makeHost(ws, 'node-check-probe')
+    await cx.tool('flowgate_start', { title: 'Node parse preload 边界' })
+    const flow = currentService().get('node-check-probe')
+    const safe = ['node --check a.js', 'node --check "语法 检查.cjs"', "node --check '语法 检查.cjs'"]
+    const unsafe = [
+      'node --check --require ./preload.cjs "语法 检查.cjs"',
+      'node --check --require=./preload.cjs a.js',
+      'node --check --import ./preload.mjs a.js', 'node --check --loader ./loader.mjs a.js',
+      'node --check a.js --require ./preload.cjs', 'node --check a.js --import ./preload.mjs',
+      'node --check a.js --loader ./loader.mjs', 'node --check a.js --trace-warnings',
+      'node --check a.js b.js', 'node --check',
+      'bash -n +n deploy.sh', 'bash -n -c "touch changed"', 'bash -n deploy.sh +n',
+      'php -l -r "unlink(1);"', 'php -l index.php -r "unlink(1);"',
+      'tsc --noEmit -p tsconfig.json', 'deno check source.ts',
+      'node --version --require ./preload.cjs',
+    ]
+    for (const stage of ['S1', 'S3']) {
+      flow.stage = stage
+      for (const command of safe) assert.equal((await cx.guard('ops_bash', { command })).kind, 'allow', stage + ': ' + command)
+      for (const command of unsafe) assert.equal((await cx.guard('ops_bash', { command })).kind, 'deny', stage + ': ' + command)
+      check(stage + ' 实际宿主守卫拒绝 parse 尾参与 preload，纯解析保持可用', () => assert.equal(existsSync(marker), false))
+    }
+    await cx.tool('flowgate_cancel', {})
+  } finally { rmSync(ws, { recursive: true, force: true }) }
+}
+
+// python -E 忽略环境变量，不是内联执行；清单提交与实际 S2/S4 判定必须一致。
+{
+  const ws = mkdtempSync(join(tmpdir(), 'flowgate-python-E-'))
+  const sid = 'python-E-contract'
+  try {
+    const cx = makeHost(ws, sid)
+    await cx.tool('flowgate_start', { title: '解释器选项按生态判定' })
+    const wrappers = ['mvnw --version', 'gradlew -v']
+    const scope = { files_expected_to_change: ['src/a.js'], commands: ['python -E test/check.py', 'php -F test/check.php', ...wrappers],
+      capabilities: [], out_of_scope_explicitly: [],
+      acceptance_criteria: [{ id: 'AC-1', when: '清单批准后', then: 'python -E 正常放行' }] }
+    for (const command of ['perl -E "say 1"', 'python -c "print(1)"', 'node -e "1"',
+      'php -r "echo 1;"', 'php -E "echo 1;"', 'php -nE1', 'ruby -e "puts 1"', 'bash -c "touch x"']) {
+      await assert.rejects(cx.tool('flowgate_doc', { html: '<p>inline</p>', scope: { ...scope, commands: [command] } }), /永远不会被放行/)
+    }
+    const pending = cx.tool('flowgate_doc', { html: '<p>python 环境隔离选项</p>', scope })
+    await tick()
+    const approved = await cx.request('/api/flowgate/action', { sessionId: sid, action: 'doc', payload: { decision: 'approve' } })
+    assert.equal(approved.status, 200, JSON.stringify(approved.body))
+    await pending
+    const flow = currentService().get(sid)
+    check('normalizePendingScope 保留合法 python -E 清单', () => {
+      assert.deepEqual(approved.body.scope.data.in_scope.commands, scope.commands)
+    })
+    for (const stage of ['S1', 'S2', 'S3', 'S4']) {
+      flow.stage = stage
+      check(stage + ' python -E 清单按阶段放行，perl -E 内联仍拒绝', () => {
+        const denial = shellDenial(flow, { command: scope.commands[0] })
+        if (stage === 'S2' || stage === 'S4') assert.equal(denial, null)
+        else assert.ok(denial)
+        const fileModeDenial = shellDenial(flow, { command: scope.commands[1] })
+        if (stage === 'S2' || stage === 'S4') assert.equal(fileModeDenial, null)
+        else assert.ok(fileModeDenial)
+        assert.ok(shellDenial({ ...flow, scope: { frozen: true, data: { in_scope: { commands: [] } } } }, { command: scope.commands[1] }))
+        for (const command of ['perl -E "say 1"', 'php -E "echo 1;"', 'php -nE1']) {
+          assert.ok(shellDenial({ ...flow, scope: { frozen: true, data: { in_scope: { commands: [command] } } } }, { command }))
+        }
+        const unapproved = { ...flow, scope: { frozen: true, data: { in_scope: { commands: [] } } } }
+        for (const command of wrappers) {
+          assert.ok(shellDenial(unapproved, { command }), command)
+          const wrapperDenial = shellDenial(flow, { command })
+          if (stage === 'S2' || stage === 'S4') assert.equal(wrapperDenial, null, command)
+          else assert.ok(wrapperDenial, command)
+        }
+        for (const command of ['node --version', 'npm -v', 'python --version', 'perl --version', 'mvn --version', 'gradle -v']) {
+          assert.equal(shellDenial(flow, { command }), null, command)
+        }
+      })
+    }
+    await cx.tool('flowgate_cancel', {})
   } finally { rmSync(ws, { recursive: true, force: true }) }
 }
 

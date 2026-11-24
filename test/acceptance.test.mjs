@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { normalizeCriteria, acceptanceLedger, grillReadiness, remediationList, scopeReadiness, stageSummary } from '../lib/acceptance.js'
-import { needsOf, resolveExecutable } from '../lib/ecosystems.js'
+import { BROAD_COMMAND, INLINE_EXEC, PARSE_ONLY, READONLY_VERSION, TEST_COMMAND, ecosystemsFor, needsOf, resolveExecutable } from '../lib/ecosystems.js'
 import { join } from 'node:path'
 
 const snapshot = { id: 'a'.repeat(64), complete: true }
@@ -95,6 +95,91 @@ test('每个生态都登记了「它靠谁才能跑」：包管理器指向解�
   assert.deepEqual(needsOf('"npm"'), ['node'])
   // 没登记的名字不猜。
   assert.deepEqual(needsOf('some-unknown-tool'), [])
+})
+
+test('免授权解析只接受明确的单文件形式，不接纳启动选项或隐式配置', () => {
+  for (const command of [
+    'node --check file.js', 'nodejs -c file.js', 'php -l index.php', 'php --syntax-check index.php',
+    'bash -n script.sh', 'sh -n script.sh', 'zsh -n script.sh', 'dash -n script.sh',
+    'node --check "目录/文件 名.js"', "node --check '目录/文件 名.js'",
+    'node --check C:/repo/file.js', 'node --check C:\\repo\\file.js',
+  ]) assert.equal(PARSE_ONLY.test(command), true, command)
+  for (const command of [
+    '', 'node --check', 'node --check a.js b.js', 'node --check --require',
+    'node --require ./hook.cjs --check file.js', 'node --check file.js --require ./hook.cjs',
+    'node --import ./hook.mjs --check file.js', 'node --check file.js --import ./hook.mjs',
+    'node --loader ./hook.mjs --check file.js', 'node --check file.js --loader ./hook.mjs',
+    'node --check "file.js" --require ./hook.cjs', 'node --check *', 'node --check [ab].js', 'node --check \\--require=./hook.cjs',
+    'node --check file.js\n', 'node --check file.js\r\n', 'node --check ""',
+    'node --check "--require"', 'node --check "file.js\n--require hook.cjs"',
+    'bash +n script.sh', 'bash -n script.sh +n', 'bash -n script.sh -c echo',
+    'bash -c echo -n script.sh', 'bash -nc echo', 'php -l index.php -r echo',
+    'php -r echo -l index.php', 'php -l --run=echo', 'perl -c script.pl', 'ruby -c script.rb',
+    'tsc --noEmit', 'tsc --noEmit file.ts', 'deno check file.ts',
+  ]) assert.equal(PARSE_ONLY.test(command), false, command)
+})
+
+test('版本规则逐条退出且不继承任意尾参或其他生态的选项', () => {
+  for (const command of [
+    'node --version', 'npm --version', 'node -v', 'npm -v', 'nodejs --version',
+    'python -V', 'py --version', 'pip --version', 'php -v', 'composer -V',
+    'go version', 'cargo -V', 'java -version', 'javac --version', 'dotnet --version',
+    'mvn --version', 'gradle -v',
+    'ruby --version', 'bundle -v', 'perl -v', 'luarocks --version', 'bash --version',
+    'pwsh --version', 'make --version', 'command -v node', 'where node', 'npm --version\t',
+  ]) assert.equal(READONLY_VERSION.test(command), true, command)
+  for (const command of [
+    '', 'node --version file.js', 'npm --version --require hook.cjs', 'python -v',
+    'pip -V', 'gofmt version', 'go --version', 'ruby -v', 'lua -v', 'cmd --version',
+    'sh --version', 'node --version\n', 'node --version\r\n', 'where node npm',
+    'mvnw --version', 'mvnw -v', 'gradlew --version', 'gradlew -v', './gradlew --version',
+    'node --version'.padEnd(1024, ' ') + '--require hook.cjs',
+  ]) assert.equal(READONLY_VERSION.test(command), false, command)
+})
+
+test('内联执行按解释器标志区分大小写并识别相邻、组合、引号及路径写法', () => {
+  const embedded = new RegExp(INLINE_EXEC.source, 'u')
+  for (const command of [
+    'node -e1', 'node -pe1', 'node --eval=1', 'node --print 1', 'nodejs -p1', 'bun -e1',
+    'npx -c echo', 'python -c1', 'python3 -Ic1', 'py -Ec1', 'perl -E1', 'perl -we1',
+    'ruby -ne1', 'ruby -W2e1', 'ruby -0777ne1', 'perl -0777ne1', 'perl -l0777e1', 'php -nr1', 'php --run=1', 'php -R1', 'php -E1', 'php -nE1', 'php -E "echo 1;"', 'php --process-end=1', 'elixir -e 1', 'iex --eval 1',
+    'lua -e1', 'luajit -e1', 'deno eval 1', 'bash -xc echo', 'sh -c echo',
+    'pwsh -COMMAND echo', 'powershell -enc QQ==', 'pwsh -CommandWithArgs echo', 'cmd /Cecho',
+    'NODE.EXE -e1', 'C:/工具/node.exe -e1', 'C:\\工具\\python.exe -c1',
+    '"C:/Program Files/node.exe" -e1', "'/usr/bin/perl' -E1",
+    'n"od"e -"e"1', '"node" "-e"1', 'node --require hook.cjs -e1',
+    'node --version -e1', 'php -l index.php -r1', 'node \\-e1', 'n\\ode -\\e1',
+  ]) {
+    assert.equal(INLINE_EXEC.test(command), true, command)
+    assert.equal(embedded.test(command), true, '嵌入 source：' + command)
+  }
+  for (const command of [
+    '', 'python -E', 'python -E script.py', 'python -e1', 'node -E1', 'node --Eval=1',
+    'node --check file.js', 'node -c file.js', 'php -l index.php', 'php -e index.php', 'php -F script.php', 'php -nFscript.php', 'php --process-file script.php',
+    'perl -c file.pl', 'ruby -c file.rb', 'bash -n script.sh', 'bash +n script.sh',
+    'npm -e1', 'pip -c1', 'go -e1', 'mix -e1', 'cmd -c echo', 'deno --eval 1',
+    'notnode -e1', 'node-helper -e1', 'node --evaluation=1',
+  ]) {
+    assert.equal(INLINE_EXEC.test(command), false, command)
+    assert.equal(embedded.test(command), false, '嵌入 source：' + command)
+  }
+})
+
+test('严格执行规则不收紧体检的测试、宽泛命令和生态依赖识别', () => {
+  for (const command of ['npm run test -- --coverage', 'NODE --test test/x.mjs', 'python -m pytest -q', 'deno test --allow-all', 'composer run test']) {
+    assert.equal(TEST_COMMAND.test(command), true, command)
+  }
+  for (const command of ['npm *', 'PYTHON *', 'php *', 'deno *', '*']) {
+    assert.equal(BROAD_COMMAND.test(command), true, command)
+  }
+  for (const [token, ids] of [
+    ['"C:/工具/NODE.EXE"', ['node']], ['C:\\tools\\python3.exe', ['python']],
+    ['"./gradlew.bat"', ['java']], ['bun', ['node']], ['some-unknown-tool', []],
+  ]) assert.deepEqual(ecosystemsFor(token), ids, token)
+  assert.deepEqual(needsOf('"C:/工具/NPM.CMD"'), ['node'])
+  assert.deepEqual(needsOf('C:\\tools\\pip3.exe'), ['python', 'python3', 'py'])
+  const readiness = scopeReadiness([unit], ['python -E -m pytest -q', 'deno test --allow-all'], ['test/example.test.js'])
+  assert.ok(!readiness.risks.some((risk) => risk.code === 'no-test-command'))
 })
 
 test('带目录的写法相对仓库根解析：宿主进程 cwd 不是仓库根时也不误报', () => {

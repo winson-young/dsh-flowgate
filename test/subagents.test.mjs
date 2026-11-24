@@ -576,6 +576,37 @@ await test('最终守卫默认拒绝未知、写入、代理、消息、流程�
     }
     assert.equal((await host.check('ops_result', { action: 'page', sandbox_permissions: 'danger-full-access' }, id, true)).kind, 'deny')
     assert.equal((await host.check('ops_bash', { command: 'pwd' }, id, true)).kind, 'allow')
+    // 最终 tools.guard 也必须使用严格参数语法，不能让 parse 正则吃掉任意尾参。
+    for (const command of ['node --check source.js', 'node --check "目录/语法 检查.js"',
+      "node --check '目录/语法 检查.js'", 'bash -n deploy.sh', 'php -l index.php',
+      'node --version', 'npm -v', 'python --version']) {
+      assert.equal((await host.check('ops_bash', { command }, id, true)).kind, 'allow', command)
+      const code = 'return await tools.ops_bash(' + JSON.stringify({ command }) + ');'
+      assert.equal((await host.check('run_code', { code, description: '纯解析转发' }, id, true)).kind, 'allow', command)
+    }
+    for (const command of [
+      'node --check --require ./preload.cjs source.js',
+      'node --check --require=./preload.cjs source.js',
+      'node --check --import ./preload.mjs source.js',
+      'node --check --loader ./loader.mjs source.js',
+      'node --check source.js --require ./preload.cjs',
+      'node --check source.js --import ./preload.mjs',
+      'node --check source.js --loader ./loader.mjs',
+      'node --check source.js --trace-warnings',
+      'node --check source.js other.js', 'node --check',
+      'node --version --require ./preload.cjs', 'npm -v exec arbitrary',
+      'bash -n +n deploy.sh', 'bash -n -c "touch changed"',
+      'bash -n deploy.sh +n', 'bash -n deploy.sh -c "touch changed"',
+      'php -l -r "unlink(1);"', 'php -l index.php -r "unlink(1);"',
+      'tsc --noEmit -p tsconfig.json', 'deno check source.ts',
+      'python -E test/check.py', 'perl -E "say 1"',
+    ]) {
+      for (const name of ['ops_bash', 'bash']) {
+        assert.equal((await host.check(name, { command }, id, true)).kind, 'deny', name + ': ' + command)
+      }
+      const code = 'return await tools.ops_bash(' + JSON.stringify({ command }) + ');'
+      assert.equal((await host.check('run_code', { code, description: 'parse 尾参逃逸' }, id, true)).kind, 'deny', command)
+    }
     // 评审要核对「实际改了什么」，测试方向要核对工作区有没有多余改动；
     // 原来只认精确的 pwd，子代理只能按文件正文猜。git 的这三个子命令只读。
     for (const command of ['git diff --stat', 'git status', 'git log --oneline -5']) {
@@ -647,12 +678,25 @@ await test('S4 子代理只看 scope 清单：清单内放行、清单外一律�
   await fixture({ onStart: async (activation, host) => {
     const id = activation.childId
     assert.equal((await host.check('ops_bash', { command: 'npm test' }, id, true)).kind, 'allow')
+    assert.equal((await host.check('ops_bash', { command: 'python -E test/check.py' }, id, true)).kind, 'allow')
+    for (const command of [
+      'node --check --require ./preload.cjs source.js',
+      'node --check source.js --require ./preload.cjs',
+      'node --check source.js --import ./preload.mjs',
+      'node --check source.js --loader ./loader.mjs',
+      'bash -n +n deploy.sh', 'php -l -r "unlink(1);"',
+      'perl -E "say 1"', 'tsc --noEmit -p tsconfig.json', 'deno check source.ts',
+    ]) {
+      assert.equal((await host.check('ops_bash', { command }, id, true)).kind, 'deny', command)
+      const code = 'return await tools.ops_bash(' + JSON.stringify({ command }) + ');'
+      assert.equal((await host.check('run_code', { code, description: 'S4 尾参逃逸' }, id, true)).kind, 'deny', command)
+    }
     assert.equal((await host.check('ops_bash', { command: 'touch fixture-output' }, id, true)).kind, 'deny')
     assert.equal((await host.check('ops_write_file', { path: 'src/auth/session.ts' }, id, true)).kind, 'deny')
     assert.equal((await host.check('unknown_plugin_tool', {}, id, true)).kind, 'deny')
     assert.equal((await host.check('ops_bash', { command: 'pwd', sandbox_permissions: 'danger-full-access' }, id, true)).kind, 'deny')
   } }, async (host) => {
-    await host.advance('S4', { reviewDecision: 'skip', commands: ['npm test'] })
+    await host.advance('S4', { reviewDecision: 'skip', commands: ['npm test', 'python -E test/check.py'] })
     const added = await host.action('addDirection', { name: '迁移回滚', points: ['迁移后回滚'], needsWrite: true })
     const direction = added.directions.find((item) => item.name === '迁移回滚')
     // 客户端多传的 needsWrite 被忽略：方向对象里没有这个概念，也没有任何授予结果。
