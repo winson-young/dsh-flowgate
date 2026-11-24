@@ -22,6 +22,8 @@ dsh plugin --profile web add link:D:/Projects/dsh-flowgate
 
 **桌面端（desktop profile）** 的安装方式不同，请按[桌面端安装步骤](<docs/development.md#桌面端安装>)操作。
 
+开发这个插件本身时，建议用 `file:` 装打包好的 `tgz` 而不是 `link:` 指向源码目录：`link:` 下运行中的插件就是正在改的这份代码，规则改错时会连正常调用一起拦下。发布用 `node scripts/publish.mjs`（自测 → 打包 → 改 profile 依赖），之后在 profile 目录 `pnpm install` 并重启 DSH 才生效。详见[修改代码后如何生效](<docs/development.md#修改代码后如何生效>)。
+
 ## 快速上手
 
 以下界面截图由插件组件配合示例数据生成；工作区与规则截图已更新到本轮四阶段规则和需求整理界面。预览已验证三种宽度、明暗主题与键盘操作，真实宿主加载和模型请求需单独验证；完整范围见[开发说明](<docs/development.md#维护说明插图>)。

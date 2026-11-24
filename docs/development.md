@@ -14,20 +14,22 @@
     }
   },
   "dependencies": {
-    /* 保留原有依赖 */
+    /* 保留原有依赖，二选一 */
     "dsh-flowgate": "link:D:/Projects/dsh-flowgate"
+    /* 或装打包好的发布版： */
+    /* "dsh-flowgate": "file:D:/Plugins/flowgate-pkg/dsh-flowgate-0.1.1.tgz" */
   }
 }
 ```
 
-将路径换成本项目的实际位置。在 Bash / Git Bash 中执行：
+将路径换成本项目的实际位置。`link:` 保存即生效，适合热调试；`file:` 装的是打包快照，改代码不影响运行版本，适合在本项目上开发插件本身（理由见[修改代码后如何生效](#修改代码后如何生效)）。在 Bash / Git Bash 中执行：
 
 ```bash
 cd "$USERPROFILE/.dsh/profiles/desktop"
 pnpm install --prefer-offline
 ```
 
-重新启动桌面端。在本项目目录运行 `npm run test:install`，核对 profile 清单、软链和 bundle 契约。该检查需对应的 profile 已安装插件，详见下方测试说明。
+重新启动桌面端。在本项目目录运行 `npm run test:install`，核对 profile 清单、依赖来源、安装副本完整性与 bundle 契约。该检查需对应的 profile 已安装插件，详见下方测试说明。
 
 ## 修改范围与只读边界
 
@@ -343,7 +345,14 @@ S4 退回只有 S2 一个目标，所以「AC 本身测不了」的缺口回 S2 
 
 ## 修改代码后如何生效
 
-本地开发使用 `link:` 安装；`file:` 安装为复制内容，不会同步源码改动。
+安装方式决定「改代码」与「运行版本」之间隔了几步。两种都支持：
+
+| 安装方式 | 改代码之后 |
+| :--- | :--- |
+| `link:D:/Projects/dsh-flowgate` | 保存即生效（重启 DSH 后）。开发期方便，但**运行中的插件就是正在改的这份代码**，改坏了没有退路 |
+| `file:D:/Plugins/flowgate-pkg/dsh-flowgate-x.y.z.tgz` | 不生效。要跑 `node scripts/publish.mjs` 重新打包并 `pnpm install` 才换上 |
+
+`file:` 安装是复制内容，不会同步源码改动。插件本身在有 bug 的版本上开发插件，会踩到「用有 bug 的守卫修这个守卫」——判定规则一边改一边生效，改错时连正确的调用都可能被自己的半成品规则拦下。所以**改插件自己的代码时推荐 `file:` 安装**，用 `link:` 只在你确实需要热调试时临时改回去。
 
 | 修改位置 | 生效方式 |
 | :--- | :--- |
@@ -351,7 +360,27 @@ S4 退回只有 S2 一个目标，所以「AC 本身测不了」的缺口回 S2 
 | [宿主端](../lib/index.js) | 完全重启 DSH 进程，清除模块导入缓存 |
 | 包中的客户端声明或导出 | 重启 DSH，重新加载 bundle 元数据 |
 
-desktop profile 使用 `link:D:/Projects/dsh-flowgate` 时会直接指向本项目。仅修改宿主 JavaScript 无需重新安装，但必须完全退出并重启 DSH 才加载新模块；之后刷新原有 GUI 地址，客户端产物也需按上表重建。只刷新浏览器不会更新宿主模块。不要仅凭源码、预览或单测已更新就认定当前运行的 DSH 已加载新代码。
+desktop profile 使用 `link:D:/Projects/dsh-flowgate` 时会直接指向本项目，此时仅修改宿主 JavaScript 无需重新安装，但必须完全退出并重启 DSH 才加载新模块；使用 `file:` 安装时还必须先重新打包再安装，见下节。之后刷新原有 GUI 地址，客户端产物也需按上表重建。只刷新浏览器不会更新宿主模块。不要仅凭源码、预览或单测已更新就认定当前运行的 DSH 已加载新代码。
+
+### 发布到 `file:` 安装
+
+`node scripts/publish.mjs` 做三件事：跑一遍 `npm test`、把当前工作副本打包到发布目录、把 profile 的依赖声明指向新包。它**不执行 `pnpm install`，也不重启 DSH**——什么时候真正换上，由你决定。
+
+```bash
+node scripts/publish.mjs                # 自测 + 打包 + 改 profile 依赖
+node scripts/publish.mjs --skip-test    # 跳过自测
+node scripts/publish.mjs --no-profile   # 只打包，不动 profile
+```
+
+发布目录默认 `D:/Plugins/flowgate-pkg`，profile 默认 `~/.dsh/profiles/desktop`，可用 `FLOWGATE_PKG_DIR` / `FLOWGATE_PROFILE_DIR` 覆盖。脚本结束后仍需两步才生效：在 profile 目录跑 `pnpm install`，再完全退出并重启 DSH。
+
+三点必须记住：
+
+- **版本号要先往上加**。`npm pack` 用 `package.json` 的 `version` 命名文件，同名会被 pnpm 判为「没有变化」而跳过解压，看起来装上了其实是旧内容。
+- **发布目录里留旧包就是回退路径**。新版有问题时把 profile 的依赖指回上一个 `tgz`，再 `pnpm install` 并重启即可，不要删历史包。
+- **流程数据不在插件目录**。`.dsh-flowgate/` 在流程所在工作区下，换安装方式不影响已有流程快照。
+
+`test/install.test.mjs` 只核对**安装副本自身**是否完整可加载，不跟工作副本比版本——「改了代码还没发布」不会让它失败，否则 S4 的 `npm test` 会因为发布节奏而非代码问题报错。版本不一致时它只打印一句提示。
 
 ### 运行版本核对
 
@@ -450,7 +479,7 @@ npm run test:gatemode      # 门禁模式：自动通过、随时切换、阻塞
 npm run test:subagents     # 新版 activation、最终守卫、取消与降级的测试替身
 npm run test:integration   # 假宿主运行真实 apply()，检查工具、路由与挂起唤醒
 npm run test:client        # React 渲染与按钮行为、布局契约、主题变量
-npm run test:install       # profile 清单、软链、bundle 与导出契约
+npm run test:install       # profile 清单、依赖来源、安装副本与 bundle 契约
 ```
 
 以上测试都不需启动 DSH；子代理测试使用测试替身，不能证明真实宿主执行成功。`test:install` 依赖本地安装环境，默认检查 `~/.dsh/profiles/desktop`。检查其他 profile 时，先设置环境变量 `FLOWGATE_PROFILE_DIR` 为其绝对路径，再运行该命令。自动化通过后仍需在真实 DSH 中确认入口、门禁按钮、回退和窄屏布局。

@@ -445,6 +445,21 @@ S3 评审留下 6 条非阻塞发现，其中两条是实现缺陷，按用户�
 
 当前 desktop profile 使用 `link:D:/Projects/dsh-flowgate`。本轮仅改宿主 JavaScript 时无需重新安装，也无需客户端改动；完全退出并重启 DSH 后才加载新模块，浏览器刷新无效。本会话不重启，实机结果待实际验证后补记。
 
+## 安装方式改为发布快照（2026-11-24）
+
+desktop profile 从 `link:D:/Projects/dsh-flowgate` 改为 `file:D:/Plugins/flowgate-pkg/dsh-flowgate-0.1.1.tgz`，把「正在改的代码」和「运行中的插件」分开。
+
+| 项 | 结果 | 说明 |
+| :--- | :--- | :--- |
+| 打包内容 | 28 个文件、822 KB | `lib/` 八个模块与 `cordis.patch.yml` 均在包内；`test/`、`scripts/` 不进包 |
+| 隔离生效 | 通过 | `node_modules/dsh-flowgate` 由符号链接变为实体目录，`realpathSync` 指向自身而非工作副本；改工作副本不影响运行版本 |
+| 安装副本可加载 | 通过 | 从安装目录直接 `import` 宿主入口成功，导出 `name` 与 `apply`；副本不含 `node_modules`，只依赖 Node 内置模块与宿主注入的 `react` |
+| 安装就绪度 | 17 项全通过 | 断言改为同时接受 `link:` 与 `file:`，并统一核对**安装副本**而非工作副本 |
+| 全量测试 | 九套全通过 | `npm test` 退出码 0；`stamp-revisions.mjs --check` 输出 `Module revisions verified (7 modules).` |
+| 运行生效 | 待重启 | 未重启 DSH，运行中仍是旧的 `link:` 版本；重启后需核对 `hostRevision` 与磁盘一致 |
+
+改动的三处：新增 [发布脚本](../scripts/publish.mjs)（自测 → `npm pack` 到发布目录 → 改 profile 依赖声明，不执行 `pnpm install`、不重启）；[安装就绪度测试](../test/install.test.mjs) 放宽依赖来源断言并把检查对象统一到安装副本，版本不一致只提示不判失败——否则「改了代码还没发布」会让 S4 的 `npm test` 报错，看起来像代码缺陷；文档同步 `README.md`、`docs/development.md` 与本文件。
+
 ## 实机验证记录（2026-11-17，桌面端 0.2.2-rc.3）
 
 五条流程在真实桌面端跑通，每条都是「用户点按钮 → 宿主状态机推进」，Agent 只在中间调工具：

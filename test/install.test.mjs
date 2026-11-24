@@ -4,8 +4,8 @@
  *           packages/client/modules/src/client/system.ts（__ModuleLoader__ 注册契约）
  */
 import assert from 'node:assert/strict'
-import { readFileSync, existsSync, realpathSync } from 'node:fs'
-import { dirname, join, resolve } from 'node:path'
+import { readFileSync, existsSync } from 'node:fs'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -101,22 +101,32 @@ await check('profile 的 bundles 清单包含 dsh-flowgate', () => {
   assert.ok(bundles.includes('dsh-flowgate'), 'bundles 里没有 dsh-flowgate：' + JSON.stringify(bundles))
 })
 
-await check('profile 的 dependencies 用 link: 指向本仓库', () => {
+await check('profile 的 dependencies 声明了 dsh-flowgate 的来源', () => {
   const spec = profile?.dependencies?.['dsh-flowgate']
-  assert.ok(typeof spec === 'string' && spec.startsWith('link:'), '依赖不是 link: spec：' + String(spec))
-  const target = resolve(spec.slice('link:'.length))
-  assert.equal(realpathSync(target).toLowerCase(), realpathSync(ROOT).toLowerCase())
+  assert.ok(typeof spec === 'string' && spec.length > 0, '依赖缺失：' + String(spec))
+  // 开发期用 link: 指向工作副本，发布期用 file: 指向打好的 tgz，两种都合法。
+  // 但必须能在盘上找到实际内容，否则 pnpm install 会失败。
+  assert.match(spec, /^(link|file):/, '依赖必须写成 link: 或 file: 开头：' + spec)
+  const raw = spec.replace(/^(link|file):/, '')
+  const target = isAbsolute(raw) ? raw : resolve(PROFILE, raw)
+  assert.ok(existsSync(target), '依赖指向的路径不存在：' + spec)
 })
 
-const linkedDir = join(PROFILE, 'node_modules', 'dsh-flowgate')
+// 安装目录：link: 时是符号链接，file: 时是解压出来的实体目录，两种都接受。
+// 这里只核对「装进来的这一份自身是完整的」，不跟工作副本比版本 ——
+// 发布节奏由 publish.mjs 掌握，安装就绪度不该因为「还没发布」而失败。
+const installedDir = join(PROFILE, 'node_modules', 'dsh-flowgate')
 
-await check('profile 的 node_modules 里已链到本仓库', () => {
-  assert.ok(existsSync(linkedDir), '缺少 ' + linkedDir + '（先跑 pnpm install）')
-  assert.equal(realpathSync(linkedDir).toLowerCase(), realpathSync(ROOT).toLowerCase())
+await check('profile 的 node_modules 里已安装 dsh-flowgate', () => {
+  assert.ok(existsSync(installedDir), '缺少 ' + installedDir + '（先跑 pnpm install）')
+  assert.ok(
+    existsSync(join(installedDir, 'package.json')),
+    '安装目录里没有 package.json：' + installedDir + '（安装可能不完整）',
+  )
 })
 
 let pkg = null
-const pkgJsonPath = join(linkedDir, 'package.json')
+const pkgJsonPath = join(installedDir, 'package.json')
 
 await check('包自身的 package.json 可读', () => {
   assert.ok(existsSync(pkgJsonPath), '找不到 ' + pkgJsonPath)
@@ -170,7 +180,7 @@ await check('clientExportOf：exports["./client"] 存在且文件在盘上', () 
   const raw = pkg?.exports?.['./client']
   const rel = typeof raw === 'string' ? raw : raw?.default
   assert.equal(typeof rel, 'string', 'exports["./client"] 缺失')
-  clientPath = join(linkedDir, rel)
+  clientPath = join(installedDir, rel)
   assert.ok(existsSync(clientPath), '找不到客户端 bundle：' + clientPath)
 })
 
@@ -188,24 +198,38 @@ await check('bundle 不自行打包 react（react 由宿主 seed）', () => {
 
 let host = null
 await check('宿主半可被 import 且导出 name / inject / apply', async () => {
-  host = await import(pathToFileURL(join(linkedDir, pkg.main ?? 'lib/index.js')).href)
+  host = await import(pathToFileURL(join(installedDir, pkg.main ?? 'lib/index.js')).href)
   assert.equal(typeof host.apply, 'function', '缺少 apply')
   assert.equal(host.name, pkg.name, '导出的 name 必须等于包名（Cordis 用它做诊断与依赖解析）')
 })
 
 await check('宿主半不引入任何 @deepseek-ai/* 运行时依赖', () => {
-  const text = readFileSync(join(ROOT, 'lib', 'index.js'), 'utf8')
+  const text = readFileSync(join(installedDir, 'lib', 'index.js'), 'utf8')
   const valueImports = [...text.matchAll(/^import\s+(?!type)[^'"]*from\s+'([^']+)'/gm)].map((m) => m[1])
   const foreign = valueImports.filter((spec) => spec.startsWith('@deepseek-ai/'))
   assert.deepEqual(foreign, [], '宿主半出现了跨包值导入：' + JSON.stringify(foreign))
 })
 
 await check('bundle patch 声明的行 id 与包名一致', () => {
-  const patchPath = join(ROOT, 'cordis.patch.yml')
+  const patchPath = join(installedDir, 'cordis.patch.yml')
   const text = readFileSync(patchPath, 'utf8')
   assert.match(text, /- insert:/, 'patch 必须是 insert 形状')
   assert.match(text, new RegExp("name: '" + pkg.name + "'"), 'patch 里的 name 必须是包名')
 })
+
+// 安装副本与工作副本的版本对照：只作提示，不参与判定。
+// 两者不一致通常意味着「改了代码但还没发布」，运行中的插件仍是安装的那一版 ——
+// 这是发布节奏问题，不是安装错误，不该让 S4 的测试失败。
+try {
+  const localVersion = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version
+  if (localVersion !== pkg?.version) {
+    console.log('')
+    console.log('提示：工作副本是 ' + localVersion + '，安装的是 ' + pkg?.version + '。')
+    console.log('      运行中的插件仍是安装的那一版。要换上工作副本的代码，先跑 node scripts/publish.mjs。')
+  }
+} catch {
+  // 读不到工作副本的版本不影响安装就绪度判定，忽略。
+}
 
 console.log('')
 if (failures.length) {
