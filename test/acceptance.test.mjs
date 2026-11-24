@@ -172,6 +172,15 @@ test('严格执行规则不收紧体检的测试、宽泛命令和生态依赖�
   for (const command of ['npm *', 'PYTHON *', 'php *', 'deno *', '*']) {
     assert.equal(BROAD_COMMAND.test(command), true, command)
   }
+  // 清单条目可以带执行目录（`node * [.]`）：只给超宽命令加一个方括号后缀就能把它洗成
+  // 「看起来限定在某目录」的合规条目，所以超宽判定必须穿透后缀看命令本身。
+  for (const command of ['npm * [.]', 'node * [packages/web]', '* [packages/web]', 'PYTHON * [ a/b ]']) {
+    assert.equal(BROAD_COMMAND.test(command), true, command)
+  }
+  // 具体命令带后缀不算超宽：后缀不是命令的一部分。
+  for (const command of ['npm run * [packages/web]', 'node test/host.test.mjs [.]']) {
+    assert.equal(BROAD_COMMAND.test(command), false, command)
+  }
   for (const [token, ids] of [
     ['"C:/工具/NODE.EXE"', ['node']], ['C:\\tools\\python3.exe', ['python']],
     ['"./gradlew.bat"', ['java']], ['bun', ['node']], ['some-unknown-tool', []],

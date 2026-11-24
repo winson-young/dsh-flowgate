@@ -195,6 +195,7 @@ function makeHost(options = {}) {
       : chain[index](exec, () => next(index + 1))
     // 模拟宿主不可被普通 pre-execute allow 覆盖的最终守卫。
     const before = finalOnly ? { kind: 'allow' } : await next(0)
+    if (before.kind === 'deny') return before
     for (const guard of guards) {
       const verdict = await guard(exec)
       const reason = typeof verdict === 'string' ? verdict : verdict?.reason
@@ -372,6 +373,55 @@ await test('新版 review：预留真实 childId，执行前已有最终只读�
     for (const token of ['带引号引用', '普通引用', '未引用', 'Unicode', 'UNC', '盘根', '上限 + 1']) {
       assert.ok(correctnessPrompt.includes(token), '提示词缺少边界分支：' + token)
     }
+  })
+})
+
+// AC-8：子代理通道不能成为换目录的后门。清单条目绑住执行目录之后，子代理在流程根跑
+// 一条「只在 packages/web 下批准」的命令必须被拒；同一个判定在主 Agent 那边也一样。
+// 走 S4 的测试子代理：只有 S2 / S4 才把 scope 清单交给子代理通道。
+await test('AC-8 子代理 shell 与主 Agent 同一套目录规则', async () => {
+  await fixture({ manualResult: true }, async (host) => {
+    mkdirSync(join(host.cwd, 'packages', 'web'), { recursive: true })
+    await host.advance('S4', { commands: ['npm test', 'node --test test/host.test.mjs [packages/web]'] })
+    const running = observe(host.call('flowgate_test_run'))
+    await eventually(() => host.activations.length >= 1, '测试子代理启动')
+    const activation = host.activations[0]
+    const id = activation.childId
+    // 子会话的 cwd 就是流程根：带 [packages/web] 的条目在这里不该命中。
+    const wrongDir = await host.check('ops_bash', { command: 'node --test test/host.test.mjs' }, id, true)
+    assert.equal(wrongDir.kind, 'deny', '子代理在流程根不能命中只批准在子目录执行的条目')
+    // 不带目录后缀的条目照旧在流程根放行：收紧的是目录，不是命令本身。
+    assert.equal((await host.check('ops_bash', { command: 'npm test' }, id, true)).kind, 'allow')
+    // 换行在子代理通道同样先被拒：多行命令会让审查只看前半句。
+    const multiline = await host.check('ops_bash', { command: 'npm test\nrm -rf src' }, id, true)
+    assert.equal(multiline.kind, 'deny')
+    assert.match(multiline.reason, /换行/)
+    const trailingNewline = await host.check('ops_bash', { command: 'npm test\r\n' }, id, true)
+    assert.equal(trailingNewline.kind, 'deny')
+    assert.match(trailingNewline.reason, /换行/)
+    // 主 Agent 用的是同一个判定：同一条命令在流程根同样被拒，清单内的照旧放行。
+    assert.equal((await host.check('ops_bash', { command: 'node --test test/host.test.mjs' })).kind, 'deny')
+    assert.equal((await host.check('ops_bash', { command: 'npm test' })).kind, 'allow')
+    // workdir 是同一个旁路的第二个入口：子会话 header.cwd 在流程根，但 `ops_bash({ command, workdir })`
+    // 能让它在子目录里跑另一个同名程序。判定必须跟着 workdir 走，否则「绑目录」只在 header.cwd 上成立。
+    const listedInSubdir = await host.check('ops_bash', { command: 'node --test test/host.test.mjs', workdir: 'packages/web' }, id, true)
+    assert.equal(listedInSubdir.kind, 'allow', '带 workdir 指向被批准的子目录时应该放行')
+    const wrongWorkdir = await host.check('ops_bash', { command: 'npm test', workdir: 'packages/web' }, id, true)
+    assert.equal(wrongWorkdir.kind, 'deny', '流程根批准的命令带 workdir 换到子目录必须被拒')
+    const auditPath = join(host.cwd, '.dsh-flowgate', 'flows.jsonl')
+    const events = () => readFileSync(auditPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+    const auditStart = events().length
+    assert.equal((await host.check('ops_bash', { command: 'npm test', workdir: 'packages/web' }, id)).kind, 'deny')
+    assert.equal((await host.check('ops_bash', { command: 'node --test test/host.test.mjs', workdir: 'packages/web' }, id)).kind, 'allow')
+    assert.deepEqual(events().slice(auditStart).map(({ type, detail }) => [type, detail.dir, detail.cwd]), [
+      ['shell.denied', 'packages/web', join(host.cwd, 'packages', 'web')],
+      ['shell.allowed', 'packages/web', join(host.cwd, 'packages', 'web')],
+    ])
+    // 主 Agent 侧同一个旁路同样堵上。
+    assert.equal((await host.check('ops_bash', { command: 'npm test', workdir: 'packages/web' })).kind, 'deny')
+    assert.equal((await host.check('ops_bash', { command: 'node --test test/host.test.mjs', workdir: 'packages/web' })).kind, 'allow')
+    activation.result.resolve(reportFor(activation.spec, activation.points))
+    await host.complete('test', running.promise)
   })
 })
 

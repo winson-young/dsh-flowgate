@@ -6,6 +6,44 @@
 
 历史记录中的 `by: 'subagents'` 仅表明调用了子代理聚合入口；聚合报告通过、`blocking: 0` 或流程走完，均不能证明真实子代理成功执行并返回有效报告。下文原有结论保留，其证据范围受此限定。
 
+## 命令判定绑定换行与执行目录（2026-11-24）
+
+需求：用户原文「G02 命令判定看到的不是完整命令：漏了换行，也不看它在哪个目录下跑」。两处缺陷：`SHELL_ESCAPE_HINTS` 的字符类里没有 `\r\n`，而 shell 确实把换行当命令分隔符——审批器可能只认可第一行，执行器却会读取全部输入；`shellDenial` 只取 `args.command`，`scopeCommandMatches` 只比 `head.name` 与 `rest`，没有 cwd 维度，`working_directory` 又在 `PASSIVE_TOOLS` 里任何阶段都能 cd。合起来：批准过的命令与实际执行的命令之间没有绑定关系，而撤销授权、事后追责都依赖这个绑定。
+
+方案（十轮问答定稿）：
+
+- **换行在入口单独判**：`SHELL_ESCAPE_HINTS` 字符类补 `\r\n`；`shellDenial` 对命令原文先应用 `SHELL_MULTILINE`，随后才去除首尾空白，命中即拒并写 `multiline` 审计事件，理由文案点名换行而不混进「重定向 / 管道」；子代理通道 `readonlyDenial` 用同一条断言；清单录入 `normalizePendingScope` 对含换行的条目单独报错，不让人以为去掉管道就能过。
+- **清单条目带执行目录**：后缀写法 `[相对目录]`（`npm run build [packages/web]`）。`parseScopeCommand` 拆分，`normalizeScopeDir` 收口（绝对路径、盘符、`..` 一律无效），`scopeCommandEntry` 拼回。没有后缀的条目只认流程根，带后缀的按 `commandDirKey` 精确匹配那一个目录；子目录要另写一条，不做前缀覆盖。
+- **cwd 一路传到底**：`scopeDenial` → `shellDenial` → `scopeCommandMatches` 都带 cwd；判定用的目录还要读 shell 工具自己的参数——`shellWorkdir(args)` 取 `workdir` / `cwd` 里第一个非空值（`dir` 刻意不认：它在不同工具里不保证是执行目录，认它等于按一个实际不生效的目录命中条目，变成误放），相对会话目录解析，再核对文件系统中的真实目录。只有路径与实际位置一致、且在流程根内时，才能命中命令清单。`auditShell` 和待补队列同时记录相对目录 `dir` 与绝对路径 `cwd`。无法确认目录的待补条目保留原因，补录时重新核对目录，确认后由 `dir` 生成目录后缀。
+- **`working_directory` 在 S2 / S4 受限**：`workingDirectoryDenial` 核对 cd 的实际目标。根外、无法确认以及与请求路径不一致的目录一律拒绝。
+- **子代理同一套规则**：`childDenial` 的 `scopeShell` 闭包捕获子会话 `header.cwd`，并多接一个 `workdir` 参数（`readonlyDenial` 把 `shellWorkdir(args)` 传进去）。子代理的直接 shell 调用共用目录校验，前置拒绝或最终守卫会写审计。
+- **界面说清目录**：`scopeEntryDir` 取出后缀，清单 / 待补 / 已明确不补三处都补一句「仅限 packages/web 目录内执行」。
+- **超宽判定穿透后缀**：`BROAD_COMMAND` 允许末尾 `[目录]`，`npm * [.]` 仍算超宽，加个目录洗不成合规条目。
+
+改动范围：`lib/index.js`、`lib/ecosystems.js`、`lib/client.js`、`test/host.test.mjs`、`test/integration.test.mjs`、`test/subagents.test.mjs`、`test/client.test.mjs`、`test/acceptance.test.mjs`、`docs/development.md`、`README.md`、`CHANGELOG.md`、本文件。
+
+| 验收项 | 状态 | 证据与限制 |
+| :--- | :--- | :--- |
+| AC-1 含换行的命令在任何阶段都被拒，理由指认换行 | 通过 | `test/host.test.mjs:3892` 覆盖四个阶段、首尾换行、纯换行、`\r` 和 `\r\n`。拒绝理由点明多行命令和换行分隔符 |
+| AC-2 带目录后缀的条目剥掉后缀后仍按前缀通配 | 通过 | `test/host.test.mjs:3908` 验证无后缀通配在流程根放行 `npm run build`。带后缀的通配在 `packages/web` 放行同一命令，在流程根拒绝 |
+| AC-3 S1 提交含换行的清单条目被拒并说明换行是分隔符 | 通过 | `test/host.test.mjs:3759` 断言命令体、目录后缀前和条目末尾的换行均导致提交失败，报错指出换行问题 |
+| AC-4 不带目录后缀的条目只在流程根放行 | 通过 | `test/host.test.mjs:3917`；无 cwd 与流程根都放行，`packages/web` 拒。另由 `test/host.test.mjs:3935`「AC-4 workdir 参数同样决定执行目录，不能用它绕过目录后缀」覆盖 `ops_bash({ command, workdir })` 这个入口：`workdir: '.'` 与流程根都放行，相对 `packages/web`、绝对子目录、`tmpdir()` 全部拒；反过来条目声明了子目录时只认 `workdir` 指向的那一个目录，不带 `workdir` 仍按流程根判定 |
+| AC-5 带 `[packages/web]` 的条目只在该目录精确匹配 | 通过 | `test/host.test.mjs:3924` 验证目标目录放行，拒绝父目录、子目录和根外目录。`:3969` 验证目录链接指向与声明路径不一致时拒绝授权 |
+| AC-6 S2 / S4 的 `working_directory` 只能在流程根内换目录 | 通过 | `test/host.test.mjs:3826` 经 S2 宿主守卫验证相对子目录放行、根外绝对路径拒绝、查询放行。`test/host.test.mjs:3953` 和 `:3969` 覆盖 S2 和 S4 的其他路径输入、缺失目录与目录链接 |
+| AC-7 每次 shell 判定审计事件带 cwd，待补队列条目带 cwd | 通过 | `test/integration.test.mjs`「AC-7 审计流水与待补队列都记下执行目录」；`test/integration.test.mjs:484` 验证审计事件和待补条目都记录 `dir` 与绝对路径 `cwd`。第二个入口由 `test/integration.test.mjs:529`「AC-7 命令带 workdir 时按 workdir 判定，审计与待补队列都记子目录」覆盖：`ops_bash({ command, workdir: 'packages/web' })` 被拒后待补条目 `dir === 'packages/web'`，同一命令不带 `workdir` 再拒一次，两次审计分别记录子目录与流程根的相对 `dir` 和绝对 `cwd`。`:553` 验证空命令拒绝也写审计，且不加入待补队列。`test/subagents.test.mjs:413` 验证直达守卫的子代理调用各生成一条审计 |
+| AC-8 S3 / S4 子代理 shell 与主 Agent 同一套 cwd 规则 | 通过 | `test/subagents.test.mjs:382`「AC-8 子代理 shell 与主 Agent 同一套目录规则」；子会话在流程根跑 `node --test … [packages/web]` 被拒、`npm test` 放行、含换行命令拒且理由点名换行。同一条用例的 `:405` 起覆盖 `workdir` 这个入口：子会话 `header.cwd` 在流程根但带 `workdir: 'packages/web'` 时，指向被批准子目录的命令放行、流程根批准的命令被拒；主 Agent 侧同样两向断言 |
+| AC-9 工作台展示带目录后缀条目时补「仅限 packages/web 目录」 | 通过 | `test/client.test.mjs:1746`「AC-9 命令清单里带目录的条目补一句执行目录」；断言含条目原文、`仅限 packages/web 目录内执行`、`方括号后缀是执行目录`、`没有后缀的条目只认流程根目录` |
+| AC-10 补进清单自动带上被拒时所在目录的后缀 | 通过 | `test/integration.test.mjs:512`「AC-10 补进清单时自动带上被拒时的目录后缀」；退回 S1 后 `pendingScope.commands` 深等于 `[command + ' [packages/web]']`，重新批准后冻结清单保留带后缀条目。`:565` 验证无效目录无法补录，同名待补命令按目录独立处理 |
+| 超宽判定不被后缀绕过 | 通过 | `test/acceptance.test.mjs`；`npm * [.]`、`node * [packages/web]`、`* [packages/web]`、`PYTHON * [ a/b ]` 仍为 true，`npm run * [packages/web]` 与 `node test/host.test.mjs [.]` 为 false |
+
+限制：
+
+- `npm run test:host` 在本机跑不完。`test/host.test.mjs:4777` 的 `execFileSync(process.execPath, ['--check', source], options)` 抛 `spawnSync C:\nvm4w\nodejs\node.exe EPERM`（errno -4048），本机沙箱禁止测试进程再起 Node 子进程；该用例在本次改动之前同样失败，与本次改动无关。本轮 360 项输出 `ok`，其中包含 AC-1 至 AC-6 对应断言。
+- 客户端 239 项、集成 41 项、子代理 75 项、验收体检 39 项和门禁 10 项全部通过。`npm run check` 校验 7 个模块的修订和语法。
+- 改完 `lib/*.js` 必须跑 `npm run stamp`：本轮两次遇到 `test/integration.test.mjs:733` 断言 `runtime.status === 'verified'` 实际为 `mismatch`，都是模块 revision 没重算，stamp 后（`Updated module revisions: 2/7.`）通过。
+- 界面部分只做了组件渲染断言（`test/client.test.mjs`），没有在真实宿主里点过带目录后缀的条目；真实门禁交互仍需重载插件后手动确认。
+- `npm test` 的首套 `test/provenance.test.mjs` 在本机有一项失败：第 14 项 `external directory junction is rejected before reading its target` 的清理阶段抛 `ENOTEMPTY: directory not empty, rmdir 'C:\\Users\\lonsdor\\AppData\\Local\\Temp\\dsh-Dn98Xt\\flowgate-provenance-gp0y96\\workspace'`（`test/provenance.test.mjs:32` 的 `fixture` 收尾 `fs.rmSync`）。断言本身在此之前都已通过，失败出在临时目录里那个 Windows junction 的删除上，与本次改动无关——本次没有动 `lib/provenance.js`，也没有动 `test/provenance.test.mjs`（`git status` 里两者都不在改动列表）。因此 `npm test` 的串行链在首套就中断，后八套改为逐条单独跑：`test:host` 受上面的 EPERM 限制，此前逐套运行的其余七套均通过。本轮验收使用上面列出的回归结果。
+
 ## CDP 调试通道与界面验证脚本落地（2026-11-23）
 
 需求：用户提问「这个插件做测试经常遇到实机没办法走，或者 ui 没办法实测，这种有办法解决吗？我应该装什么插件或者做什么设置能解决呢？告诉我方案，不改东西」（m00297），随后授权开 CDP 试跑（m00321），再授权「先把现有的代码提交一下，然后固化和改造」（m00477）。

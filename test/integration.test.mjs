@@ -478,6 +478,113 @@ await check('S2 越界写被拒绝并给出回退指引', async () => {
 })
 
 // P0-2：数据目录由插件自己维护。以前是无条件放行，等于让 Agent 改自己的 scope 与状态快照。
+// AC-7 / AC-10：命令授权必须绑住执行目录。审计流水与待补队列都要留下「在哪个目录跑的」，
+// 用户点「补进清单」时也要把那个目录一起带进去——否则补进去的条目只认流程根，
+// 同一条命令换个目录照样跑不了，用户还得再被拒一次。
+await check('AC-7 审计流水与待补队列都记下执行目录', async () => {
+  const sub = join(CWD, 'packages', 'web')
+  mkdirSync(sub, { recursive: true })
+  const header = host.sessions.get(SESSION).header
+  const original = header.cwd
+  const command = 'pnpm run denied-in-subdir'
+  let denied
+  try {
+    header.cwd = sub
+    denied = await guard('bash', { command })
+  } finally {
+    header.cwd = original
+  }
+  assert.equal(denied.kind, 'deny')
+  const flow = mod.currentService().get(SESSION)
+  const queued = flow.pendingCommands.find((entry) => entry.command === command)
+  assert.ok(queued, '被拒命令必须进待补队列')
+  assert.equal(queued.dir, 'packages/web', '待补队列要记下被拒时的执行目录')
+  assert.equal(queued.cwd, sub)
+  const events = readFileSync(join(CWD, '.dsh-flowgate', 'flows.jsonl'), 'utf8')
+    .trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+  const audit = events.filter((item) => item.type === 'shell.denied' && item.detail?.command === command)
+  assert.ok(audit.length, '判定必须进审计流水')
+  assert.equal(audit.at(-1).detail.dir, 'packages/web', '审计要记下执行目录')
+  assert.equal(audit.at(-1).detail.cwd, sub)
+  assert.equal(audit.at(-1).detail.outcome, 'denied')
+})
+
+await check('AC-10 补进清单时自动带上被拒时的目录后缀', async () => {
+  const command = 'pnpm run denied-in-subdir'
+  const supplemented = await post({ sessionId: SESSION, action: 'reopenScopeForCommands', payload: {} })
+  assert.equal(supplemented.status, 200, JSON.stringify(supplemented.data))
+  const view = await getState()
+  assert.equal(view.stage, 'S1', '补命令要退回需求分析重新批准 scope')
+  assert.deepEqual(view.doc.pendingScope.commands, [command + ' [packages/web]'], '补进去的条目必须带目录后缀')
+  // 重新批准后冻结的 scope 也要是带后缀的那一条：清单与执行目录一起被批准。
+  const reapproved = await post({ sessionId: SESSION, action: 'doc', payload: { decision: 'approve', acceptScopeRisks: true } })
+  assert.equal(reapproved.status, 200, JSON.stringify(reapproved.data))
+  const after = await getState()
+  assert.equal(after.stage, 'S2')
+  assert.deepEqual(after.scope.data.in_scope.commands, [command + ' [packages/web]'])
+})
+
+// AC-7 的第二个入口：`ops_bash({ command, workdir })` 里的 workdir 才是真正决定跑哪个程序的东西。
+// 会话 header.cwd 留在流程根，光看它就等于把目录绑定交回给调用方——本轮要修的问题会从这里原样漏回来。
+await check('AC-7 命令带 workdir 时按 workdir 判定，审计与待补队列都记子目录', async () => {
+  const command = 'pnpm run denied-via-workdir'
+  const denied = await guard('bash', { command, workdir: 'packages/web' })
+  assert.equal(denied.kind, 'deny', '清单条目只批准在流程根执行，workdir 换到子目录必须被拒')
+  const flow = mod.currentService().get(SESSION)
+  const queued = flow.pendingCommands.find((entry) => entry.command === command)
+  assert.ok(queued, '被拒命令必须进待补队列')
+  assert.equal(queued.dir, 'packages/web', '待补队列要记下 workdir 决定的执行目录')
+  assert.equal(queued.cwd, join(CWD, 'packages', 'web'))
+  // 同一条命令不带 workdir 就是流程根：审计里的 dir 要跟着变，不能一律记成流程根。
+  assert.equal((await guard('bash', { command })).kind, 'deny')
+  const events = readFileSync(join(CWD, '.dsh-flowgate', 'flows.jsonl'), 'utf8')
+    .trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+  const audit = events.filter((item) => item.type === 'shell.denied' && item.detail?.command === command)
+  assert.equal(audit.length, 2, '两次判定都要进审计流水')
+  assert.equal(audit.at(-2).detail.dir, 'packages/web', '带 workdir 时审计要记子目录')
+  assert.equal(audit.at(-1).detail.dir, '.', '不带 workdir 时审计要记流程根')
+  assert.equal(audit.at(-2).detail.cwd, join(CWD, 'packages', 'web'))
+  assert.equal(audit.at(-1).detail.cwd, CWD)
+  const declined = await post({ sessionId: SESSION, action: 'declineScopeCommands', payload: {} })
+  assert.equal(declined.status, 200, '清理本例产生的待补命令')
+  assert.deepEqual(flow.pendingCommands, [])
+})
+
+await check('AC-7 空命令拒绝有审计且不进入待补队列', async () => {
+  const flow = mod.currentService().get(SESSION)
+  const count = flow.pendingCommands.length
+  assert.equal((await guard('bash', { command: '   ', workdir: 'packages/web' })).kind, 'deny')
+  assert.equal(flow.pendingCommands.length, count)
+  const event = flow.events.at(-1)
+  assert.equal(event.type, 'shell.denied')
+  assert.equal(event.detail.outcome, 'empty')
+  assert.equal(event.detail.dir, 'packages/web')
+  assert.equal(event.detail.cwd, join(CWD, 'packages', 'web'))
+})
+
+await check('AC-10 目录无法确认时禁止补录，同名命令按目录分别处理', async () => {
+  const command = 'pnpm run docs-check'
+  assert.equal((await guard('bash', { command, workdir: 'packages/missing' })).kind, 'deny')
+  assert.equal((await guard('bash', { command })).kind, 'deny')
+  const view = await getState()
+  const missing = view.pendingCommands.find((entry) => entry.dir === 'packages/missing')
+  const root = view.pendingCommands.find((entry) => entry.dir === '.')
+  assert.match(missing.directoryError, /无法确认执行目录/)
+  assert.equal(missing.canSupplement, false)
+  assert.equal(root.canSupplement, true)
+  assert.notEqual(missing.selectionKey, root.selectionKey)
+  const rejected = await post({ sessionId: SESSION, action: 'reopenScopeForCommands', payload: { commands: [missing.selectionKey] } })
+  assert.equal(rejected.status, 409, JSON.stringify(rejected.data))
+  assert.match(rejected.data.error, /无法确认执行目录/)
+  const after = await getState()
+  assert.equal(after.stage, 'S2')
+  assert.deepEqual(after.scope.data.in_scope.commands, view.scope.data.in_scope.commands)
+  const declined = await post({ sessionId: SESSION, action: 'declineScopeCommands', payload: { commands: [missing.selectionKey] } })
+  assert.equal(declined.status, 200, JSON.stringify(declined.data))
+  assert.deepEqual((await getState()).pendingCommands.map((entry) => entry.selectionKey), [root.selectionKey])
+  assert.equal((await post({ sessionId: SESSION, action: 'declineScopeCommands', payload: {} })).status, 200)
+})
+
 await check('数据目录不接受工具写入（含 S2 内部台账）', async () => {
   const d = await guard('write', { file_path: '.dsh-flowgate/notes.md' })
   assert.equal(d.kind, 'deny')

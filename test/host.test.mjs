@@ -3754,11 +3754,21 @@ for (const [kind, reason, expected] of [
       out_of_scope_explicitly: [],
       acceptance_criteria: [{ id: 'AC-1', when: '清单内命令', then: '不需要授权' }],
     })
-    // 四类无效条目：空、超长、含逃逸、超量。全部在提交时拒绝，不留待批准文档。
+    // 无效条目包括空、超长、含逃逸或换行、后缀含控制字符、超量。
+    // 全部在提交时拒绝，不留待批准文档。
     for (const [commands, marker] of [
       [['   '], /空命令条目/],
       [['x'.repeat(400)], /超过 300 字/],
       [['node -e "process.exit(0)"'], /永远不会被放行/],
+      // 换行是命令分隔符：一条条目里写两条命令，放行的永远只是第一行。
+      [['npm run build\nrm -rf src'], /换行/],
+      // 换行落在目录后缀前面也得拦：后缀正则的 `\s+\[` 会把那个换行当成空白吃掉，
+      // 只按剥完后缀的 command 判，剥出来是单行的 `npm run build`，含换行的原文就安静存进清单了。
+      [['npm run build\n[packages/web]'], /换行/],
+      [['npm run build\r\n'], /换行/],
+      // 后缀里的控制字符会拼出一个永远算不出来的目录名：commandDirKey 得到的是真实路径，
+      // 带制表符的目录名和任何真实 cwd 都比不上——条目看着在清单里，执行侧永远拒。
+      [['npm run build [a\tb]'], /目录后缀无效/],
       [Array.from({ length: 25 }, (_, index) => 'cmd-' + index), /超过上限 20 条/],
     ]) {
       await assert.rejects(cx.tool('flowgate_doc', { html: cmdHtml, scope: cmdScope(commands) }), marker)
@@ -3788,7 +3798,7 @@ for (const [kind, reason, expected] of [
     })
 
     const listExact = await cx.guard('bash', { command: 'npm test' })
-    const listWild = await cx.guard('bash', { command: 'npm run build --silent' })
+    const listWild = await cx.guard('bash', { command: 'npm run build' })
     const listMiss = await cx.guard('bash', { command: 'npm publish' })
     // 清单里写的是裸 node，机器上跑的是带盘符的 node.exe：这是同一条命令。
     // 不按解释器身份归一化，Agent 照抄 package.json 的 scripts 写清单，到 S2 就一条都放行不了。
@@ -3809,6 +3819,15 @@ for (const [kind, reason, expected] of [
       assert.equal(listOther.kind, 'deny', JSON.stringify(listOther))
     })
 
+    mkdirSync(join(cmdCwd, 'packages', 'web'), { recursive: true })
+    const inside = await cx.guard('working_directory', { cd: 'packages/web' })
+    const outside = await cx.guard('working_directory', { cd: tmpdir() })
+    const query = await cx.guard('working_directory', {})
+    check('AC-6 宿主守卫在 S2 按流程根核对换目录请求', () => {
+      assert.equal(inside.kind, 'allow')
+      assert.equal(outside.kind, 'deny')
+      assert.equal(query.kind, 'allow')
+    })
     await cx.guard('bash', { command: 'npm publish ' + 'a'.repeat(300) })
     const audit = readFileSync(join(cmdCwd, '.dsh-flowgate', 'flows.jsonl'), 'utf8')
       .split('\n')
@@ -3836,6 +3855,7 @@ for (const [kind, reason, expected] of [
 {
   const stageCwd = mkdtempSync(join(tmpdir(), 'flowgate-cmd-stage-'))
   try {
+    mkdirSync(join(stageCwd, 'packages', 'web', 'sub'), { recursive: true })
     const flowOf = (stage, commands) => ({
       id: 'f_cmd_stage',
       sessionId: 'sess_cmd_stage',
@@ -3866,6 +3886,100 @@ for (const [kind, reason, expected] of [
       assert.ok(shellDenial(s4, { command: 'npm publish 2>&1' }), '换了命令体照样拒')
       assert.ok(shellDenial(s4, { command: 'npm test | rm -rf src' }), '管道接写命令照样拒')
       assert.ok(shellDenial(s4, { command: 'npm test 2>&1; touch x' }), '分号拼接照样拒')
+    })
+    // AC-1：换行与 `;` 一样是命令分隔符。判定必须在入口就拦下，不能等清单匹配——
+    // 清单匹配看到的只是第一行，放行它等于「审查前半句、执行全部」。
+    check('AC-1 含换行的命令在任何阶段都被拒，理由指认换行', () => {
+      for (const stage of ['S1', 'S2', 'S3', 'S4']) {
+        const denial = shellDenial(flowOf(stage, ['npm test']), { command: 'pwd\nrm -rf src' })
+        assert.ok(denial, stage + ' 不该放过多行命令')
+        assert.match(denial, /多行.*换行/)
+        for (const command of ['\npwd', 'pwd\r\n', '\n']) {
+          assert.match(shellDenial(flowOf(stage, []), { command }), /多行.*换行/)
+        }
+      }
+      // 清单里原样写着这条也不行：入口断言先于清单匹配。
+      const listed = flowOf('S2', ['npm run build\nrm -rf src'])
+      assert.ok(shellDenial(listed, { command: 'npm run build\nrm -rf src' }))
+      // 单独的 \r 同样是分隔符：只加 \n 会留下 CR 这条缝。
+      assert.ok(shellDenial(flowOf('S2', ['npm test']), { command: 'npm test\rrm -rf src' }))
+    })
+    // AC-2：条目带目录后缀时，剥掉后缀剩下的命令仍然按前缀通配匹配。
+    check('AC-2 带目录后缀的条目剥掉后缀后仍按前缀通配', () => {
+      assert.equal(shellDenial(flowOf('S2', ['npm run *']), { command: 'npm run build' }), null)
+      const listed = flowOf('S2', ['npm run * [packages/web]'])
+      const dir = join(stageCwd, 'packages', 'web')
+      assert.equal(shellDenial(listed, { command: 'npm run build' }, dir), null)
+      assert.ok(shellDenial(listed, { command: 'npm run build' }), '流程根不在授权目录内')
+      assert.ok(shellDenial(listed, { command: 'npm publish' }, dir), '前缀不符照样拒')
+    })
+    // AC-4：不带目录后缀的条目只认流程根。子目录里同名的 build 脚本做的是另一件事。
+    check('AC-4 不带目录后缀的条目只在流程根放行', () => {
+      const listed = flowOf('S2', ['npm run build'])
+      assert.equal(shellDenial(listed, { command: 'npm run build' }), null)
+      assert.equal(shellDenial(listed, { command: 'npm run build' }, stageCwd), null)
+      assert.match(shellDenial(listed, { command: 'npm run build' }, join(stageCwd, 'packages', 'web')), /执行目录：packages\/web/)
+    })
+    // AC-5：带 [packages/web] 的条目只在那一个目录精确匹配，父子目录都不算。
+    check('AC-5 带 [packages/web] 的条目只在该目录精确匹配', () => {
+      const listed = flowOf('S2', ['npm run build [packages/web]'])
+      const dir = join(stageCwd, 'packages', 'web')
+      assert.equal(shellDenial(listed, { command: 'npm run build' }, dir), null)
+      assert.ok(shellDenial(listed, { command: 'npm run build' }, join(dir, 'sub')), '子目录要另写一条')
+      assert.ok(shellDenial(listed, { command: 'npm run build' }, join(stageCwd, 'packages')), '父目录不匹配')
+      assert.ok(shellDenial(listed, { command: 'npm run build' }, tmpdir()), '流程根之外')
+    })
+    // AC-4 / AC-7：`ops_bash({ command, workdir })` 里的 workdir 才是真正决定跑哪个程序的东西。
+    // 只看会话 header.cwd 等于把目录绑定交回给调用方：header.cwd 在流程根、命令却带 workdir
+    // 指向子目录时，必须在子目录上判定，否则「授权不绑目录」从 workdir 这个入口原样漏回来。
+    check('AC-4 workdir 参数同样决定执行目录，不能用它绕过目录后缀', () => {
+      const listed = flowOf('S2', ['npm run build'])
+      assert.equal(shellDenial(listed, { command: 'npm run build', workdir: '.' }), null)
+      assert.equal(shellDenial(listed, { command: 'npm run build', workdir: stageCwd }), null)
+      assert.ok(shellDenial(listed, { command: 'npm run build', workdir: join(stageCwd, 'packages', 'web') }), '带 workdir 换到子目录必须按子目录判定')
+      assert.ok(shellDenial(listed, { command: 'npm run build', workdir: 'packages/web' }), '相对 workdir 一样')
+      // 审计流水要能自己说清「到底在哪儿跑的」：只记相对流程根的 dir，事后还得翻流程快照里的
+      // flow.cwd 才能还原，所以 detail 同时记 dir 与绝对路径 cwd——这里两条一起断言。
+      const audited = listed.events.filter((event) => event.type === 'shell.denied' && event.detail?.command === 'npm run build')
+      assert.equal(audited.at(-1).detail.dir, 'packages/web', '审计要记 workdir 决定的执行目录')
+      assert.equal(audited.at(-1).detail.cwd, join(stageCwd, 'packages', 'web'), '审计还要记绝对路径，流水才自足')
+      assert.ok(shellDenial(listed, { command: 'npm run build', workdir: tmpdir() }), '流程根之外更不行')
+      // 反过来：条目声明了子目录，只带 workdir 不带 cwd 也要命中；不带 workdir 就是流程根。
+      const scoped = flowOf('S2', ['npm run build [packages/web]'])
+      assert.equal(shellDenial(scoped, { command: 'npm run build', workdir: join(stageCwd, 'packages', 'web') }), null)
+      assert.ok(shellDenial(scoped, { command: 'npm run build' }), '不带 workdir 就是流程根，不该命中子目录条目')
+    })
+    // AC-6：working_directory 会改掉后面所有命令的执行位置，S2 / S4 必须留在流程根之内。
+    check('AC-6 S2 / S4 的 working_directory 只能在流程根之内换目录', () => {
+      for (const stage of ['S2', 'S4']) {
+        const flow = flowOf(stage, [])
+        assert.equal(scopeDenial(flow, 'working_directory', {}), null, stage + '：不带 cd 只查看当前目录')
+        assert.equal(scopeDenial(flow, 'working_directory', { cd: join(stageCwd, 'packages') }), null, stage + '：绝对子目录')
+        assert.equal(scopeDenial(flow, 'working_directory', { cd: 'packages/web' }), null, stage + '：相对子目录')
+        assert.ok(scopeDenial(flow, 'working_directory', { cd: tmpdir() }), stage + '：根外必须拒')
+        assert.ok(scopeDenial(flow, 'working_directory', { cd: '..' }), stage + '：父目录必须拒')
+        assert.ok(scopeDenial(flow, 'working_directory', { cd: '   ' }), stage + '：空目标必须拒')
+        assert.match(scopeDenial(flow, 'working_directory', { cd: 'packages/missing' }), /无法确认执行目录/)
+      }
+      // S1 / S3 本来就不放行变更性命令：换目录在那里不构成新的授权通道，维持原样。
+      for (const stage of ['S1', 'S3']) {
+        assert.equal(scopeDenial(flowOf(stage, []), 'working_directory', { cd: tmpdir() }), null, stage)
+      }
+    })
+    check('AC-5 / AC-6 按实际目录拒绝不一致的目录别名', () => {
+      const alias = join(stageCwd, 'packages', 'alias')
+      fs.symlinkSync(join(stageCwd, 'packages', 'web'), alias, process.platform === 'win32' ? 'junction' : 'dir')
+      try {
+        for (const stage of ['S2', 'S4']) {
+          const flow = flowOf(stage, ['npm run build [packages/alias]'])
+          assert.match(scopeDenial(flow, 'working_directory', { cd: alias }), /实际位置与请求的路径不一致/)
+          assert.match(shellDenial(flow, { command: 'npm run build', workdir: alias }), /实际位置与请求的路径不一致/)
+          assert.equal(flow.events.at(-1).detail.cwd, fs.realpathSync.native(join(stageCwd, 'packages', 'web')))
+        }
+      } finally {
+        if (process.platform === 'win32') fs.rmdirSync(alias)
+        else fs.unlinkSync(alias)
+      }
     })
     // 只读豁免：插件不认识的工具默认拒，用户声明后放行。写工具与 shell 不接受这种豁免。
     check('未登记工具默认拒，用户声明只读后放行', () => {

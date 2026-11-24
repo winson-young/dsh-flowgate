@@ -1703,7 +1703,8 @@ const HubPanelIcon = componentOf('sidebar.panellist')
       pending: true,
       pendingScope: {
         files_expected_to_change: ['src/auth/session.ts', 'src/auth/store.ts'],
-        commands: ['npm test', 'npm run *'],
+        // 带方括号后缀的条目要和它执行的目录一起展示：只显示命令原文，用户会以为它在流程根跑。
+        commands: ['npm test', 'npm run *', 'npm run build [packages/web]'],
         capabilities: ['会话过期检测'],
         shared_contracts: ['checkExpiry(session, now) 的签名与返回值保持不变'],
         out_of_scope_explicitly: ['OAuth 第三方登录'],
@@ -1739,6 +1740,15 @@ const HubPanelIcon = componentOf('sidebar.panellist')
     assert.ok(text.includes('npm run *'))
     assert.ok(text.includes('没有别的开关'))
     assert.ok(text.includes('退回 S1'))
+  })
+  // AC-9：带目录后缀的条目要把「在哪个目录跑」一起显示。只显示命令原文，
+  // 用户会以为它和别的条目一样在流程根执行——那正是这次要修的歧义。
+  await check('AC-9 命令清单里带目录的条目补一句执行目录', () => {
+    assert.ok(text.includes('npm run build [packages/web]'))
+    assert.ok(text.includes('仅限 packages/web 目录内执行'))
+    // 不带后缀的条目只说流程根，不能被误读成「任意目录都行」。
+    assert.ok(text.includes('方括号后缀是执行目录'))
+    assert.ok(text.includes('没有后缀的条目只认流程根目录'))
   })
 }
 
@@ -2106,6 +2116,28 @@ const HubPanelIcon = componentOf('sidebar.panellist')
     const call = posted.find((item) => item.action === 'reopenScopeForCommands')
     assert.ok(call, '必须提交 reopenScopeForCommands')
     assert.deepEqual(call.payload.commands, ['git checkout -- src/api/middleware.ts'])
+  })
+}
+
+{
+  posted = []
+  currentView = baseView('S2', {
+    pendingCommands: [
+      { command: 'npm run build', dir: '.', stage: 'S2', selectionKey: 'root', canSupplement: true },
+      { command: 'npm run build', dir: 'packages/web', stage: 'S2', selectionKey: 'web', canSupplement: true },
+      { command: 'npm run build', dir: 'packages/missing', stage: 'S2', selectionKey: 'missing',
+        canSupplement: false, directoryError: '无法确认执行目录' },
+    ],
+  })
+  const renderer = await render(FlowDetail, {})
+  await check('待补命令按目录单独勾选，无法补录的目录只显示原因', async () => {
+    const tree = renderer.toJSON()
+    assert.ok(flat(tree).includes('npm run build [packages/web]'))
+    assert.ok(flat(tree).includes('无法补录。无法确认执行目录'))
+    await changeValue(checkboxNodes(tree)[0], false)
+    await click(buttonByText(renderer.toJSON(), '补进清单（1 条）并重新批准'))
+    const call = posted.find((item) => item.action === 'reopenScopeForCommands')
+    assert.deepEqual(call?.payload.commands, ['web'])
   })
 }
 
