@@ -6,11 +6,70 @@ import path from 'node:path'
 import { test } from 'node:test'
 import { captureSnapshot, sameSnapshot, findingCounts } from '../lib/provenance.js'
 
-function fixture(run) {
+function cleanupFixture(entry, { io = fs, report = console.warn } = {}) {
+  function isLink(target, stat) {
+    if (stat.isSymbolicLink()) return true
+    if (process.platform !== 'win32' || !stat.isDirectory()) return false
+
+    // Some Windows junctions are reported as directories by lstat. Compare against the physical parent.
+    const expected = path.join(io.realpathSync.native(path.dirname(target)), path.basename(target))
+    try {
+      return path.relative(expected, io.realpathSync.native(target)) !== ''
+    } catch (error) {
+      // lstat found an entry. Treat an unresolvable target as a dangling link.
+      if (error.code === 'ENOENT') return true
+      throw error
+    }
+  }
+
+  function unlinkLink(target) {
+    try {
+      io.unlinkSync(target)
+    } catch (error) {
+      if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EISDIR', 'ENOENT'].includes(error.code)) throw error
+      // Windows may report a missing target for a dangling junction. Remove only the entry.
+      io.rmdirSync(target)
+    }
+  }
+
+  function remove(target, listed = false) {
+    try {
+      let stat
+      try {
+        stat = io.lstatSync(target)
+      } catch (error) {
+        if (process.platform !== 'win32' || !listed || error.code !== 'ENOENT') throw error
+        // A listed entry can still be present as a dangling Windows junction.
+        unlinkLink(target)
+        return true
+      }
+      if (isLink(target, stat)) {
+        unlinkLink(target)
+      } else if (stat.isDirectory()) {
+        let empty = true
+        for (const child of io.readdirSync(target)) {
+          if (!remove(path.join(target, child), true)) empty = false
+        }
+        if (!empty) return false
+        io.rmdirSync(target)
+      } else {
+        io.unlinkSync(target)
+      }
+      return true
+    } catch (error) {
+      if (error.code === 'ENOENT') return true
+      report(`Fixture cleanup failed for ${target}: ${error.code ?? 'UNKNOWN'}: ${error.message}`)
+      return false
+    }
+  }
+
+  remove(entry)
+}
+
+function fixture(run, cleanupOptions) {
   // Cleanup is confined to this one directory created by this invocation.
   const home = fs.mkdtempSync(path.join(tmpdir(), 'flowgate-provenance-'))
   const cwd = path.join(home, 'workspace')
-  fs.mkdirSync(cwd)
   const put = (name, content) => {
     const target = path.join(cwd, name)
     fs.mkdirSync(path.dirname(target), { recursive: true })
@@ -27,10 +86,62 @@ function fixture(run) {
     } },
     devChanges: { files: [], untracked: [] },
   }
-  put('src/main.js', 'first')
-  try { return run({ home, cwd, put, flow }) }
-  finally { fs.rmSync(home, { recursive: true, force: true }) }
+  try {
+    fs.mkdirSync(cwd)
+    put('src/main.js', 'first')
+    return run({ home, cwd, put, flow })
+  } finally {
+    cleanupFixture(home, cleanupOptions)
+  }
 }
+
+test('fixture cleanup reports a deletion failure without changing the test outcome', () => {
+  const assertionFailure = new assert.AssertionError({ message: 'original assertion failure' })
+  const result = Symbol('fixture result')
+  for (const throwAssertion of [false, true]) {
+    const diagnostics = []
+    let home, blocked, sibling
+    const io = {
+      ...fs,
+      unlinkSync(target) {
+        if (target === blocked) {
+          throw Object.assign(new Error('simulated deletion failure'), { code: 'EIO' })
+        }
+        fs.unlinkSync(target)
+      },
+    }
+    const run = () => fixture((fixtureData) => {
+      home = fixtureData.home
+      blocked = fixtureData.put('blocked.txt', 'blocked')
+      sibling = fixtureData.put('sibling.txt', 'sibling')
+      if (throwAssertion) throw assertionFailure
+      return result
+    }, { io, report: (message) => diagnostics.push(message) })
+    try {
+      if (throwAssertion) assert.throws(run, (error) => error === assertionFailure)
+      else assert.equal(run(), result)
+      assert.deepEqual(diagnostics, [`Fixture cleanup failed for ${blocked}: EIO: simulated deletion failure`])
+      assert.equal(fs.readFileSync(blocked, 'utf8'), 'blocked')
+      assert.equal(fs.existsSync(sibling), false)
+    } finally {
+      if (home) cleanupFixture(home)
+    }
+  }
+})
+
+test('fixture cleanup removes a real directory link and preserves the external target', () => fixture(({ cwd: outside, put }) => {
+  const sentinel = put('nested/sentinel.txt', 'outside fixture')
+  const home = fixture(({ home, cwd }) => {
+    const link = path.join(cwd, 'external')
+    fs.symlinkSync(outside, link, process.platform === 'win32' ? 'junction' : 'dir')
+    assert.equal(fs.realpathSync.native(link), fs.realpathSync.native(outside))
+    assert.equal(fs.readFileSync(path.join(link, 'nested', 'sentinel.txt'), 'utf8'), 'outside fixture')
+    return home
+  })
+  assert.throws(() => fs.lstatSync(home), { code: 'ENOENT' })
+  assert.equal(fs.readFileSync(sentinel, 'utf8'), 'outside fixture')
+  assert.deepEqual(fs.readdirSync(path.dirname(sentinel)), ['sentinel.txt'])
+}))
 
 const rules = { pluginVersion: '0.1.0', config: { cap: 30, strict: true } }
 const hash = (value) => createHash('sha256').update(value).digest('hex')

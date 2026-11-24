@@ -1405,14 +1405,15 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
 // ---------------------------------------------------------------------------
 {
   // 受限沙箱会禁止 spawn git（EPERM）：这时构造不出真实仓库，跳过这段而不是中断整套测试。
-  let gitUsable = true
+  let skipReason
   try {
-    execFileSync('git', ['--version'], { windowsHide: true })
-  } catch {
-    gitUsable = false
+    execFileSync('git', ['--version'], { windowsHide: true, timeout: 5000 })
+  } catch (error) {
+    if (!['ENOENT', 'EACCES', 'EPERM'].includes(error.code)) throw error
+    skipReason = '宿主无 shell 时的 Git 子进程用例未执行：Git 不可用（' + error.code + '）'
   }
-  if (!gitUsable) {
-    console.log('  skip 没有 shell 服务时改用 child_process 采集变更摘要（当前环境禁止 spawn git）')
+  if (skipReason) {
+    console.log('FLOWGATE_TEST_SKIP ' + JSON.stringify({ reason: skipReason }))
   } else {
   const repo = mkdtempSync(join(tmpdir(), 'flowgate-repo-'))
   const git = (args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8', windowsHide: true })
@@ -1442,10 +1443,17 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
   await docNoShell
 
   const gateNoShell = noShellCtx.tool('flowgate_gate', { summary: '改完了 a.txt' })
-  // 门禁工具在 S2 会先跑 collectChanges（两次 git 进程），5ms 的 tick 不够，
-  // 门禁 waiter 还没注册就点按钮会被丢掉，execute 就一直挂着。
-  await new Promise((resolve) => setTimeout(resolve, 800))
+  // 等真实 Git 采集完成、门禁注册后再模拟点击。
+  const deadline = performance.now() + 15_000
+  for (;;) {
+    const state = await noShellCtx.request('/api/flowgate/state?sessionId=sess-noshell')
+    assert.equal(state.status, 200, JSON.stringify(state.body))
+    if (state.body.waitingKind === 'gate') break
+    assert.ok(performance.now() < deadline, '15 秒内未观察到开发门禁就绪')
+    await tick()
+  }
   const gateReply = await noShellCtx.request('/api/flowgate/action', { sessionId: 'sess-noshell', action: 'gate', payload: { decision: 'pass' } })
+  assert.equal(gateReply.status, 200, JSON.stringify(gateReply.body))
   const gateResult = await gateNoShell
   check('没有 shell 服务时改用 child_process 采集变更摘要', () => {
     assert.equal(gateReply.status, 200, JSON.stringify(gateReply.body))

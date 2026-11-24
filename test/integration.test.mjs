@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, readFileSync, existsSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, existsSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { clientFactoryRevision } from '../lib/runtime.js'
 import { join } from 'node:path'
 
 // 假宿主：只实现 flowgate 用到的 ctx 能力（inject/effect/on/get/tools/connection/workingDirectory），
 // 让真实的 apply() 跑起来，从而验证注册、守卫、路由与门禁全链路。
-const CWD = join(process.cwd(), '.tmp-it')
-rmSync(CWD, { recursive: true, force: true })
-mkdirSync(CWD, { recursive: true })
+const CWD = mkdtempSync(join(tmpdir(), 'flowgate-integration-'))
+process.once('exit', () => rmSync(CWD, { recursive: true, force: true }))
+console.log('FLOWGATE_INTEGRATION_FIXTURE ' + CWD)
 mkdirSync(join(CWD, 'src', 'auth'), { recursive: true })
 writeFileSync(join(CWD, 'src', 'auth', 'session.ts'), 'fixture source\n')
 const PREVIOUS_HUB_HOME = process.env.DSH_FLOWGATE_HOME
@@ -964,5 +965,4 @@ await check('Hub 成员摘要与分页计数一致，分页包含完成及活跃
 
 if (PREVIOUS_HUB_HOME === undefined) delete process.env.DSH_FLOWGATE_HOME
 else process.env.DSH_FLOWGATE_HOME = PREVIOUS_HUB_HOME
-rmSync(CWD, { recursive: true, force: true })
 console.log('\n全部通过：' + passed + ' 项')

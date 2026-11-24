@@ -4,14 +4,33 @@
  *           packages/client/modules/src/client/system.ts（__ModuleLoader__ 注册契约）
  */
 import assert from 'node:assert/strict'
-import { readFileSync, existsSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir, homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = resolve(HERE, '..')
-const PROFILE = process.env.FLOWGATE_PROFILE_DIR
-  ?? join(process.env.USERPROFILE ?? process.env.HOME ?? '', '.dsh', 'profiles', 'desktop')
+
+function fixtureProfile() {
+  const profile = mkdtempSync(join(tmpdir(), 'flowgate-install-'))
+  process.once('exit', () => rmSync(profile, { recursive: true, force: true }))
+  const installed = join(profile, 'node_modules', 'dsh-flowgate')
+  mkdirSync(installed, { recursive: true })
+  for (const entry of ['package.json', 'lib', 'cordis.patch.yml']) {
+    cpSync(join(ROOT, entry), join(installed, entry), { recursive: true })
+  }
+  writeFileSync(join(profile, 'package.json'), JSON.stringify({
+    dsh: { profile: { bundles: ['dsh-flowgate'] } },
+    dependencies: { 'dsh-flowgate': 'link:' + ROOT },
+  }))
+  return profile
+}
+
+const PROFILE = process.argv.includes('--fixture')
+  ? fixtureProfile()
+  : process.env.FLOWGATE_PROFILE_DIR
+    ?? join(process.env.USERPROFILE ?? process.env.HOME ?? homedir(), '.dsh', 'profiles', 'desktop')
 
 let passed = 0
 const failures = []

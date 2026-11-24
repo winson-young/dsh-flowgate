@@ -1,6 +1,6 @@
 {
   "name": "dsh-flowgate",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "四阶段流程约束开发工作台：需求分析 → 开发 → 评审 → 测试，以代码级门禁控制阶段流转",
   "type": "module",
   "main": "lib/index.js",
@@ -32,10 +32,15 @@
     "dsh": ">=0.2.2-rc.3 <0.3.0-0"
   },
   "scripts": {
-    "test": "node test/provenance.test.mjs && node test/acceptance.test.mjs && node test/runtime.test.mjs && node test/host.test.mjs && node test/gatemode.test.mjs && node test/subagents.test.mjs && node test/integration.test.mjs && node test/client.test.mjs && node test/install.test.mjs",
+    "test": "node scripts/run-tests.mjs",
+    "test:provenance": "node --test --test-reporter=tap test/provenance.test.mjs",
+    "test:acceptance": "node --test --test-reporter=tap test/acceptance.test.mjs",
+    "test:runtime": "node test/runtime.test.mjs",
+    "test:install:fixture": "node test/install.test.mjs --fixture",
+    "test:layout": "node docs/verify-layout.mjs --self-test",
     "test:host": "node test/host.test.mjs",
     "test:gatemode": "node test/gatemode.test.mjs",
-    "test:subagents": "node test/subagents.test.mjs",
+    "test:subagents": "node --test --test-reporter=tap test/subagents.test.mjs",
     "test:client": "node test/client.test.mjs",
     "test:integration": "node test/integration.test.mjs",
     "test:install": "node test/install.test.mjs",

@@ -473,16 +473,24 @@ README 的界面图使用真实插件组件与示例数据；[预览页](ui-prev
 ```bash
 pnpm install --frozen-lockfile
 npm run check             # 宿主与客户端语法检查
-npm test                  # 以下各套测试顺序执行
+npm test                  # 顺序执行十套测试，最后打印逐套状态
+npm run test:provenance    # 取证范围、链接处理与夹具清理
+npm run test:acceptance    # 验收标准与证据判定
+npm run test:runtime       # 运行时验证
 npm run test:host          # 状态机、scope 守卫、规则与门禁流转
 npm run test:gatemode      # 门禁模式：自动通过、随时切换、阻塞原因
 npm run test:subagents     # 新版 activation、最终守卫、取消与降级的测试替身
 npm run test:integration   # 假宿主运行真实 apply()，检查工具、路由与挂起唤醒
 npm run test:client        # React 渲染与按钮行为、布局契约、主题变量
-npm run test:install       # profile 清单、依赖来源、安装副本与 bundle 契约
+npm run test:install:fixture # 使用临时 profile 检查安装契约
+npm run test:layout        # 运行 25 项布局脚本自检
+npm run test:install       # 检查真实 profile 的安装就绪度
+node test/test-runner.test.mjs # 回归测试聚合、隔离与单套入口
 ```
 
-以上测试都不需启动 DSH；子代理测试使用测试替身，不能证明真实宿主执行成功。`test:install` 依赖本地安装环境，默认检查 `~/.dsh/profiles/desktop`。检查其他 profile 时，先设置环境变量 `FLOWGATE_PROFILE_DIR` 为其绝对路径，再运行该命令。自动化通过后仍需在真实 DSH 中确认入口、门禁按钮、回退和窄屏布局。
+`npm test` 会在单套失败后继续执行，并汇总 `PASS`、`FAIL`、`SKIP` 和 `NOT_RUN`。子进程无法启动或在退出 0 时缺少完成记录会报 `NOT_RUN`。任何 `FAIL` 或 `NOT_RUN` 都使总退出码为 1。只有通过或显式跳过时返回 0，跳过会附上原因，例如宿主测试找不到 Git。
+
+默认安装套件使用临时 profile。真实安装检查 `test:install` 默认读取 `~/.dsh/profiles/desktop`，可通过 `FLOWGATE_PROFILE_DIR` 指定绝对路径。布局自检无需打开 DSH，真实页面的布局取证请按上面的 CDP 步骤执行。子代理测试使用测试替身，入口、门禁按钮和回退可在真实 DSH 中进一步确认。
 
 ## 排障
 
