@@ -8,7 +8,7 @@ const { scripts } = JSON.parse(readFileSync(new URL('../package.json', import.me
 const tap = /^# tests ([1-9]\d*)\s*$/m
 const completed = /^全部通过：([1-9]\d*) 项\s*$/m
 
-export const suites = [
+const testSuites = [
   ['provenance', 'test:provenance', tap],
   ['acceptance', 'test:acceptance', tap],
   ['runtime', 'test:runtime', /^Runtime: [1-9]\d* checks passed\s*$/m],
@@ -21,9 +21,19 @@ export const suites = [
   ['layout', 'test:layout', /"checks": 25\s*}/m],
 ].map(([name, script, completion]) => ({ name, script, command: scripts[script], completion }))
 
+export const suites = [
+  {
+    name: 'revisions',
+    script: 'scripts/stamp-revisions.mjs',
+    command: 'node scripts/stamp-revisions.mjs --check',
+    completion: /^Module revisions verified \([1-9]\d* modules\)\.$/m,
+  },
+  ...testSuites,
+]
+
 function resultFor(suite, options) {
   const { command, completion } = suite
-  // npm aliases are simple Node invocations. Run them without a shell or npm.cmd.
+  // Suite commands are simple Node invocations. Run them without a shell or npm.cmd.
   if (!/^node(?: [\w./:=\-]+)+$/.test(command ?? '')) {
     return { status: 'NOT_RUN', reason: `缺少有效的 ${suite.script} Node 入口` }
   }

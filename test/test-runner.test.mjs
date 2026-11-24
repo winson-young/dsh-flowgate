@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict'
 import { execFile, spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
+import { HOST_MODULES } from '../lib/runtime.js'
 import { runSuites, suites } from '../scripts/run-tests.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
@@ -35,6 +36,77 @@ function temp(t) {
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   return dir
 }
+
+test('默认测试汇总过期指纹，继续运行其余十套且不改写模块', (t) => {
+  const cwd = join(temp(t), 'test project')
+  for (const dir of ['lib', 'scripts']) mkdirSync(join(cwd, dir), { recursive: true })
+  for (const file of ['scripts/run-tests.mjs', 'scripts/stamp-revisions.mjs', ...HOST_MODULES.map((name) => 'lib/' + name)]) {
+    copyFileSync(join(root, file), join(cwd, file))
+  }
+  const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+  const fixtureSuites = [
+    ['provenance', 'test:provenance', '# tests 1'],
+    ['acceptance', 'test:acceptance', '# tests 1'],
+    ['runtime', 'test:runtime', 'Runtime: 1 checks passed'],
+    ['host', 'test:host', '通过：1 项'],
+    ['gatemode', 'test:gatemode', '全部通过：1 项'],
+    ['subagents', 'test:subagents', '# tests 1'],
+    ['integration', 'test:integration', '全部通过：1 项'],
+    ['client', 'test:client', '全部通过：1 项'],
+    ['install', 'test:install:fixture', '全部通过：1 项'],
+    ['layout', 'test:layout', '{"checks": 25}'],
+  ]
+  for (const [name, alias, completion] of fixtureSuites) {
+    manifest.scripts[alias] = 'node ' + name + '.mjs'
+    writeFileSync(join(cwd, name + '.mjs'), 'console.log(' + JSON.stringify(completion) + ')')
+  }
+  writeFileSync(join(cwd, 'package.json'), JSON.stringify(manifest))
+
+  const runFixture = (command) => {
+    const [node, ...args] = command.split(' ')
+    assert.equal(node, 'node')
+    const path = join(cwd, 'runner.log')
+    const fd = openSync(path, 'w')
+    let result
+    try {
+      result = spawnSync(process.execPath, args, { ...options, cwd, stdio: ['ignore', fd, fd] })
+    } finally {
+      closeSync(fd)
+    }
+    assert.ifError(result.error)
+    return { status: result.status, output: readFileSync(path, 'utf8') }
+  }
+  const stamp = () => {
+    const result = runFixture(manifest.scripts.stamp)
+    assert.equal(result.status, 0, result.output)
+  }
+  const assertSummary = (fingerprintLine, output) => {
+    const expected = ['=== 测试汇总 ===', fingerprintLine, ...fixtureSuites.map(([name]) => name + '=PASS')]
+    assert.deepEqual(output.trimEnd().split(/\r?\n/).slice(-expected.length), expected)
+  }
+  const verifyClean = () => {
+    const result = runFixture(manifest.scripts.test)
+    assert.equal(result.status, 0, result.output)
+    assert.match(result.output, /^Module revisions verified \([1-9]\d* modules\)\.$/m)
+    assertSummary('revisions=PASS', result.output)
+  }
+
+  stamp()
+  verifyClean()
+  const target = join(cwd, 'lib', 'acceptance.js')
+  const stale = Buffer.concat([readFileSync(target), Buffer.from('\n// unstamped fixture edit\n')])
+  writeFileSync(target, stale)
+  const result = runFixture(manifest.scripts.test)
+  assert.equal(result.status, 1, result.output)
+  const events = result.output.trim().split(/\r?\n/).filter(Boolean)
+  assert.deepEqual(events.slice(0, 2), ['=== revisions ===', 'Stale module revisions: acceptance.js'])
+  assert.deepEqual(events.slice(2, 2 + fixtureSuites.length * 2),
+    fixtureSuites.flatMap(([name, , completion]) => ['=== ' + name + ' ===', completion]))
+  assertSummary('revisions=FAIL (退出码 1)', result.output)
+  assert.deepEqual(readFileSync(target), stale)
+  stamp()
+  verifyClean()
+})
 
 test('失败后继续，汇总四种状态并返回真实退出码', (t) => {
   const cwd = temp(t)
