@@ -2332,7 +2332,7 @@ const HubPanelIcon = componentOf('sidebar.panellist')
   // 归属口径：挂不上验收标准、或落在 scope 文件之外的发现只作提示，不进重做清单。
   await check('S3 标出发现的验收标准归属与仅提示条数', () => {
     assert.ok(text.includes('2 条仅提示'))
-    assert.ok(text.includes('只有挂得上冻结 scope 验收标准'))
+    assert.ok(text.includes('只有已核实、严重度为 CRITICAL/MAJOR、挂得上冻结 scope 验收标准'))
     assert.ok(text.includes('AC-9'))
     assert.ok(text.includes('未归属验收标准'))
     assert.ok(text.includes('scope 外文件'))
@@ -2358,6 +2358,45 @@ const HubPanelIcon = componentOf('sidebar.panellist')
     assert.ok(!flat(renderer.toJSON()).includes('升档到大需求严格执行'))
   })
 }
+
+await check('S3 证据字符串、未核实原因、结论冲突与丢弃项均可见', async () => {
+  currentView = baseView('S3', { review: { blocking: 0, advisories: 2,
+    counts: { total: 2, critical: 0, major: 1, minor: 1, blocking: 0, advisories: 2, unscoped: 0, unverified: 1, unverifiedSevere: 1 },
+    angles: [{ id: 'correctness', name: '正确性', verdict: 'advisory',
+      verdictConflict: { declared: 'blocking', derived: 'advisory' },
+      findings: [{ file: 'src/app.js', line: 1, kind: 'defect', severity: 'MAJOR', summary: '异常分支', evidence: 'value',
+        repro: { when: '传入空值', expected: '拒绝', actual: '通过' }, unverified: true,
+        unverifiedReason: 'evidence 标识符 value 不在 src/app.js 中' },
+        { file: 'src/app.js', kind: 'design', severity: 'MINOR', summary: '界面约定冲突', evidence: 'render',
+          basis: { quote: 'function render() {', conflict: 'AC-2 的设计约定' } }],
+      rejectedFindings: [{ index: 0, severity: 'MAJOR', missing: ['repro.when'] }, { index: 2, severity: 'MAJOR', missing: ['counter.attempt'] }] }] } })
+  const tree = (await render(FlowDetail, {})).toJSON()
+  const text = flat(tree)
+  for (const label of ['未核实', '未核实原因：', '位置证据：value', '复现：', '期望 拒绝', '实际 通过',
+    '声称 有阻塞项', '未核实 1（其中 CRITICAL/MAJOR 1）', '第 1 条', '第 3 条', 'counter.attempt', '设计依据：', '已核实、严重度为 CRITICAL/MAJOR']) {
+    assert.ok(text.includes(label), label)
+  }
+  assert.ok(findTags(tree, 'details').some((node) => node.props.className.includes('fg-finding-basis')))
+})
+
+await check('快捷评审报告单列因缺少证据被丢弃的条目', async () => {
+  currentView = baseView('S3', { waiting: true, waitingKind: 'gate', review: { blocking: 0, advisories: 0,
+    angles: [{ id: 'correctness', name: '正确性', verdict: 'advisory', findings: [],
+      rejectedFindings: [{ index: 0, severity: 'MAJOR', missing: ['counter.attempt'] }] }] } })
+  const renderer = await render(stageHint, {})
+  await click(buttonByText(renderer.toJSON(), '评审报告'))
+  const text = flat(quickDialog(renderer))
+  for (const value of ['因缺少证据被丢弃 · 1', '正确性 · 第 1 条', 'counter.attempt', '仍会拦住普通通过']) assert.ok(text.includes(value), value + ' 未出现：' + text)
+  await click(buttonByText(quickDialog(renderer), '关闭'))
+  assert.equal(quickDialog(renderer), null)
+})
+
+await check('S3 老快照缺证据计数也不渲染 undefined', async () => {
+  currentView = baseView('S3', { review: { blocking: 0, counts: { total: 0, critical: 0, major: 0, minor: 0, blocking: 0, advisories: 0 },
+    angles: [{ id: 'correctness', name: '正确性', verdict: 'pass', findings: [] }] } })
+  const text = flat((await render(FlowDetail, {})).toJSON())
+  assert.ok(!text.includes('undefined'))
+})
 
 await check('快捷操作在阻塞评审时可直接带风险进入测试', async () => {
   posted = []

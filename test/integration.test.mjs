@@ -17,6 +17,14 @@ process.env.DSH_FLOWGATE_HOME = join(CWD, 'hub-home')
 const SESSION = 'sess-main'
 const SHELL_OUT = ' M src/auth/session.ts\n---numstat---\n3\t1\tsrc/auth/session.ts\n'
 
+// 与真实夹具源码对应，避免证据契约把旧用例的阻塞发现逐条丢弃。
+const reviewFinding = (severity, summary) => ({
+  file: 'src/auth/session.ts', line: 1, severity, ac: 'AC-1', kind: 'defect',
+  evidence: 'fixture', summary,
+  repro: { when: '调用 session 的刷新分支', expected: '处理并发刷新', actual: '缺少并发处理' },
+  ...(severity === 'MINOR' ? {} : { counter: { attempt: '检查是否已有处理并发刷新的路径', survived: true } }),
+})
+
 function makeHost() {
   const tools = new Map()
   const routes = new Map()
@@ -58,7 +66,7 @@ function makeHost() {
               ...(checkedFiles.length ? { checkedFiles, readEvidence: [
                 { file: checkedFiles[0], firstLine: readContent, lastLine: readContent },
               ] } : {}),
-              findings: [{ file: 'src/auth/session.ts', line: 42, severity: 'MINOR', summary: '缺少失败路径的注释' }],
+              findings: [reviewFinding('MINOR', '缺少失败路径的注释')],
             }),
           }],
         }),
@@ -614,7 +622,7 @@ await check('评审阻塞时仅允许当前报告的显式风险接受进入 S4'
       id: 'correctness',
       name: '正确性',
       verdict: 'blocking',
-      findings: [{ file: 'src/auth/session.ts', line: 42, severity: 'MAJOR', ac: 'AC-1', summary: '未处理并发刷新' }],
+      findings: [reviewFinding('MAJOR', '未处理并发刷新')],
     }],
   }), 'flowgate_review')
   await tick()
@@ -644,7 +652,7 @@ await check('评审阻塞时仅允许当前报告的显式风险接受进入 S4'
   writeFileSync(source, original)
   const replaced = within(call('flowgate_review', {
     angles: [{ id: 'correctness', name: '正确性', verdict: 'blocking',
-      findings: [{ file: 'src/auth/session.ts', line: 42, severity: 'MAJOR', ac: 'AC-1', summary: '重新核对并发刷新' }] }],
+      findings: [reviewFinding('MAJOR', '重新核对并发刷新')] }],
   }), 'flowgate_review replacement')
   await tick()
   const fresh = await getState()

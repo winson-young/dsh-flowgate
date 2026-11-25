@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **评审发现必须带证据，「核实过」与「没核实」在重做清单里分开**：起因是评审报告里的发现只有一句结论、没有任何可核对的东西，于是「核实过」和「没核实」在重做清单里长得一模一样——评审就退化成有概率编造的第二个意见，而「评审通过了」还会被当成事实。发现现在必须写 `kind`（`defect` / `design`）和 `evidence`（该文件源码里真实出现的标识符，不是自由描述）；缺陷另需正整数 `line` 与 `repro.when/expected/actual`（期望与实际必须不同），设计问题另需 `basis.quote`（源码里逐字存在的一行）与 `basis.conflict`；`CRITICAL` / `MAJOR` 另需 `counter.attempt` 与 `counter.survived: true`，写明尝试反驳后仍成立。
+  `reviewTool` 的 schema 用 `allOf` + `if/then` 表达条件必填，但容许单条发现先不完整地进入执行阶段——否则一份混着合格与不合格发现的报告会被宿主整体拒绝，合格条目跟着一起丢掉。完整性由 `checkFinding` 逐条执行，`flowgate_review` 与子代理 `flowgate_review_run` 共用这一个校验器；缺字段的条目单独存进 `angle.rejectedFindings`（只记索引、严重度与缺项，不回显原文），同角度的合格条目照常保留。
+  文件读不到、标识符不在源码里、行号越界或引文对不上时，发现保留原严重度但标 `unverified`，并给出 `unverifiedReason`。未核实项计入 `counts.unverified` / `counts.unverifiedSevere`，不算阻断项、不进重做清单、只作提示。角度内所有发现都未核实、或有 `CRITICAL` / `MAJOR` 因缺字段被丢弃时，门禁拒绝普通通过；`skip` 全未核实角度会记录 `flow.review.skippedUnverified`。
+  子代理自己写的 `verdict` 不再被覆盖：`angle.verdict` 存按已核实发现推导的值，声明值与推导值不一致时用 `angle.verdictConflict` 并列保存两者、界面同时显示，复用角度不重复报告旧冲突。
+  界面：发现条目下可折叠查看依据（kind、证据位置、复现三件套或设计依据、反驳记录），未核实与冲突各有徽标，门禁的评审快捷报告新增「因缺少证据被丢弃」一节。`counts` 新增两个键后老快照会缺键，渲染改为逐键兜底合并，避免汇总行拼出「未归属 undefined」。
+  测试：`test/provenance.test.mjs` 覆盖未核实与阻断分离计数，`test/subagents.test.mjs` 覆盖手工与子代理两条路径给出相同缺项清单，`test/gatemode.test.mjs` 覆盖全未核实 / 部分未核实 / 严重项被丢弃的门禁行为，`test/host.test.mjs` 覆盖非字符串嵌套字段不写入快照。同步升到 0.1.5。
+
 - **插件代码与运行插件隔离：改用 `file:` 装打包好的 tgz，发布交给 `scripts/publish.mjs`**：起因是排查一次耗时 4 小时的流程——用户报的原话是「用有 bug 的守卫去修这个守卫，这个确实是个问题，那有没有办法代码和插件隔离开呢？等我需要安装的时候才安装过来」。desktop profile 原本用 `link:D:/Projects/dsh-flowgate`，开发目录就是运行目录，保存即生效；而那次流程本身就在改命令判定与 scope 规则，于是改动一边落地一边生效，改错时正常调用也被自己的半成品规则拦下（`node --version && npm --version`、`npm run test:subagents 2>&1 | grep ...`、`git -c core.whitespace=cr-at-eol diff --check HEAD` 三次被拒，理由都是「重定向 / 管道 / 解释器内联」）。
   新增 `scripts/publish.mjs`：跑 `npm test`、`npm pack --pack-destination` 直接生成到发布目录（默认 `D:/Plugins/flowgate-pkg`）、把 profile 的 `dependencies["dsh-flowgate"]` 改成 `file:<tgz 绝对路径>`，并列出发布目录里最近的几个包作为回退选项。它**不执行 `pnpm install`、不重启 DSH**——安装时机留给用户，避免「测完就自动换掉运行版本」。支持 `--skip-test`、`--no-profile`，目录可用 `FLOWGATE_PKG_DIR` / `FLOWGATE_PROFILE_DIR` 覆盖。
   `test/install.test.mjs` 放宽为同时接受 `link:` 与 `file:`：原「profile 的 dependencies 用 link: 指向本仓库」断言（`spec.startsWith('link:')` 加 `realpathSync` 相等）与「node_modules 里已链到本仓库」（`realpathSync(linkedDir) === realpathSync(ROOT)`）把「不隔离」写成了硬约束，换安装方式必然失败。现在改为核对「依赖 spec 以 `link:` 或 `file:` 开头且指向的路径存在」与「安装目录里 package.json 存在」。同时把该测试的检查对象统一到**安装副本**（`installedDir`）：原先 `lib/index.js` 与 `cordis.patch.yml` 读的是 `ROOT`，与其余读安装副本的断言混在一起，两份内容分家后会产生「项目是新的、装的是旧的」这类看起来像代码缺陷的报错，而它其实只是还没发布。工作副本与安装副本版本不一致时只打印一句提示，不参与判定——否则 S4 的 `npm test` 会因为发布节奏失败，正好再造一个死循环。

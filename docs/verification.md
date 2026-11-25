@@ -20,7 +20,7 @@
 - **过期归页面层，且排在所有记录形态之前**：`runtimeOf` 先判宿主层再判页面层，过期只在页面层落成 `absent`，不再让 `unverified` 变成三来源混合态。`clientState()` 内部的 TTL 判定也提到了 `rejected` 与 `reported` 两支之前——排在后面时，页面关掉后旧记录会把 `clientStatus` 永久钉在 `unverified`，Agent 会去查一个没在跑的页面。过期时原记录的原因降为结构化字段 `rejectedReason` / `reportedWithoutRevision` 保留，由 `describeRuntime` 的 `expiredNote()` 补在文案末尾。`clientState` 返回的 `expired` 也是结构化标记，`describeRuntime` 不再用 `reason.includes('过期')` 做字符串匹配；`reason` 里也不再拼「；另：上报被拒（…）」，一半结构化一半拼串同样算断。
 - **TTL 只在一处判定**：`clientState()` 判过期，`runtimeOf()` 不再用 `Date.now() - page.reportedAt <= CLIENT_REPORT_TTL` 判第二遍。两处各比一次时阈值一旦漂移，页面层与合并层会对「过期」给出不同结论，而 G38 的价值就在这两层可互相核对。合并层因此只看 `client.status`；`verified` 却缺 pageId / 视口时按「页面实例不全」念，不借用「已核对」的文案。
 - **版本字段只有一处产出**：新增 `runtimeFields(version, host, client)`，`status` 的两个分支、`summary` 首行、`view()` 的 `runtime` 全部从它取；`STATUS_RUNTIME_KEYS` 定名单、`pickRuntime` 按名单挑字段。`describeRuntime` 只认对外名 `moduleRevision` / `diskModuleRevision`，删掉 `diskModuleRevision ?? diskHostRevision` 兜底；`hostRevision` / `diskHostRevision` 降为内部别名，仅供 scope 外的布局证据链路。加第八个版本字段仍要动三处：`runtimeFields` 的返回值、`STATUS_RUNTIME_KEYS`、以及 `output.schema` 的 `properties` 与 `required`（`properties` 手写，漏了就被 `additionalProperties: false` 拒掉）；`test/host.test.mjs` 另有独立断言证明十二个内部字段既不进 `properties` 也不进返回值，`pickRuntime` 的剔除名单不是自证。
-- **status 增七个字段**：`version`（`package.json` 的 `version`，本次提到 0.1.4）、`moduleRevision`、`diskModuleRevision`、`runtimeStatus`、`clientRevision`、`clientStatus`、`staleModules`。全部写进 `required`，`additionalProperties` 仍为 false；无流程分支也一并带齐（`clientStatus` 为 `absent`，`runtimeStatus` 取宿主层实测）。
+- **status 增七个字段**：`version`（`package.json` 的 `version`，本次提到 0.1.5）、`moduleRevision`、`diskModuleRevision`、`runtimeStatus`、`clientRevision`、`clientStatus`、`staleModules`。全部写进 `required`，`additionalProperties` 仍为 false；无流程分支也一并带齐（`clientStatus` 为 `absent`，`runtimeStatus` 取宿主层实测）。
 - **summary 首行就是版本**：`describeRuntime` 的结果插在 `lines[0]`，位于流程标题之前。宿主 `mismatch` 时第二行逐个念出未重新盖章的模块名，并明写「加载的是旧模块，验证结论不可用」；宿主 `unverified` 时明写「无法核对」。
 
 改动范围：`lib/runtime.js`、`lib/index.js`、`package.json`、`test/runtime.test.mjs`、`test/host.test.mjs`、`test/integration.test.mjs`、`docs/verification.md`、`docs/development.md`。
@@ -34,7 +34,7 @@
 | AC-5 过期归 `absent` 且只判一次 | 通过 | `test/runtime.test.mjs`「上报过期归 absent 且文案写明过期，宿主层判定不受影响」：合法上报在 `1000 + CLIENT_REPORT_TTL` 仍 `verified`、`+1` 变 `absent` 且 `reason` 含「过期」，`hostState` 仍 `verified`；`rejected` / `reported` 两条旧记录同样过期归 `absent`。TTL 只在 `clientState()` 里比一次，`runtimeOf()` 不再比第二遍（`lib/index.js` 已不引用 `CLIENT_REPORT_TTL`） |
 | AC-6 summary 首行是运行版本 | 通过 | `test/host.test.mjs`「G38 有流程时 status 首行是运行版本」断言 `summary.split('\n')[0]` 以 `运行版本：` 开头、含 `host xxxxxxxx（与磁盘一致）`；mismatch 与 unverified 两支文案由 `test/runtime.test.mjs` 的文案夹具覆盖，含逐个念出未盖章模块名 |
 | AC-7 文案函数可用纯对象断言 | 通过 | `describeRuntime` 只做字符串拼接，`test/runtime.test.mjs` 不启动页面、不加载真实模块，直接传普通对象断言首行 |
-| AC-8 version 等于 package.json 且已提升到 0.1.4 | 通过 | `test/runtime.test.mjs`「插件版本号来自 package.json」读盘比对；`test/host.test.mjs` 两个分支都断言 `version` 匹配 `^\d+\.\d+\.\d+$` |
+| AC-8 version 等于 package.json 且已提升到 0.1.5 | 通过 | `test/runtime.test.mjs`「插件版本号来自 package.json」读盘比对；`test/host.test.mjs` 两个分支都断言 `version` 匹配 `^\d+\.\d+\.\d+$` |
 | AC-9 全量测试与盖章校验 | 见限制 | 盖章校验 `--check` 报七个模块通过；全量测试的实测结果与本机两处既有失败见下方限制 |
 
 ## 命令判定绑定换行与执行目录（2026-11-24）

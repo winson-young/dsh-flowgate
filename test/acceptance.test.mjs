@@ -589,6 +589,20 @@ test('Windows 路径按大小写和分隔符规范匹配，不接受目录相似
   assert.equal(result.advisories.length, 1)
 })
 
+test('未核实的 MAJOR 保留原严重度但只能进入重做建议', () => {
+  const flow = flowOf()
+  flow.review = { angles: [{ findings: [
+    { ac: 'AC-1', file: 'src/ui.js', severity: 'MAJOR', summary: '真实阻塞项' },
+    { ac: 'AC-1', file: 'src/ui.js', severity: 'MAJOR', summary: '位置与描述对不上', unverified: true },
+  ] }] }
+  const result = remediationList(flow, acceptanceLedger(flow, snapshot))
+  assert.equal(result.items.filter((item) => item.source === 'review').length, 1)
+  assert.equal(result.items.find((item) => item.source === 'review').summary, '真实阻塞项')
+  assert.equal(result.advisories.length, 1)
+  assert.equal(result.advisories[0].severity, 'MAJOR')
+  assert.equal(result.advisories[0].unverified, true)
+})
+
 test('阶段摘要独立展示开发、验收、运行态、执行及复用数量', () => {
   const flow = flowOf()
   flow.devChanges = { files: ['src/ui.js'], untracked: [{ path: 'src/helper.js' }, 'src/ui.js'] }

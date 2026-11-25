@@ -276,6 +276,80 @@ await check('同一模式重复设置是幂等的', async () => {
   assert.equal((await host.state()).gateMode, 'auto')
 })
 
+// 证据门禁：未核实与缺字段分别拦截；零发现和部分未核实不应误拦。
+const reviewFinding = (overrides = {}) => ({
+  file: 'src/app.js', line: 1, kind: 'defect', severity: 'MINOR', ac: 'AC-1',
+  summary: 'value 在失败路径不返回预期', evidence: 'value',
+  repro: { when: '调用失败路径', expected: '返回 2', actual: '返回 1' },
+  ...overrides,
+})
+const reviewCases = [
+  { name: '全未核实角度', findings: [reviewFinding({ evidence: 'nonexistent' })], status: 409, message: /全部未核实/, skipped: ['correctness'] },
+  { name: '部分未核实角度', findings: [reviewFinding(), reviewFinding({ evidence: 'nonexistent' })], status: 200, skipped: [] },
+  { name: '零发现角度', findings: [], status: 200, skipped: [] },
+  { name: '严重缺字段条目', findings: [reviewFinding({ severity: 'MAJOR', counter: undefined })], status: 409, message: /缺少证据字段被丢弃/, skipped: [] },
+]
+for (const [index, sample] of reviewCases.entries()) {
+  await check('评审证据门禁：' + sample.name, async () => {
+    const host = makeHost(freshCwd(), 'sess-evidence-' + index)
+    await host.tool('flowgate_start', { brief: '核对评审证据', preset: 'strict' })
+    const doc = host.tool('flowgate_doc', { html: '<p>证据</p>', scope: cleanScope() })
+    await tick()
+    assert.equal((await host.act('doc', { decision: 'approve' })).status, 200)
+    await doc
+    const dev = host.tool('flowgate_gate', {})
+    await tick()
+    assert.equal((await host.act('gate', { decision: 'pass' })).status, 200)
+    await dev
+    const review = host.tool('flowgate_review', { angles: [{ id: 'correctness', name: '正确性', verdict: 'advisory', findings: sample.findings }] })
+    await tick()
+    const current = await host.state()
+    if (sample.name === '严重缺字段条目') {
+      assert.deepEqual(current.review.angles[0].rejectedFindings[0].missing, ['counter.attempt', 'counter.survived'])
+      assert.equal(Object.hasOwn(current.review.angles[0].rejectedFindings[0], 'summary'), false)
+      assert.equal(Object.hasOwn(current.review.angles[0].rejectedFindings[0], 'file'), false)
+    }
+    const response = await host.act('gate', { decision: 'pass' })
+    assert.equal(response.status, sample.status, JSON.stringify(response.body))
+    if (sample.message) assert.match(response.body.error, sample.message)
+    if (sample.status === 409) {
+      const skipped = await host.act('gate', { decision: 'skip' })
+      assert.equal(skipped.status, 200, JSON.stringify(skipped.body))
+      assert.deepEqual((await host.state()).review.skippedUnverified ?? [], sample.skipped)
+    }
+    await review
+  })
+}
+
+// 多角度时的量词边界：被拦的只有「全未核实」的那个角度，跳过也只记它的名。
+// 把已核实的角度也写进拦截文案，等于让人去补本来就有的证据。
+await check('评审证据门禁：多角度只拦未核实的那个并只记它的名', async () => {
+  const host = makeHost(freshCwd(), 'sess-evidence-multi')
+  await host.tool('flowgate_start', { brief: '多角度证据核对', preset: 'strict' })
+  const doc = host.tool('flowgate_doc', { html: '<p>多角度</p>', scope: cleanScope() })
+  await tick()
+  assert.equal((await host.act('doc', { decision: 'approve' })).status, 200)
+  await doc
+  const dev = host.tool('flowgate_gate', {})
+  await tick()
+  assert.equal((await host.act('gate', { decision: 'pass' })).status, 200)
+  await dev
+  const review = host.tool('flowgate_review', { angles: [
+    { id: 'correctness', name: '正确性', verdict: 'advisory', findings: [reviewFinding({ evidence: 'nonexistent' })] },
+    { id: 'security', name: '安全', verdict: 'advisory', findings: [reviewFinding()] },
+  ] })
+  await tick()
+  const blocked = await host.act('gate', { decision: 'pass' })
+  assert.equal(blocked.status, 409, JSON.stringify(blocked.body))
+  assert.match(blocked.body.error, /：正确性；/)
+  assert.ok(!/、安全/.test(blocked.body.error), blocked.body.error)
+  assert.ok(!/：安全/.test(blocked.body.error), blocked.body.error)
+  const skipped = await host.act('gate', { decision: 'skip' })
+  assert.equal(skipped.status, 200, JSON.stringify(skipped.body))
+  assert.deepEqual((await host.state()).review.skippedUnverified ?? [], ['correctness'])
+  await review
+})
+
 console.log('\n全部通过：' + passed + ' 项')
 if (failures.length) {
   console.log('失败：' + failures.length + ' 项')

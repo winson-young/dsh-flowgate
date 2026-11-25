@@ -163,6 +163,29 @@ const execOf = (name, args) => ({
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 5))
 
+// 评审发现现在要带证据：evidence 必须是目标文件里真实出现的标识符，
+// defect 还要给能对上的 line 与复现。下面这些用例关心的是门禁语义，
+// 不是证据校验本身，所以统一准备一份真实文件并生成合法发现。
+const REVIEW_SOURCE = 'export const session = (now, expiresAt) => (now > expiresAt ? 401 : 200)\n'
+function seedReviewSource(root) {
+  mkdirSync(join(root, 'src', 'auth'), { recursive: true })
+  writeFileSync(join(root, 'src', 'auth', 'session.ts'), REVIEW_SOURCE)
+}
+function reviewFinding(overrides = {}) {
+  return {
+    file: 'src/auth/session.ts',
+    line: 1,
+    severity: 'MAJOR',
+    ac: 'AC-1',
+    summary: '时区错误',
+    kind: 'defect',
+    evidence: 'expiresAt',
+    repro: { when: 'now 与 expiresAt 处于不同时区', expected: '返回 401', actual: '返回 200' },
+    counter: { attempt: '我尝试证明 now 与 expiresAt 同源、不会跨时区', survived: true },
+    ...overrides,
+  }
+}
+
 async function runTool(name, args = {}) {
   const definition = host.tools.get(name)
   assert.ok(definition, '工具未注册：' + name)
@@ -238,7 +261,7 @@ check('无流程时 status 返回 active=false', () => assert.equal(status0.acti
 check('G38 无流程时 status 也带齐七个版本字段', () => {
   // AC-8：版本号必须来自 package.json，且本次已提升——写成常量会把「没读盘」也断言成通过。
   assert.equal(status0.version, JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version)
-  assert.equal(status0.version, '0.1.4')
+  assert.equal(status0.version, '0.1.5')
   assert.match(status0.moduleRevision, /^[a-f0-9]{64}$/)
   assert.equal(status0.diskModuleRevision, status0.moduleRevision)
   assert.equal(status0.runtimeStatus, 'verified')
@@ -896,6 +919,7 @@ check('S2 记录变更摘要凭据', () => {
 })
 
 // AC-6 / AC-7：评审阶段升档 + 评审发现问题 → 回退 S2。
+seedReviewSource(cwd)
 const reviewPending = runTool(
   'flowgate_review',
   {
@@ -906,7 +930,7 @@ const reviewPending = runTool(
         verdict: 'blocking',
         findings: [
           // 挂在已声明的验收标准上、且在 scope 文件内：这类发现才进重做清单。
-          { file: 'src/auth/session.ts', line: 42, severity: 'MAJOR', ac: 'AC-1', summary: '过期时间未考虑时区' },
+          reviewFinding({ ac: 'AC-1', summary: '过期时间未考虑时区' }),
         ],
       },
     ],
@@ -993,7 +1017,7 @@ const reviewPending2 = runTool('flowgate_review', {
       id: 'correctness',
       name: '正确性',
       verdict: 'blocking',
-      findings: [{ file: 'src/auth/session.ts', line: 12, severity: 'CRITICAL', ac: 'AC-2', summary: '缺少并发保护' }],
+      findings: [reviewFinding({ severity: 'CRITICAL', ac: 'AC-2', summary: '缺少并发保护' })],
     },
   ],
 })
@@ -1021,7 +1045,7 @@ const reviewPending3 = gateRound(
         id: 'security',
         name: '安全',
         verdict: 'pass',
-        findings: [{ file: 'src/auth/session.ts', line: 20, severity: 'MINOR', ac: 'AC-1', summary: '建议日志脱敏' }],
+        findings: [reviewFinding({ severity: 'MINOR', ac: 'AC-1', summary: '建议日志脱敏' })],
       },
     ],
   },
@@ -1263,13 +1287,16 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
   await dev4
 
   // 发现落在 scope 之外：重做 S2 也修不了，只能回 S1 调 scope。
+  // 这条发现要能进快照，证据就得对得上真实文件，所以先把它说的文件写出来。
+  mkdirSync(join(cwd, 'src', 'config'), { recursive: true })
+  writeFileSync(join(cwd, 'src', 'config', 'secrets.ts'), 'export const secret = process.env.API_KEY\nexport const rotated = () => secret\nexport const ttl = 60\n')
   const review4 = ctx4.tool('flowgate_review', {
     angles: [{
       id: 'security',
       name: '安全',
       verdict: 'blocking',
       // 挂上了验收标准，但文件不在 scope 内：仍然不算阻塞项，且说明 scope 没划够。
-      findings: [{ file: 'src/config/secrets.ts', line: 7, severity: 'CRITICAL', ac: 'AC-1', summary: '密钥硬编码' }],
+      findings: [reviewFinding({ file: 'src/config/secrets.ts', line: 1, severity: 'CRITICAL', ac: 'AC-1', summary: '密钥硬编码', evidence: 'API_KEY' })],
     }],
   })
   await tick()
@@ -2365,9 +2392,10 @@ rmSync(cwd, { recursive: true, force: true })
   await tick()
   await cx.request('/api/flowgate/action', { sessionId: sid, action: 'gate', payload: { decision: 'pass' } })
   await devCall
+  seedReviewSource(cwd)
   const signal = new AbortController()
   const reviewCall = cx.tool('flowgate_review', { angles: [{ id: 'correctness', name: '正确性', verdict: 'blocking',
-    findings: [{ file: 'src/auth/session.ts', line: 42, severity: 'MAJOR', ac: 'AC-1', summary: '时区错误' }] }] }, { signal: signal.signal })
+    findings: [reviewFinding()] }] }, { signal: signal.signal })
   await tick()
   const submitted = await cx.request('/api/flowgate/state?sessionId=' + sid)
   assert.equal(submitted.body.review.blocking, 1)
@@ -2419,8 +2447,9 @@ for (const [kind, reason, expected] of [
   await tick()
   await cx.request('/api/flowgate/action', { sessionId: sid, action: 'gate', payload: { decision: 'pass' } })
   await devCall
+  seedReviewSource(cwd)
   const reviewCall = cx.tool('flowgate_review', { angles: [{ id: 'correctness', name: '正确性', verdict: 'blocking',
-    findings: [{ file: 'src/auth/session.ts', line: 42, severity: 'MAJOR', ac: 'AC-1', summary: '时区错误' }] }] })
+    findings: [reviewFinding()] }] })
   await tick()
   const report = await cx.request('/api/flowgate/state?sessionId=' + sid)
   const accepted = await cx.request('/api/flowgate/action', { sessionId: sid, action: 'gate',
@@ -4228,18 +4257,33 @@ for (const [kind, reason, expected] of [
     await tick()
     await act('gate', { decision: 'pass' })
     await dev
+    // 发现要带能对上的证据：先把它们说的文件写出来，否则全部按未核实降级。
+    mkdirSync(join(gateCwd, 'src'), { recursive: true })
+    writeFileSync(join(gateCwd, 'src', 'gate.ts'), [
+      'export const gate = (x) => x',
+      'export const refresh = (token) => token',
+      'export const lock = new Set()',
+      'export const pending = new Map()',
+      'export const retry = () => {}',
+      'export const backoff = 0',
+      'export const jitter = 0',
+      'export const queued = []',
+      'export const flushed = false',
+      'export const metrics = {}',
+    ].join('\n') + '\n')
+    writeFileSync(join(gateCwd, 'src', 'other.ts'), 'export const legacy = true\nexport const old = true\nexport const deprecated = true\n')
     const review = px.tool('flowgate_review', {
       angles: [{
         id: 'correctness',
         name: '正确性',
         verdict: 'blocking',
         findings: [
-          { file: 'src/gate.ts', line: 1, severity: 'MAJOR', ac: 'AC-1', summary: '并发时可能重复刷新' },
-          { file: 'src/gate.ts', line: 2, severity: 'CRITICAL', summary: '没挂验收标准的发现' },
-          { file: 'src/other.ts', line: 3, severity: 'MAJOR', ac: 'AC-1', summary: '落在 scope 之外' },
-          { file: 'src/gate.ts', line: 4, severity: 'MAJOR', ac: 'AC-9', summary: '验收标准 id 不存在' },
-          { file: 'src/gate.ts', line: 5, severity: 'MINOR', ac: 'AC-1', summary: '只是建议' },
-          ...Array.from({ length: 4 }, (_, index) => ({ file: 'src/gate.ts', line: 6 + index, severity: 'MINOR', ac: 'AC-1', summary: '额外建议 ' + index })),
+          reviewFinding({ file: 'src/gate.ts', line: 1, severity: 'MAJOR', ac: 'AC-1', summary: '并发时可能重复刷新', evidence: 'gate' }),
+          reviewFinding({ file: 'src/gate.ts', line: 2, severity: 'CRITICAL', summary: '没挂验收标准的发现', evidence: 'refresh', ac: undefined }),
+          reviewFinding({ file: 'src/other.ts', line: 3, severity: 'MAJOR', ac: 'AC-1', summary: '落在 scope 之外', evidence: 'legacy' }),
+          reviewFinding({ file: 'src/gate.ts', line: 4, severity: 'MAJOR', ac: 'AC-9', summary: '验收标准 id 不存在', evidence: 'lock' }),
+          reviewFinding({ file: 'src/gate.ts', line: 5, severity: 'MINOR', ac: 'AC-1', summary: '只是建议', evidence: 'pending' }),
+          ...Array.from({ length: 4 }, (_, index) => reviewFinding({ file: 'src/gate.ts', line: 6 + index, severity: 'MINOR', ac: 'AC-1', summary: '额外建议 ' + index, evidence: ['retry', 'backoff', 'jitter', 'queued'][index] })),
         ],
       }],
     })
@@ -4249,7 +4293,7 @@ for (const [kind, reason, expected] of [
     const kept = reported.angles[0].findings
     check('fast 档保留完整发现与超过 3 条的 MINOR 计数，不用摘要冒充发现', () => {
       assert.equal(kept.length, 9)
-      assert.deepEqual(reported.counts, { total: 9, critical: 1, major: 3, minor: 5, blocking: 1, advisories: 8, unscoped: 3 })
+      assert.deepEqual(reported.counts, { total: 9, critical: 1, major: 3, minor: 5, blocking: 1, advisories: 8, unscoped: 3, unverified: 0, unverifiedSevere: 0 })
       assert.equal(kept.filter((finding) => finding.severity === 'MINOR').length, 5)
       assert.ok(kept.every((finding) => !/另有.*未列出/.test(finding.summary)))
     })
@@ -4397,17 +4441,179 @@ async function provenanceFixture(label) {
 }
 
 {
+  const fx = await provenanceFixture('finding-spoofs-unicode')
+  try {
+    assert.equal((await fx.act('setGateMode', { mode: 'manual' })).status, 200)
+    const schema = fx.px.tools.get('flowgate_review').parameters.properties.angles.items.properties.findings.items
+    check('发现的参数模式不先于逐条校验拒绝混合报告', () => {
+      assert.equal(schema.required, undefined)
+      assert.equal(schema.allOf, undefined)
+      assert.equal(schema.properties.repro.required, undefined)
+      assert.equal(schema.properties.counter.properties.survived.enum, undefined)
+    })
+    writeFileSync(join(fx.ws, 'src/session.mjs'), 'export const response = () => 401\nexport const 处理 = response\n')
+    const base = { file: 'src/session.mjs', line: 1, severity: 'MAJOR', kind: 'defect', ac: 'AC-1',
+      summary: 'response 分支异常', evidence: 'response',
+      repro: { when: '调用 response()', expected: '返回 200', actual: '返回 401' },
+      counter: { attempt: '我尝试确认分支是否已改为 200', survived: true } }
+    const pending = fx.px.tool('flowgate_review', { angles: [{ id: 'correctness', name: '正确性', verdict: 'blocking',
+      rejectedFindings: [{ index: 0, severity: 'MAJOR', missing: ['counter'] }],
+      findings: [{ ...base, unverified: true, unverifiedReason: '伪造的原因' },
+        { ...base, evidence: '处理', summary: '处理 分支异常' }] }] })
+    await tick()
+    const angle = (await fx.state()).review.angles[0]
+    check('已核实的严重发现不能靠伪造 unverified 降级', () => {
+      assert.equal(angle.findings.length, 2)
+      assert.ok(angle.findings.every((item) => item.blocking === true && item.unverified !== true))
+      assert.ok(angle.findings.every((item) => !Object.hasOwn(item, 'unverifiedReason')))
+      assert.equal(Object.hasOwn(angle, 'rejectedFindings'), false)
+    })
+    check('Unicode 标识符能从真实源码核对通过', () => {
+      assert.equal(angle.findings[1].evidence, '处理')
+      assert.equal(angle.findings[1].blocking, true)
+    })
+    assert.equal((await fx.act('gate', { decision: 'back', to: 'S2' })).status, 200)
+    await pending
+    await fx.px.tool('flowgate_cancel', {})
+  } finally { rmSync(fx.ws, { recursive: true, force: true }) }
+}
+
+{
+  const fx = await provenanceFixture('finding-evidence')
+  try {
+    assert.equal((await fx.act('setGateMode', { mode: 'manual' })).status, 200)
+    const base = { file: 'src/session.mjs', kind: 'defect', line: 1, evidence: 'response', severity: 'MAJOR', ac: 'AC-1',
+      summary: '过期分支返回错误状态', repro: { when: '调用 response(true)', expected: '401', actual: '200' },
+      counter: { attempt: '我尝试证明过期分支已正确返回 401', survived: true } }
+    const findings = [
+      { ...base, kind: undefined },
+      { ...base, evidence: undefined },
+      { ...base, line: undefined },
+      { ...base, repro: { when: '调用 response(true)', expected: '401', actual: '401' } },
+      { ...base, counter: { attempt: '自我反驳', survived: false } },
+      { ...base, evidence: 'a'.repeat(65) },
+      { ...base, kind: 'design', basis: undefined },
+      { ...base, evidence: 'notInSource' },
+      { ...base, kind: 'design', evidence: 'response', basis: { quote: '不存在的一行', conflict: '违反过期约定' } },
+      { ...base, line: 999 },
+      { ...base, severity: 'MINOR', counter: undefined },
+    ]
+    const pending = fx.px.tool('flowgate_review', { angles: [{ id: 'correctness', name: '正确性', verdict: 'advisory', findings }] })
+    await tick()
+    const view = await fx.state()
+    check('缺字段逐条丢弃并保留安全的索引和缺项，不泄漏原文', () => {
+      const rejected = view.review.angles[0].rejectedFindings
+      assert.equal(rejected.length, 7)
+      assert.deepEqual(rejected.map((item) => item.index).sort((a, b) => a - b), [0, 1, 2, 3, 4, 5, 6])
+      assert.ok(rejected.every((item) => Object.keys(item).sort().join(',') === 'index,missing,severity'))
+      assert.ok(rejected.some((item) => item.index === 3 && item.missing.includes('repro.actual')))
+      assert.ok(rejected.some((item) => item.index === 4 && item.missing.includes('counter.survived')))
+    })
+    check('严重发现的源码证据对不上时保留严重度但不阻塞', () => {
+      assert.equal(view.review.angles[0].findings.length, 4)
+      assert.equal(view.review.counts.unverified, 3)
+      assert.equal(view.review.counts.unverifiedSevere, 3)
+      assert.equal(view.review.counts.blocking, 0)
+      assert.equal(view.review.counts.advisories, 4)
+      assert.equal(view.review.angles[0].verdict, 'advisory')
+      const reasons = view.review.angles[0].findings.filter((item) => item.unverified).map((item) => item.unverifiedReason)
+      assert.ok(reasons.some((reason) => /evidence 标识符 notInSource 不在/.test(reason)))
+      assert.ok(reasons.some((reason) => /basis.quote 不是/.test(reason)))
+      assert.ok(reasons.some((reason) => /line 999 超出/.test(reason)))
+    })
+    assert.equal((await fx.act('gate', { decision: 'back', to: 'S2' })).status, 200)
+    await pending
+    await fx.px.tool('flowgate_cancel', {})
+  } finally { rmSync(fx.ws, { recursive: true, force: true }) }
+}
+
+{
+  const fx = await provenanceFixture('finding-evidence-boundaries')
+  try {
+    assert.equal((await fx.act('setGateMode', { mode: 'manual' })).status, 200)
+    const longQuote = 'export const longQuote = \"' + 'x'.repeat(305) + '\"'
+    writeFileSync(join(fx.ws, 'src/session.mjs'), 'export const response = () => 401\n  const indented = response\n' + longQuote + '\n')
+    const base = { file: 'src/session.mjs', line: 1, severity: 'MAJOR', kind: 'defect', ac: 'AC-1',
+      summary: 'response 分支错误', evidence: 'response',
+      repro: { when: '调用 response()', expected: '返回 200', actual: '返回 401' },
+      counter: { attempt: '尝试检查其他路径', survived: true } }
+    const design = { ...base, kind: 'design', evidence: 'indented',
+      basis: { quote: '  const indented = response', conflict: '与约定冲突' } }
+    const findings = [
+      // 合格发现额外带嵌套的非契约字段与超大对象：它们一律不许进快照。
+      { ...base,
+        repro: { ...base.repro, expected: 'a'.repeat(200) + 'X', actual: 'a'.repeat(200) + 'Y', payload: { blob: 'x'.repeat(512 * 1024) } },
+        counter: { ...base.counter, payload: { blob: 'y'.repeat(512 * 1024) } },
+        ignored: 'z'.repeat(512 * 1024) },
+      { ...design, evidence: 'longQuote', basis: { ...design.basis, quote: longQuote } },
+      design,
+      { ...design, basis: { ...design.basis, quote: 'const indented = response' } },
+      { ...base, file: undefined }, { ...base, summary: undefined }, { ...base, kind: undefined },
+      { ...base, evidence: undefined }, { ...base, line: undefined },
+      { ...base, repro: { ...base.repro, when: undefined } },
+      { ...base, repro: { ...base.repro, expected: undefined } },
+      { ...base, repro: { ...base.repro, actual: undefined } },
+      { ...design, basis: { ...design.basis, quote: undefined } },
+      { ...design, basis: { ...design.basis, conflict: undefined } },
+      { ...base, counter: { ...base.counter, attempt: undefined } },
+      { ...base, counter: { ...base.counter, survived: false } },
+      { ...base, severity: 'X'.repeat(65536) },
+    ]
+    const pending = fx.px.tool('flowgate_review', { angles: [{ id: 'correctness', name: '正确性', verdict: 'pass', findings }] })
+    await tick()
+    const view = await fx.state()
+    const angle = view.review.angles[0]
+    check('手工结论按已核实严重项推导，原声称另存冲突', () => {
+      assert.equal(angle.verdict, 'blocking')
+      assert.deepEqual(angle.verdictConflict, { declared: 'pass', derived: 'blocking' })
+    })
+    check('按原文判定超长差异和逐字引文，且只保存合同字段', () => {
+      assert.equal(angle.findings.length, 4)
+      assert.equal(angle.findings[0].unverified, undefined)
+      assert.notEqual(angle.findings[0].repro.expected, angle.findings[0].repro.actual)
+      assert.match(angle.findings[0].repro.expected, /SHA-256/)
+      assert.equal(angle.findings[1].unverified, undefined)
+      assert.match(angle.findings[1].basis.quote, /SHA-256/)
+      assert.equal(angle.findings[2].unverified, undefined)
+      assert.equal(angle.findings[3].unverified, true)
+      assert.match(angle.findings[3].unverifiedReason, /basis.quote 不是/)
+      assert.equal(Object.hasOwn(angle.findings[0], 'ignored'), false)
+      // 嵌套位置上的非合同字段同样不许落盘：子代理入口不过 schema，
+      // 原样保留一个 512KB 的嵌套对象就能把快照顶过冷恢复上限。
+      assert.equal(Object.hasOwn(angle.findings[0].repro, 'payload'), false)
+      assert.equal(Object.hasOwn(angle.findings[0].counter, 'payload'), false)
+    })
+    check('必填字段逐个拒绝，非法严重度不以原文写入快照', () => {
+      const rejected = new Map(angle.rejectedFindings.map((item) => [item.index, item]))
+      for (const [index, field] of [[4, 'file'], [5, 'summary'], [6, 'kind'], [7, 'evidence'],
+        [8, 'line'], [9, 'repro.when'], [10, 'repro.expected'], [11, 'repro.actual'],
+        [12, 'basis.quote'], [13, 'basis.conflict'], [14, 'counter.attempt'], [15, 'counter.survived'], [16, 'severity']]) {
+        assert.ok(rejected.get(index)?.missing.includes(field), field)
+      }
+      assert.equal(rejected.get(16).severity, 'INVALID')
+      assert.ok(JSON.stringify(view.review).length < 16000)
+    })
+    assert.equal((await fx.act('gate', { decision: 'back', to: 'S2' })).status, 200)
+    await pending
+    await fx.px.tool('flowgate_cancel', {})
+  } finally { rmSync(fx.ws, { recursive: true, force: true }) }
+}
+
+{
   const fx = await provenanceFixture('hard-cap-severity')
   try {
     const findings = ['CRITICAL', 'MAJOR', 'MINOR'].flatMap((severity, index) =>
-      Array.from({ length: [201, 2, 3][index] }, (_, i) => ({ file: 'src/session.mjs', ac: 'AC-1', severity, summary: severity + ' ' + i })))
+      Array.from({ length: [201, 2, 3][index] }, (_, i) => ({ file: 'src/session.mjs', ac: 'AC-1', severity, summary: severity + ' ' + i,
+        kind: 'defect', line: 1, evidence: 'response',
+        repro: { when: '会话过期后发请求', expected: '返回 401', actual: '返回 200' },
+        ...(severity === 'MINOR' ? {} : { counter: { attempt: '我尝试证明过期响应不受此分支影响', survived: true } }) })))
     const pending = fx.px.tool('flowgate_review', { angles: [{ id: 'correctness', name: '正确性', verdict: 'blocking', findings }] })
     await tick()
     const view = await fx.state()
     check('硬上限省略项保留原严重度与阻塞数量，不能合成 MINOR 或丢失分级', () => {
       assert.equal(view.review.angles[0].findings.length, 200)
-      assert.deepEqual(view.review.counts, { total: 206, critical: 201, major: 2, minor: 3, blocking: 203, advisories: 3, unscoped: 0 })
-      assert.deepEqual(view.review.angles[0].omittedCounts, { total: 6, critical: 1, major: 2, minor: 3, blocking: 3, advisories: 3, unscoped: 0 })
+      assert.deepEqual(view.review.counts, { total: 206, critical: 201, major: 2, minor: 3, blocking: 203, advisories: 3, unscoped: 0, unverified: 0, unverifiedSevere: 0 })
+      assert.deepEqual(view.review.angles[0].omittedCounts, { total: 6, critical: 1, major: 2, minor: 3, blocking: 3, advisories: 3, unscoped: 0, unverified: 0, unverifiedSevere: 0 })
     })
     assert.equal((await fx.act('gate', { decision: 'back', to: 'S2' })).status, 200)
     await pending

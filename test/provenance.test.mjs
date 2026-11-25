@@ -384,18 +384,32 @@ test('findingCounts counts all severities and all nonblocking findings, includin
     { severity: 'MINOR', acMatched: false, fileInScope: false },
     { severity: 'UNKNOWN' },
   ] }])
-  assert.deepEqual(counts, { total: 7, critical: 2, major: 2, minor: 2, blocking: 2, advisories: 5, unscoped: 3 })
+  // 未核实与严重度正交：这批发现没有 unverified 标记，两个新计数必须为 0。
+  assert.deepEqual(counts, { total: 7, critical: 2, major: 2, minor: 2, blocking: 2, advisories: 5, unscoped: 3, unverified: 0, unverifiedSevere: 0 })
+})
+
+test('findingCounts separates unverified from blocking without changing severity', () => {
+  const counts = findingCounts([{ findings: [
+    // 未核实的严重项：严重度不动，但不能当阻塞项。
+    { severity: 'CRITICAL', blocking: false, acMatched: true, fileInScope: true, unverified: true },
+    // 未核实的轻微项：只进 unverified，不进 unverifiedSevere。
+    { severity: 'MINOR', blocking: false, acMatched: true, fileInScope: true, unverified: true },
+    { severity: 'MAJOR', blocking: true, acMatched: true, fileInScope: true },
+  ] }])
+  // 两类未核实都落进 advisories（blocking 判据已排除它们），只有一条已核实项算阻塞。
+  assert.deepEqual(counts, { total: 3, critical: 1, major: 1, minor: 1, blocking: 1, advisories: 2, unscoped: 0, unverified: 2, unverifiedSevere: 1 })
 })
 
 test('findingCounts includes trusted omittedCounts beyond the report hard cap', () => {
   const counts = findingCounts([{ findings: [{ severity: 'MINOR', blocking: false }], omittedCounts: {
     total: 205, critical: 20, major: 80, minor: 105, blocking: 90, advisories: 115, unscoped: 7,
   } }, { findings: [], omittedCounts: { total: -1, minor: 1.5, critical: '2', major: NaN, blocking: Infinity } }])
-  assert.deepEqual(counts, { total: 206, critical: 20, major: 80, minor: 106, blocking: 90, advisories: 116, unscoped: 7 })
+  // omittedCounts 里没有未核实键，叠加后仍为 0：超上限的省略项不做内容校验。
+  assert.deepEqual(counts, { total: 206, critical: 20, major: 80, minor: 106, blocking: 90, advisories: 116, unscoped: 7, unverified: 0, unverifiedSevere: 0 })
 })
 
 test('findingCounts tolerates missing angle lists and counts every supplied finding once', () => {
-  const zero = { total: 0, critical: 0, major: 0, minor: 0, blocking: 0, advisories: 0, unscoped: 0 }
+  const zero = { total: 0, critical: 0, major: 0, minor: 0, blocking: 0, advisories: 0, unscoped: 0, unverified: 0, unverifiedSevere: 0 }
   for (const input of [undefined, null, {}, [null, {}, { findings: 'invalid' }]]) assert.deepEqual(findingCounts(input), zero)
   assert.deepEqual(findingCounts([{ findings: [null, {}, { blocking: false }] }]), { ...zero, total: 3, advisories: 3 })
 })

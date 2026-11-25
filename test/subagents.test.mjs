@@ -48,7 +48,9 @@ function reportFor(spec, expectedPoints = [], checkedFiles = [], readEvidence = 
     })) }
     : { verdict: 'advisory', suggestUpgrade: false, checkedFiles,
       readEvidence, findings: [
-      { file: 'src/auth/session.ts', line: 17, severity: 'MINOR', summary: 'fixture finding' },
+      // 发现现在要带能对上的证据：design 类给出文件里逐字存在的一行与冲突的约定。
+      { file: 'src/auth/session.ts', kind: 'design', evidence: 'fixture', summary: 'fixture finding', severity: 'MINOR',
+        basis: { quote: 'fixture source', conflict: '缺少失败路径的注释' } },
     ] }
   return { stopReason: 'completed', output: [{ type: 'text', text: JSON.stringify(report) }] }
 }
@@ -449,7 +451,12 @@ await test('初始 SDK 未加载 ops_read_files：默认 read 与按需加载均
 
 for (const [name, content] of [['空文件', ''], ['纯空白文件', '  \n\t\n']]) {
   await test(name + '成功读取后不误标未覆盖', async () => {
-    await fixture({}, async (host) => {
+    await fixture({ response: (activation) => {
+      const report = reportForActivation(activation)
+      if (!activation.spec.label.startsWith('评审')) return report
+      const body = JSON.parse(report.output[0].text)
+      return { stopReason: 'completed', structured: { ...body, verdict: 'pass', findings: [] }, output: [] }
+    } }, async (host) => {
       await host.advance()
       writeFileSync(join(host.cwd, 'src/auth/session.ts'), content)
       const { before, value } = await host.complete('review', host.call('flowgate_review_run'))
@@ -910,11 +917,83 @@ for (const kind of ['review', 'test']) {
   })
 }
 
+await test('手工与子代理同一批坏发现给出相同缺项清单并保留合格同伴', async () => {
+  const valid = { file: 'src/auth/session.ts', kind: 'design', severity: 'MINOR', evidence: 'fixture',
+    summary: 'fixture finding', basis: { quote: 'fixture source', conflict: '缺少失败路径注释' } }
+  const findings = [
+    { ...valid, kind: undefined },
+    { ...valid, severity: 'UNKNOWN', counter: { attempt: '已尝试反驳', survived: true } },
+    { ...valid, basis: { quote: 'fixture source' } },
+    { ...valid, evidence: undefined },
+    valid,
+  ]
+  let manual
+  await fixture({}, async (host) => {
+    await host.advance()
+    const report = { angles: [{ id: 'correctness', name: '正确性', verdict: 'advisory', findings }] }
+    const { before } = await host.complete('review', host.call('flowgate_review', JSON.parse(JSON.stringify(report))), { decision: 'skip' })
+    manual = before.review.angles[0]
+  })
+  await fixture({ response: (activation) => {
+    const report = JSON.parse(reportForActivation(activation).output[0].text)
+    return { stopReason: 'completed', structured: { ...report, findings: JSON.parse(JSON.stringify(findings)) }, output: [] }
+  } }, async (host) => {
+    await host.advance()
+    const { before } = await host.complete('review', host.call('flowgate_review_run'), { decision: 'skip' })
+    const child = before.review.angles[0]
+    assert.deepEqual(child.rejectedFindings, manual.rejectedFindings)
+    assert.deepEqual([...child.rejectedFindings].sort((a, b) => a.index - b.index).map((item) => item.missing),
+      [['kind'], ['severity'], ['basis.conflict'], ['evidence']])
+    assert.equal(child.findings.length, 1)
+    assert.equal(manual.findings.length, 1)
+  })
+})
+
+for (const sample of [
+  { name: '一致', change: (report) => report, verdict: 'advisory' },
+  { name: '声称通过但有发现', change: (report) => ({ ...report, verdict: 'pass' }), verdict: 'advisory', declared: 'pass' },
+  { name: '零发现却声称阻塞', change: (report) => ({ ...report, verdict: 'blocking', findings: [] }), verdict: 'pass', declared: 'blocking' },
+  { name: '严重发现未核实', change: (report) => ({ ...report, verdict: 'blocking', findings: [{
+    file: 'src/auth/session.ts', kind: 'design', severity: 'MAJOR', evidence: 'notInSource', summary: '定位符号不存在',
+    basis: { quote: 'fixture source', conflict: '缺少失败路径的注释' },
+    counter: { attempt: '我尝试证明存在对应标识符', survived: true },
+  }] }), verdict: 'advisory', declared: 'blocking', unverified: true },
+  { name: '缺字段不丢掉同角度合格发现', change: (report) => ({ ...report, findings: [
+    { ...report.findings[0], kind: undefined }, report.findings[0],
+  ] }), verdict: 'advisory', rejected: true },
+  { name: '未知严重度只丢弃对应一条', change: (report) => ({ ...report, findings: [
+    { ...report.findings[0], severity: 'UNKNOWN', counter: { attempt: '检查过严重度', survived: true } }, report.findings[0],
+  ] }), verdict: 'advisory', rejected: true, missing: ['severity'] },
+]) {
+  await test('子代理证据与结论：' + sample.name, async () => {
+    await fixture({ response: (activation) => ({ stopReason: 'completed',
+      structured: sample.change(JSON.parse(reportForActivation(activation).output[0].text)), output: [],
+    }) }, async (host) => {
+      await host.advance()
+      const { before } = await host.complete('review', host.call('flowgate_review_run'), { decision: 'skip' })
+      const angle = before.review.angles[0]
+      assert.equal(angle.verdict, sample.verdict)
+      if (sample.declared) assert.deepEqual(angle.verdictConflict, { declared: sample.declared, derived: sample.verdict })
+      else assert.equal(Object.hasOwn(angle, 'verdictConflict'), false)
+      if (sample.unverified) {
+        assert.equal(angle.findings[0].unverified, true)
+        assert.equal(before.review.counts.unverifiedSevere, before.review.angles.length)
+        assert.equal(before.review.blocking, 0)
+      }
+      if (sample.rejected) {
+        assert.equal(angle.findings.length, 1)
+        assert.deepEqual(angle.rejectedFindings[0].missing, sample.missing ?? ['kind'])
+        assert.equal(angle.coverage, 'uncovered')
+        assert.match(angle.executionError, /第 1 条缺 (kind|severity)/)
+      }
+    })
+  })
+}
+
 for (const [name, report] of [
   ['缺字段', {}],
   ['findings 非数组', { verdict: 'pass', findings: {} }],
   ['未知 verdict', { verdict: 'unknown', findings: [] }],
-  ['未知 severity', { verdict: 'pass', findings: [{ file: 'x', severity: 'UNKNOWN', summary: 'x' }] }],
 ]) {
   await test('合法 JSON 的坏评审结构也降级：' + name, async () => {
     await fixture({ response: () => ({ stopReason: 'completed', output: [{ type: 'text', text: JSON.stringify(report) }] }) }, async (host) => {
@@ -1183,6 +1262,27 @@ for (const kind of ['review', 'test']) {
     })
   })
 }
+
+await test('复用角度保留原结论但不带上轮结论冲突', async () => {
+  await fixture({ response: (activation) => ({ stopReason: 'completed',
+    structured: { ...JSON.parse(reportForActivation(activation).output[0].text), verdict: 'pass' }, output: [],
+  }) }, async (host) => {
+    await host.advance()
+    const first = host.call('flowgate_review_run')
+    await eventually(async () => Boolean((await host.state()).review), '首轮冲突报告')
+    assert.deepEqual((await host.state()).review.angles[0].verdictConflict, { declared: 'pass', derived: 'advisory' })
+    await host.action('gate', { decision: 'back', to: 'S2' })
+    await within(first, '退回开发')
+    const dev = host.call('flowgate_gate')
+    await eventually(async () => (await host.state()).waitingKind === 'gate', '开发门禁')
+    await host.action('gate', { decision: 'pass' })
+    await within(dev, '开发完成')
+    const { before } = await host.complete('review', host.call('flowgate_review_run'))
+    assert.equal(before.review.angles[0].reused, true)
+    assert.equal(before.review.angles[0].verdict, 'advisory')
+    assert.equal(Object.hasOwn(before.review.angles[0], 'verdictConflict'), false)
+  })
+})
 
 for (const kind of ['review', 'test']) for (const stale of [false, true]) {
   await test(kind + ' 子报告传输 AC 证据与原始版本，不替陈旧证据补盖当前版本：' + stale, async () => {

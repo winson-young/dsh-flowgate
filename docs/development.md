@@ -101,7 +101,9 @@ S4 出口门禁有三种结束方式，状态、事件与界面文案各不相�
 | 有阻断发现，但没有落在 scope 外的 CRITICAL / MAJOR | 回到 S2 修复 |
 | 有 CRITICAL / MAJOR 落在 scope 外 | 回到 S1，先更新范围并重新批准 |
 
-「阻断发现」的口径收在冻结 scope 上：一条发现要同时满足三条才算——严重度不是 `MINOR`、挂得上 `acceptance_criteria` 里的某个验收标准 id（`ac` 字段）、且文件在 `in_scope.files_expected_to_change` 内。挂不上验收标准或落在 scope 外的发现照样列在评审报告里，但只作提示、不进 S2 的重做清单（它们证明的是范围没划够，不是这一次开发做错了）。这条口径同时约束 `flowgate_review` 与 `flowgate_review_run`，界面上对应的徽标是「未归属验收标准」与「scope 外文件」。`fast` 档只减少默认评审角度与测试方向，界面可折叠展示前三条，底层普通发现不按三条截断。每角度仍有 200 条存储安全上限；超出时 `omittedCounts` 单独保留收到的完整严重度与阻断计数，不能伪造一条 MINOR 代替多条原始发现。`MINOR` 的完整计数与 AC 结果独立：仅有 MINOR 不自动令 AC 失败，零阻断也不能自动令 AC 通过。
+「阻断发现」的口径收在冻结 scope 上：一条发现要同时满足四条才算——严重度不是 `MINOR`、挂得上 `acceptance_criteria` 里的某个验收标准 id（`ac` 字段）、文件在 `in_scope.files_expected_to_change` 内，且已核实。挂不上验收标准或落在 scope 外的发现照样列在评审报告里，但只作提示、不进 S2 的重做清单（它们证明的是范围没划够，不是这一次开发做错了）。这条口径同时约束 `flowgate_review` 与 `flowgate_review_run`，界面上对应的徽标是「未归属验收标准」与「scope 外文件」。`fast` 档只减少默认评审角度与测试方向，界面可折叠展示前三条，底层普通发现不按三条截断。每角度仍有 200 条存储安全上限；超出时 `omittedCounts` 单独保留收到的完整严重度与阻断计数，不能伪造一条 MINOR 代替多条原始发现。`MINOR` 的完整计数与 AC 结果独立：仅有 MINOR 不自动令 AC 失败，零阻断也不能自动令 AC 通过。未核实项保留原严重度，计入 `counts.unverified` / `counts.unverifiedSevere`，但不算阻断且只进入重做建议。
+
+发现契约由 `reviewTool` 的 schema、`normalizeSubmittedAngles` 的 `checkFinding` 与子代理 `runAngle` 共用：参数 schema 容许部分填写的发现，以免宿主先拒整份混合报告；完整性必填规则在 `checkFinding` 逐条执行，子代理也走同一校验器。必填 `kind`（`defect` / `design`）、`file`、`severity`、`summary`、`evidence`（文件里真实出现的 1–64 字符标识符）。缺陷需正整数 `line` 与非空 `repro.when/expected/actual`，期望和实际不能相同；设计问题需 `basis.quote`（源码里逐字存在的一行）与 `basis.conflict`；严重度为 `CRITICAL` 或 `MAJOR` 时需 `counter.attempt` 和 `counter.survived: true`。缺字段的条目存 `angle.rejectedFindings`（只存索引、严重度与缺项），同角度合格发现照常保留；文件读取、标识符、行号或引用不符的合格条目则标 `unverified` 和 `unverifiedReason`。子代理缺字段时该角度额外标 `coverage: uncovered`，不能通过评审。全未核实角度或严重发现被丢弃时，门禁拒绝普通通过；跳过全未核实角度会记录 `flow.review.skippedUnverified`。子代理的声明结论与按已核实发现推导的结论不符时，`angle.verdict` 保存推导值并用 `angle.verdictConflict` 保存 `declared` 和 `derived`；复用时不重复报告旧冲突。
 
 工作区默认规则记录在 `.dsh-flowgate/config.json`，与流程快照分开；规则继承顺序见[四阶段规则](#四阶段规则)。
 

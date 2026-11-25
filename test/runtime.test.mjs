@@ -92,7 +92,7 @@ check('被拒或没指纹的旧上报同样会过期，过期后一律 absent', 
   assert.equal(reportedLate.reportedWithoutRevision, true)
   assert.equal(rejectedLate.reportedWithoutRevision, false)
   // 过期时 describeRuntime 仍要把当初的原因念出来，且来源是结构化字段而不是拼在 reason 里。
-  const expiredLine = describeRuntime({ version: '0.1.4', runtimeStatus: 'verified', moduleRevision: a, diskModuleRevision: a, clientStatus: 'absent', clientExpired: true, clientRejectedReason: rejectedLate.rejectedReason })
+  const expiredLine = describeRuntime({ version: '0.1.5', runtimeStatus: 'verified', moduleRevision: a, diskModuleRevision: a, clientStatus: 'absent', clientExpired: true, clientRejectedReason: rejectedLate.rejectedReason })
   assert.match(expiredLine, /client 上次上报已过期（30 秒内无刷新）\uff1b上次记录被拒（指纹不是 64 位十六进制）/)
   // 没过期时仍然照旧区分：被拒不是没参与。
   assert.equal(clientState({ rejected: true, reason: '指纹不是 64 位十六进制', reportedAt: 1000 }, a, 2000).status, 'unverified')
@@ -102,8 +102,8 @@ check('被拒或没指纹的旧上报同样会过期，过期后一律 absent', 
 check('运行版本字段统一由 runtimeFields 产出，对外名与内部别名一致', () => {
   const host = { hostRevision: a, diskHostRevision: a, stale: [], status: 'verified' }
   const client = { status: 'verified', clientRevision: a, expectedClientRevision: a, reason: '', expired: false }
-  const fields = runtimeFields('0.1.4', host, client)
-  assert.equal(fields.version, '0.1.4')
+  const fields = runtimeFields('0.1.5', host, client)
+  assert.equal(fields.version, '0.1.5')
   assert.equal(fields.moduleRevision, a)
   assert.equal(fields.diskModuleRevision, a)
   assert.equal(fields.hostRevision, a)
@@ -113,22 +113,22 @@ check('运行版本字段统一由 runtimeFields 产出，对外名与内部别�
   assert.deepEqual(fields.staleModules, [])
   assert.equal(fields.clientExpired, false)
   // 读不懂的指纹与空模块名一律不许流到文案里。
-  const broken = runtimeFields('0.1.4', { hostRevision: 'zzz', diskHostRevision: a, stale: ['acceptance.js', ''], status: 'mismatch' }, { status: 'absent' })
+  const broken = runtimeFields('0.1.5', { hostRevision: 'zzz', diskHostRevision: a, stale: ['acceptance.js', ''], status: 'mismatch' }, { status: 'absent' })
   assert.equal(broken.moduleRevision, '')
   assert.equal(broken.clientRevision, '')
   assert.deepEqual(broken.staleModules, ['acceptance.js'])
 })
 
 check('运行版本首行含版本号与两侧指纹，不一致时念出未盖章模块', () => {
-  const ok = describeRuntime({ version: '0.1.4', runtimeStatus: 'verified', moduleRevision: a, diskModuleRevision: a, clientStatus: 'verified', clientRevision: a })
-  assert.equal(ok, '运行版本：0.1.4 / host ' + a.slice(0, 8) + '（与磁盘一致） / client ' + a.slice(0, 8) + '（已核对）')
-  const bad = describeRuntime({ version: '0.1.4', runtimeStatus: 'mismatch', moduleRevision: a, diskModuleRevision: b, staleModules: ['acceptance.js'] })
+  const ok = describeRuntime({ version: '0.1.5', runtimeStatus: 'verified', moduleRevision: a, diskModuleRevision: a, clientStatus: 'verified', clientRevision: a })
+  assert.equal(ok, '运行版本：0.1.5 / host ' + a.slice(0, 8) + '（与磁盘一致） / client ' + a.slice(0, 8) + '（已核对）')
+  const bad = describeRuntime({ version: '0.1.5', runtimeStatus: 'mismatch', moduleRevision: a, diskModuleRevision: b, staleModules: ['acceptance.js'] })
   assert.match(bad, /加载的是旧模块，验证结论不可用/)
   assert.match(bad, /未重新盖章的模块：acceptance\.js/)
-  const absent = describeRuntime({ version: '0.1.4', runtimeStatus: 'verified', moduleRevision: a, diskModuleRevision: a, clientStatus: 'absent' })
+  const absent = describeRuntime({ version: '0.1.5', runtimeStatus: 'verified', moduleRevision: a, diskModuleRevision: a, clientStatus: 'absent' })
   assert.match(absent, /client 未参与（本次没有页面轮询，宿主层已核对）/)
   // AC-6：宿主读不到指纹时首行必须写「无法核对」，这一支写错了测试不会失败。
-  const unknown = describeRuntime({ version: '0.1.4', runtimeStatus: 'unverified', moduleRevision: '', diskModuleRevision: '' })
+  const unknown = describeRuntime({ version: '0.1.5', runtimeStatus: 'unverified', moduleRevision: '', diskModuleRevision: '' })
   assert.match(unknown, /host 无法核对（模块未登记或源码缺失，验证结论不可用）/)
 })
 
