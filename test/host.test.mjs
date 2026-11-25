@@ -259,9 +259,9 @@ const status0 = await runTool('flowgate_status', {})
 check('无流程时 status 返回 active=false', () => assert.equal(status0.active, false))
 // G38：没有流程时也要能确认「验的是哪一版」，否则 Agent 连自己跑的是不是刚发布的那一版都不知道。
 check('G38 无流程时 status 也带齐七个版本字段', () => {
-  // AC-8：版本号必须来自 package.json，且本次已提升——写成常量会把「没读盘」也断言成通过。
+  // AC-8：版本号必须来自 package.json——写成常量会把「没读盘」也断言成通过，而且每升一次版本就得跟着改一次，忘了改就让整个 host 套件一直红（它曾写死 0.1.5，升到 0.1.6 之后这条断言再没通过过）。所以这里只跟 package.json 比，再校验形状，不钉具体版本号。
   assert.equal(status0.version, JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version)
-  assert.equal(status0.version, '0.1.5')
+  assert.match(status0.version, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/)
   assert.match(status0.moduleRevision, /^[a-f0-9]{64}$/)
   assert.equal(status0.diskModuleRevision, status0.moduleRevision)
   assert.equal(status0.runtimeStatus, 'verified')

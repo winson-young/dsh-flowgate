@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -19,6 +19,10 @@ const testSuites = [
   ['client', 'test:client', completed],
   ['install', 'test:install:fixture', completed],
   ['layout', 'test:layout', /"checks": 25\s*}/m],
+  // 发布脚本的用例接在这里。但只有工作副本里真有那个测试文件时才接：
+  // test/test-runner.test.mjs 的 fixture 只复制 scripts/ 与 lib/，不复制 test/，
+  // 按存在与否决定接入，才不会把那个 fixture 的汇总行数与顺序打乱。
+  ...(existsSync(root + 'test/publish.test.mjs') ? [['publish', 'test:publish', tap]] : []),
 ].map(([name, script, completion]) => ({ name, script, command: scripts[script], completion }))
 
 export const suites = [

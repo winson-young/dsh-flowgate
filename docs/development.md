@@ -368,7 +368,7 @@ S4 退回只有 S2 一个目标，所以「AC 本身测不了」的缺口回 S2 
 | 安装方式 | 改代码之后 |
 | :--- | :--- |
 | `link:D:/Projects/dsh-flowgate` | 保存即生效（重启 DSH 后）。开发期方便，但**运行中的插件就是正在改的这份代码**，改坏了没有退路 |
-| `file:D:/Plugins/flowgate-pkg/dsh-flowgate-x.y.z.tgz` | 不生效。要跑 `node scripts/publish.mjs` 重新打包并 `pnpm install` 才换上 |
+| `file:D:/Plugins/flowgate-pkg/dsh-flowgate-x.y.z-YYYYMMDDTHHMM.tgz` | 不生效。要跑 `node scripts/publish.mjs` 重新打包并 `pnpm install` 才换上 |
 
 `file:` 安装是复制内容，不会同步源码改动。插件本身在有 bug 的版本上开发插件，会踩到「用有 bug 的守卫修这个守卫」——判定规则一边改一边生效，改错时连正确的调用都可能被自己的半成品规则拦下。所以**改插件自己的代码时推荐 `file:` 安装**，用 `link:` 只在你确实需要热调试时临时改回去。
 
@@ -382,19 +382,27 @@ desktop profile 使用 `link:D:/Projects/dsh-flowgate` 时会直接指向本项�
 
 ### 发布到 `file:` 安装
 
-`node scripts/publish.mjs` 做三件事：跑一遍 `npm test`、把当前工作副本打包到发布目录、把 profile 的依赖声明指向新包。它**不执行 `pnpm install`，也不重启 DSH**——什么时候真正换上，由你决定。
+`node scripts/publish.mjs` 做四件事：先比版本、跑一遍 `npm test`、把当前工作副本打包到发布目录（文件名带时间戳）、把 profile 的依赖声明指向新包。它**不执行 `pnpm install`，也不重启 DSH**——什么时候真正换上，由你决定。
 
 ```bash
-node scripts/publish.mjs                # 自测 + 打包 + 改 profile 依赖
-node scripts/publish.mjs --skip-test    # 跳过自测
+node scripts/publish.mjs                # 版本闸门 + 自测 + 打包 + 改 profile 依赖
+node scripts/publish.mjs --skip-test    # 跳过自测（跳不过版本闸门）
 node scripts/publish.mjs --no-profile   # 只打包，不动 profile
+node scripts/publish.mjs --force        # 确需重发同一版本时放行
 ```
 
 发布目录默认 `D:/Plugins/flowgate-pkg`，profile 默认 `~/.dsh/profiles/desktop`，可用 `FLOWGATE_PKG_DIR` / `FLOWGATE_PROFILE_DIR` 覆盖。脚本结束后仍需两步才生效：在 profile 目录跑 `pnpm install`，再完全退出并重启 DSH。
 
-三点必须记住：
+四步的顺序是有意的：**版本闸门排在自测之前**。忘了升 `version` 时脚本在第一步就停下，不会先花几分钟跑完测试、再生成一个和上次同名的包。
 
-- **版本号要先往上加**。`npm pack` 用 `package.json` 的 `version` 命名文件，同名会被 pnpm 判为「没有变化」而跳过解压，看起来装上了其实是旧内容。
+必须记住的几点：
+
+- **版本不递增就发布不了**。第一步扫描发布目录里同名包的版本，`package.json` 的 `version` 不高于已有最大版本就中止并报错（退出码 1，不是警告）——包名虽然带时间戳、旧包也不会被覆盖，但装上的仍是同一个版本号，pnpm 判为「没有变化」而跳过解压，看起来装上了其实是旧内容。比较的是版本号本身，`0.1.10` 高于 `0.1.9`，与文件名字典序无关。scoped 包名也认：`npm pack` 会把 `@scope/pkg` 写成 `scope-pkg-<version>.tgz`，闸门按这个写法匹配，所以 scoped 仓库里同样能判出「没升版本」。
+- **确需重发同一版本时加 `--force`**。它跳过的是「必须递增」这条检查，放行时打印 `--force：跳过版本递增检查（…），仍然继续。`；若发布目录里已有同版本包，紧跟着还会打印 `发布目录里已有 N 个 <version> 的包，这次生成带时间戳的新文件，不覆盖它们。`——旧包始终留着，`--force` 只是让这次「同版本再发一次」在日志里看得见。版本比发布目录里的最大版本**更低**时 `--force` 也放行，但那是降级不是重发：放行文案换成 `--force：package.json 的 X 比发布目录里的最大版本 Y 更低，仍然继续——这次发布会让 profile 指向一个更旧的包。`，后面再多打一句 `注意：这一版比发布目录里的最大版本低，profile 会被指向一个更旧的包。`——两种情况共用一句话的话，从日志里就看不出自己刚把 profile 降级了。
+- **包名带时间戳**。打包后文件名是 `dsh-flowgate-<version>-<YYYYMMDDTHHMM>.tgz`，同一分钟内重复发布再追加 `-2`、`-3` 序号，所以每次发布都是新文件名，不会互相覆盖；旧包原样留在发布目录里。加时间戳之前会先看包名末尾是不是正好等于 `package.json` 的 `version`：版本号自己就可能带一个形如 `1.0.0-20261126T1000` 的 prerelease，那串字符是版本的一部分、不是上一轮发布加的时间戳，剥掉会让包名与 `version` 对不上号，而闸门正是按文件名解析版本的——这种情况原样保留。
+- **发布结束打印本次包的 sha256**。它只供人工核对，不参与「要不要重发」的判断——那由版本闸门决定，指纹是留给人对照的。
+- **`--no-profile` 时 profile 一个字都不动**。spec 只打印在日志里，要生效得自己抄进 profile 的 `dependencies`；所以这种情况下收尾不会再让你 `cd` 进 profile 跑 `pnpm install`——依赖声明还指着旧包，照做只会装回旧版。
+- **出错时说清是哪个文件、包打好没有**。profile 的 `package.json` 读不了或顶层不是对象，报「读不了 <路径>」并退出，同时打出已打好的包路径与手动接法；`FLOWGATE_PKG_DIR` 指向一个普通文件时报「读不了发布目录 <路径>」；发布目录建不出来（只读磁盘、没有写权限、父路径是个文件）时报「建不了发布目录 <路径>」，并说明版本闸门与自测都已经通过、只差一个可写的目录。这几种情况都不甩 Node 的裸调用栈。profile 的 `dependencies` 必须是普通对象（是数组时 `JSON.stringify` 只序列化索引项，写回去的文件里根本没有这条依赖），`dsh.profile.bundles` 只在确实是数组时才谈得上「含不含」——写成字符串时 `includes` 会做子串匹配，`other,dsh-flowgate` 也会让检查静默通过，所以这种情况下明说「无法确认」，不靠子串蒙混。
 - **发布目录里留旧包就是回退路径**。新版有问题时把 profile 的依赖指回上一个 `tgz`，再 `pnpm install` 并重启即可，不要删历史包。
 - **流程数据不在插件目录**。`.dsh-flowgate/` 在流程所在工作区下，换安装方式不影响已有流程快照。
 
