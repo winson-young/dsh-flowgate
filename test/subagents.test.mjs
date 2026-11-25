@@ -950,6 +950,112 @@ await test('手工与子代理同一批坏发现给出相同缺项清单并保�
 })
 
 for (const sample of [
+  { name: '缺失 verdict，文本报告', count: 201, format: 'text' },
+  { name: '非法 verdict，文本报告', count: 205, format: 'text', verdict: 'UNKNOWN' },
+  { name: '缺失 verdict，structured 报告', count: 205, format: 'structured' },
+  { name: '非法 verdict，structured 报告', count: 201, format: 'structured', verdict: 'UNKNOWN' },
+]) {
+  await test('AC-3 原始发现超限优先于 verdict 校验：' + sample.name, async () => {
+    const expectedError = '这些评审角度的发现超过单角度上限 200 条：正确性 ' + sample.count + ' 条；请缩减到上限以内后重新提交整份报告。'
+    const findings = Array.from({ length: sample.count }, () => ({ severity: 'UNKNOWN' }))
+    const verdictFields = Object.hasOwn(sample, 'verdict') ? { verdict: sample.verdict } : {}
+    await fixture({ response: (activation) => {
+      const report = JSON.parse(reportForActivation(activation).output[0].text)
+      if (activation.spec.label === '评审：正确性') {
+        delete report.verdict
+        Object.assign(report, verdictFields, { findings })
+      }
+      return sample.format === 'structured'
+        ? { stopReason: 'completed', structured: report, output: [] }
+        : { stopReason: 'completed', output: [{ type: 'text', text: JSON.stringify(report) }] }
+    } }, async (host) => {
+      await host.advance()
+      let manualError
+      await assert.rejects(within(host.call('flowgate_review', {
+        angles: [{ id: 'correctness', name: '正确性', ...verdictFields, findings }],
+      }), '手工原始发现超限被拒'), (error) => {
+        assert.equal(error.message, expectedError)
+        manualError = error.message
+        return true
+      })
+      const { before } = await host.complete('review', host.call('flowgate_review_run'), { decision: 'skip' })
+      const boundary = before.review.angles.find((angle) => angle.id === 'correctness')
+      const sibling = before.review.angles.find((angle) => angle.id === 'tests')
+      assert.equal(boundary.executionError, expectedError)
+      assert.equal(boundary.executionError, manualError)
+      assert.equal(boundary.coverage, 'uncovered')
+      assert.deepEqual(boundary.findings, [])
+      assert.notEqual(sibling.coverage, 'uncovered')
+      assert.equal(sibling.executionError, undefined)
+      assert.deepEqual(sibling.findings.map((finding) => finding.summary), ['fixture finding'])
+      assert.equal(before.review.counts.total, 1)
+      assert.equal(before.review.blocking, 0)
+    })
+  })
+}
+
+await test('AC-3 子代理仅隔离超过发现上限的角度，恰好 200 条仍逐条校验证据', async () => {
+  const design = {
+    file: 'src/auth/session.ts', kind: 'design', ac: 'AC-3', evidence: 'fixture',
+    basis: { quote: 'fixture source', conflict: '缺少失败路径注释' },
+  }
+  const severe = { ...design, severity: 'MAJOR', summary: '测试质量角度的严重发现',
+    counter: { attempt: '对照文件确认已有注释是否覆盖失败路径', survived: true } }
+  const overflowing = Array.from({ length: 201 }, (_, index) => ({
+    ...severe, severity: 'CRITICAL', summary: '正确性角度的超限发现 ' + (index + 1),
+  }))
+  const atLimit = [severe, ...Array.from({ length: 199 }, (_, index) => ({
+    ...design, severity: 'MINOR', summary: '测试质量角度的轻微发现 ' + (index + 2),
+    evidence: index === 198 ? 'notInSource' : design.evidence,
+  }))]
+  const expectedError = '这些评审角度的发现超过单角度上限 200 条：正确性 201 条；请缩减到上限以内后重新提交整份报告。'
+
+  await fixture({ response: (activation) => {
+    const report = JSON.parse(reportForActivation(activation).output[0].text)
+    const findings = activation.spec.label === '评审：正确性' ? overflowing : atLimit
+    return { stopReason: 'completed', structured: { ...report, verdict: 'blocking', findings }, output: [] }
+  } }, async (host) => {
+    await host.advance('S3', { criteria: [{ id: 'AC-3', when: '提交角度结果', then: '检查发现条数' }] })
+    const manual = host.call('flowgate_review', {
+      angles: [{ id: 'correctness', name: '正确性', verdict: 'blocking', findings: overflowing }],
+    })
+    let manualError
+    await assert.rejects(within(manual, '手工报告超限被拒'), (error) => {
+      assert.equal(error.message, expectedError)
+      manualError = error.message
+      return true
+    })
+
+    const { before, value } = await host.complete('review', host.call('flowgate_review_run'), { decision: 'back', to: 'S2' })
+    const { angles, blocking, counts } = before.review
+    assert.equal(angles.length, 2)
+    const overflowAngle = angles.find((angle) => angle.id === 'correctness')
+    const validAngle = angles.find((angle) => angle.id === 'tests')
+    assert.equal(overflowAngle.coverage, 'uncovered')
+    assert.equal(overflowAngle.executionError, manualError)
+    assert.deepEqual(overflowAngle.findings, [])
+
+    assert.notEqual(validAngle.coverage, 'uncovered')
+    assert.equal(validAngle.executionError, undefined)
+    assert.equal(validAngle.verdict, 'blocking')
+    assert.deepEqual(validAngle.findings.map((finding) => finding.summary), atLimit.map((finding) => finding.summary))
+    assert.equal(validAngle.findings[0].blocking, true)
+    assert.notEqual(validAngle.findings[0].unverified, true)
+    assert.equal(validAngle.findings[199].unverified, true)
+    assert.match(validAngle.findings[199].unverifiedReason, /notInSource/)
+    assert.equal(counts.total, 200)
+    assert.equal(counts.critical, 0)
+    assert.equal(counts.major, 1)
+    assert.equal(counts.minor, 199)
+    assert.equal(counts.unverified, 1)
+    assert.equal(counts.blocking, 1)
+    assert.equal(blocking, 1)
+    assert.equal(value.blocking, 1)
+    assert.equal(value.next, 'S2')
+  })
+})
+
+for (const sample of [
   { name: '一致', change: (report) => report, verdict: 'advisory' },
   { name: '声称通过但有发现', change: (report) => ({ ...report, verdict: 'pass' }), verdict: 'advisory', declared: 'pass' },
   { name: '零发现却声称阻塞', change: (report) => ({ ...report, verdict: 'blocking', findings: [] }), verdict: 'pass', declared: 'blocking' },

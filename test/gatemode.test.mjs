@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply } from '../lib/index.js'
@@ -23,10 +23,30 @@ async function check(name, fn) {
   }
 }
 
-function makeHost(cwd, sessionId) {
+function makeHost(cwd, sessionId, reviewFindingsFor) {
   const tools = new Map()
   const routes = []
   const handlers = new Map()
+  let guard
+  const subagents = {
+    getProvider(name) { return name === 'spawn' ? { prepareContinuable() {} } : undefined },
+    async startActivation({ childId, label }) {
+      const checkedFiles = cleanScope().files_expected_to_change
+      // 通过宿主注册的最终守卫发起读取，生成生产代码核对的读取痕迹。
+      const readEvidence = checkedFiles.map((file) => {
+        const attempt = execOf('read', { file_path: file }, undefined, childId)
+        assert.equal(guard(attempt), undefined, file)
+        const lines = readFileSync(join(cwd, file), 'utf8').trim().split(/\r?\n/)
+        return { file, firstLine: lines[0], lastLine: lines.at(-1) }
+      })
+      const text = JSON.stringify({ verdict: 'advisory', checkedFiles, readEvidence, findings: reviewFindingsFor(label) })
+      return {
+        childId,
+        result: Promise.resolve({ stopReason: 'completed', output: [{ type: 'text', text }] }),
+        async dispose() {},
+      }
+    },
+  }
   const shell = {
     resolve(request) {
       return { ...request, resolved: true }
@@ -55,11 +75,16 @@ function makeHost(cwd, sessionId) {
     },
     get(name) {
       if (name === 'shell') return shell
+      if (name === 'subagents' && reviewFindingsFor) return subagents
       if (name === 'sessions') return { get: (id) => ({ header: { id, cwd } }) }
       if (name === 'agents') return { get: (id) => ({ followup: () => {} }) }
       return undefined
     },
     tools: {
+      guard(check) {
+        guard = check
+        return () => { guard = undefined }
+      },
       register(definition) {
         tools.set(definition.name, definition)
         return () => {}
@@ -76,10 +101,10 @@ function makeHost(cwd, sessionId) {
   }
   apply({ inject: (_names, cb) => cb(scoped) })
 
-  const execOf = (name, args, signal) => ({
+  const execOf = (name, args, signal, id = sessionId) => ({
     name,
     arguments: args,
-    agent: { session: { header: { id: sessionId, cwd } } },
+    agent: { session: { header: { id, cwd } } },
     signal,
   })
 
@@ -349,6 +374,84 @@ await check('评审证据门禁：多角度只拦未核实的那个并只记它�
   assert.deepEqual((await host.state()).review.skippedUnverified ?? [], ['correctness'])
   await review
 })
+
+// AC-3 从子代理文本报告入口走到状态与确认 API，覆盖超限角度与有效角度共存。
+for (const count of [201, 200]) {
+  await check('AC-3 子代理评审门禁：单角度 ' + count + ' 条发现', async () => {
+    const host = makeHost(freshCwd(), 'sess-review-limit-' + count, (label) => {
+      if (label === '评审：正确性') {
+        return Array.from({ length: count }, (_, index) => reviewFinding({ summary: '边界发现 ' + (index + 1) }))
+      }
+      return [reviewFinding({ summary: '另一角度的有效发现' })]
+    })
+    await host.tool('flowgate_start', { brief: '验证子代理评审发现上限', preset: 'fast' })
+    assert.equal((await host.tool('flowgate_doc', { html: '<p>评审发现上限</p>', scope: cleanScope() })).frozen, true)
+    assert.equal((await host.tool('flowgate_gate', {})).next, 'S3')
+
+    const controller = new AbortController()
+    const review = host.tool('flowgate_review_run', {}, { signal: controller.signal })
+    // 在状态查询期间已拒绝时避免未处理的拒绝，最终仍直接等待原调用。
+    void review.catch(() => {})
+    try {
+      await tick()
+      const state = await host.state()
+      assert.equal(state.review?.by, 'subagents')
+      assert.equal(state.review.angles.length, 2)
+      const boundary = state.review.angles.find((angle) => angle.id === 'correctness')
+      const sibling = state.review.angles.find((angle) => angle.id === 'tests')
+      assert.notEqual(sibling.coverage, 'uncovered')
+      assert.equal(sibling.executionError, undefined)
+      assert.deepEqual(sibling.findings.map((finding) => finding.summary), ['另一角度的有效发现'])
+      assert.equal(state.review.blocking, 0)
+      const expectedTotal = count === 201 ? 1 : 201
+      assert.equal(state.review.counts.total, expectedTotal)
+      assert.equal(state.review.counts.minor, expectedTotal)
+      assert.equal(state.review.counts.advisories, expectedTotal)
+      assert.equal(state.review.counts.unverified, 0)
+
+      if (count === 201) {
+        assert.equal(boundary.coverage, 'uncovered')
+        assert.match(boundary.executionError, /正确性.*201.*条/)
+        assert.deepEqual(boundary.findings, [])
+        assert.equal(state.stage, 'S3')
+        assert.equal(state.waitingKind, 'gate')
+        assert.equal(state.autoPassed?.S3, undefined)
+        const blocked = await host.act('gate', { decision: 'pass' })
+        assert.equal(blocked.status, 409, JSON.stringify(blocked.body))
+        const uncoveredDiagnostic = '评审角度仍有目标文件未检查、读取失败或证据字段不完整'
+        const reviewAdvice = '请重新评审，不能通过评审'
+        assert.ok(state.gateBlockers?.items.some((reason) => reason.includes(uncoveredDiagnostic) && reason.includes(reviewAdvice)),
+          '自动通过拒绝理由必须包含既有未覆盖角度诊断与重评建议')
+        assert.ok(blocked.body.error.includes(uncoveredDiagnostic), '普通通过拒绝理由必须包含既有未覆盖角度诊断')
+        assert.ok(blocked.body.error.includes(reviewAdvice), '普通通过拒绝理由必须包含重评建议')
+        assert.ok(state.gateBlockers?.items.includes(blocked.body.error), '自动与普通通过应由同一原因拦截')
+        assert.equal((await host.state()).stage, 'S3')
+
+        const skipped = await host.act('gate', { decision: 'skip' })
+        assert.equal(skipped.status, 200, JSON.stringify(skipped.body))
+      } else {
+        assert.notEqual(boundary.coverage, 'uncovered')
+        assert.equal(boundary.executionError, undefined)
+        assert.deepEqual(boundary.findings.map((finding) => finding.summary),
+          Array.from({ length: count }, (_, index) => '边界发现 ' + (index + 1)))
+        assert.ok(state.autoPassed?.S3)
+        assert.equal(state.stage, 'S4')
+      }
+      const result = await review
+      assert.equal(result.decision, count === 201 ? 'skip' : 'pass')
+      assert.equal(result.next, 'S4')
+      if (count === 201) {
+        const after = await host.state()
+        assert.equal(after.stages.find((stage) => stage.id === 'S3').status, 'skipped_by_user')
+        assert.deepEqual(after.review.skippedUnverified ?? [], [])
+        assert.equal(after.review.angles.find((angle) => angle.id === 'correctness').coverage, 'uncovered')
+      }
+    } finally {
+      controller.abort()
+      await review.catch(() => {})
+    }
+  })
+}
 
 console.log('\n全部通过：' + passed + ' 项')
 if (failures.length) {

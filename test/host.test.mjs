@@ -4599,24 +4599,154 @@ async function provenanceFixture(label) {
   } finally { rmSync(fx.ws, { recursive: true, force: true }) }
 }
 
+// AC1：范围外的严重发现仍保留展示严重度，只有已核实项能触发升档回退。
+for (const severity of ['MAJOR', 'CRITICAL']) {
+  for (const mixed of [false, true]) {
+    const fx = await provenanceFixture('outside-evidence-' + severity + '-' + mixed)
+    try {
+      writeFileSync(join(fx.ws, 'src/outside.mjs'), 'export const outside = true\n')
+      const unverified = reviewFinding({ file: 'src/outside.mjs', severity, evidence: 'missingOutside', summary: '未核实的范围外发现' })
+      const verified = reviewFinding({ file: 'src/outside.mjs', severity, evidence: 'outside', summary: '已核实的范围外发现' })
+      const pending = fx.px.tool('flowgate_review', { angles: [{ id: 'correctness', name: '正确性', verdict: 'blocking',
+        findings: mixed ? [unverified, verified] : [unverified] }] })
+      await tick()
+      const before = await fx.state()
+      const waiter = currentService().gates.waiters.get(fx.sid)
+      const expectedOutside = mixed ? [{ file: 'src/outside.mjs', severity, angle: '正确性' }] : []
+      check('AC1 ' + severity + (mixed ? ' 混合证据' : ' 仅未核实') + '保留严重度、范围与未核实原因', () => {
+        const findings = before.review.angles[0].findings
+        assert.equal(findings.length, mixed ? 2 : 1)
+        assert.ok(findings.every((item) => item.severity === severity && item.fileInScope === false && item.blocking === false))
+        assert.equal(findings[0].unverified, true)
+        assert.match(findings[0].unverifiedReason, /evidence 标识符 missingOutside 不在/)
+        if (mixed) assert.equal(findings[1].unverified, undefined)
+        assert.equal(before.review.counts.blocking, 0)
+        assert.equal(before.review.counts.advisories, findings.length)
+        assert.equal(before.review.counts.unverifiedSevere, 1)
+        assert.deepEqual(before.reviewOutsideScope, expectedOutside)
+        assert.ok(waiter)
+      })
+      const upgraded = await fx.act('upgrade', { preset: 'strict' })
+      check('AC1 ' + severity + (mixed ? ' 混合证据升档回 S1' : ' 仅未核实升档留 S3'), () => {
+        assert.equal(upgraded.status, 200)
+        assert.equal(upgraded.body.preset, 'strict')
+        assert.equal(upgraded.body.stage, mixed ? 'S1' : 'S3')
+        assert.deepEqual(upgraded.body.reviewOutsideScope, expectedOutside)
+        if (!mixed) {
+          assert.deepEqual(upgraded.body.review, before.review)
+          assert.deepEqual(upgraded.body.gate, before.gate)
+          assert.equal(currentService().gates.waiters.get(fx.sid), waiter)
+        } else {
+          assert.equal(upgraded.body.scope.frozen, false)
+          assert.equal(upgraded.body.review, null)
+        }
+      })
+      if (mixed) {
+        const result = await pending
+        assert.equal(result.decision, 'interrupted')
+        assert.equal(result.next, 'S1')
+      }
+      await fx.px.tool('flowgate_cancel', {})
+      if (!mixed) await pending
+    } finally { rmSync(fx.ws, { recursive: true, force: true }) }
+  }
+}
+
+// AC2：上限按原始数组预检；拒绝整份提交，不改旧报告或其门禁等待。
 {
-  const fx = await provenanceFixture('hard-cap-severity')
+  const fx = await provenanceFixture('hard-cap-atomic')
   try {
-    const findings = ['CRITICAL', 'MAJOR', 'MINOR'].flatMap((severity, index) =>
-      Array.from({ length: [201, 2, 3][index] }, (_, i) => ({ file: 'src/session.mjs', ac: 'AC-1', severity, summary: severity + ' ' + i,
-        kind: 'defect', line: 1, evidence: 'response',
-        repro: { when: '会话过期后发请求', expected: '返回 401', actual: '返回 200' },
-        ...(severity === 'MINOR' ? {} : { counter: { attempt: '我尝试证明过期响应不受此分支影响', survived: true } }) })))
-    const pending = fx.px.tool('flowgate_review', { angles: [{ id: 'correctness', name: '正确性', verdict: 'blocking', findings }] })
+    const base = reviewFinding({ file: 'src/session.mjs', evidence: 'response' })
+    const valid = Array.from({ length: 197 }, (_, i) => ({ ...base, severity: i === 0 ? 'MINOR' : 'MAJOR', summary: '有效发现 ' + i }))
+    const findings = [...valid, { ...base, severity: 'CRITICAL', evidence: 'missingResponse' },
+      { ...base, line: 999 }, { ...base, evidence: undefined }]
+    const angle = (name, items, id = 'correctness') => ({ id, name, verdict: 'blocking', findings: items })
+    const pending = fx.px.tool('flowgate_review', { angles: [angle('原报告', findings)] })
     await tick()
-    const view = await fx.state()
-    check('硬上限省略项保留原严重度与阻塞数量，不能合成 MINOR 或丢失分级', () => {
-      assert.equal(view.review.angles[0].findings.length, 200)
-      assert.deepEqual(view.review.counts, { total: 206, critical: 201, major: 2, minor: 3, blocking: 203, advisories: 3, unscoped: 0, unverified: 0, unverifiedSevere: 0 })
-      assert.deepEqual(view.review.angles[0].omittedCounts, { total: 6, critical: 1, major: 2, minor: 3, blocking: 3, advisories: 3, unscoped: 0, unverified: 0, unverifiedSevere: 0 })
+    const before = await fx.state()
+    const service = currentService()
+    const flow = service.get(fx.sid)
+    const oldReview = flow.review
+    const waiter = service.gates.waiters.get(fx.sid)
+    const file = join(fx.ws, '.dsh-flowgate', 'flows', flow.id + '.json')
+    const disk = readFileSync(file, 'utf8')
+    const auditFile = join(fx.ws, '.dsh-flowgate', 'flows.jsonl')
+    const audit = readFileSync(auditFile, 'utf8')
+    check('AC2 200 条仍逐条校验证据与缺失字段，不静默跳过校验', () => {
+      const stored = before.review.angles[0]
+      assert.equal(findings.length, 200)
+      assert.equal(stored.findings.length, 199)
+      assert.equal(stored.rejectedFindings.length, 1)
+      assert.equal(stored.rejectedFindings[0].index, 199)
+      assert.ok(stored.rejectedFindings[0].missing.includes('evidence'))
+      assert.equal(before.review.counts.total, 199)
+      assert.equal(before.review.counts.blocking, 196)
+      assert.equal(before.review.counts.advisories, 3)
+      assert.equal(before.review.counts.unverified, 2)
+      assert.equal(before.review.counts.unverifiedSevere, 2)
+      assert.ok(stored.findings.some((item) => item.severity === 'CRITICAL' && /missingResponse/.test(item.unverifiedReason)))
+      assert.ok(stored.findings.some((item) => /line 999 超出/.test(item.unverifiedReason)))
+      assert.equal(Object.hasOwn(stored, 'omittedCounts'), false)
+      assert.ok(waiter)
+      assert.equal(before.waiting, true)
+      assert.equal(before.waitingKind, 'gate')
+      assert.deepEqual(JSON.parse(disk).review, before.review)
     })
-    assert.equal((await fx.act('gate', { decision: 'back', to: 'S2' })).status, 200)
+    const overflow = (count) => Array.from({ length: count }, () => ({ ...base }))
+    const prefix = '这些评审角度的发现超过单角度上限 200 条：'
+    const suffix = '；请缩减到上限以内后重新提交整份报告。'
+    const longNames = Array.from({ length: 12 }, (_, i) => '角度' + i + '长'.repeat(200))
+    const longListed = longNames.slice(0, 10).map((name, i) => name.slice(0, 120) + '…（超长已截断） ' + (201 + i) + ' 条')
+    const asciiPrefix = 'x'.repeat(119)
+    const cases = [
+      { label: '201 整份拒绝', angles: [angle('正确性', overflow(201))], message: prefix + '正确性 201 条' + suffix },
+      { label: '空白名称回退到去除首尾空白的 id',
+        angles: [angle(' \t ', overflow(201), ' correctness ')],
+        message: prefix + 'correctness 201 条' + suffix },
+      { label: '长名称去除首尾空白后在 emoji 前截断',
+        angles: [angle(' ' + asciiPrefix + '😀 ', overflow(201))],
+        message: prefix + asciiPrefix + '…（超长已截断） 201 条' + suffix },
+      { label: '多角度只有一个超限', angles: [angle('合格角度', valid), angle('安全性', overflow(201), 'safety')], message: prefix + '安全性 201 条' + suffix },
+      { label: '所有超限角度均列入错误', angles: [angle('正确性', overflow(201)), angle('安全性', overflow(202), 'safety')], message: prefix + '正确性 201 条、安全性 202 条' + suffix },
+      { label: '长名称限 120 且只列前十角度和剩余数量',
+        angles: longNames.map((name, i) => angle(name, overflow(201 + i), 'angle-' + i)),
+        message: prefix + [...longListed, '另有 2 个角度超限'].join('、') + suffix },
+      { label: '无效发现仍按原始数组长度计数', angles: [angle('无效发现', Array.from({ length: 201 }, (_, i) => i % 2 ? {} : null))], message: prefix + '无效发现 201 条' + suffix },
+    ]
+    for (const item of cases) {
+      const error = await fx.px.tool('flowgate_review', { angles: item.angles }).catch((error) => error)
+      const after = await fx.state()
+      check('AC2 ' + item.label + '，报告、磁盘和等待器原样保留', () => {
+        assert.ok(error instanceof RangeError)
+        assert.equal(error.message, item.message)
+        assert.ok(error.message.length <= 2000 + '…（超长已截断）'.length)
+        assert.equal(flow.review, oldReview)
+        assert.deepEqual(after.review, before.review)
+        assert.equal(after.stage, before.stage)
+        assert.deepEqual(after.stages, before.stages)
+        assert.deepEqual(after.gate, before.gate)
+        assert.equal(after.waiting, before.waiting)
+        assert.equal(after.waitingKind, before.waitingKind)
+        assert.equal(service.gates.waiters.get(fx.sid), waiter)
+        assert.equal(readFileSync(file, 'utf8'), disk)
+        assert.equal(readFileSync(auditFile, 'utf8'), audit)
+      })
+    }
+    const reduced = fx.px.tool('flowgate_review', { angles: [angle('缩减后的报告', overflow(200))] })
+    await tick()
+    const resubmitted = await fx.state()
+    check('AC2 超限报告缩减至 200 后可重新提交整份报告', () => {
+      assert.notEqual(resubmitted.review.id, before.review.id)
+      assert.equal(resubmitted.review.angles[0].name, '缩减后的报告')
+      assert.equal(resubmitted.review.angles[0].findings.length, 200)
+      assert.equal(resubmitted.review.counts.blocking, 200)
+      assert.equal(resubmitted.waiting, true)
+      assert.notEqual(service.gates.waiters.get(fx.sid), waiter)
+      assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')).review, resubmitted.review)
+    })
     await pending
+    assert.equal((await fx.act('gate', { decision: 'back', to: 'S2' })).status, 200)
+    await reduced
     await fx.px.tool('flowgate_cancel', {})
   } finally { rmSync(fx.ws, { recursive: true, force: true }) }
 }
