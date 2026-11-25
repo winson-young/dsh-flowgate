@@ -6,6 +6,37 @@
 
 历史记录中的 `by: 'subagents'` 仅表明调用了子代理聚合入口；聚合报告通过、`blocking: 0` 或流程走完，均不能证明真实子代理成功执行并返回有效报告。下文原有结论保留，其证据范围受此限定。
 
+## 运行版本可观测：status 念出版本与两侧指纹（2026-11-25）
+
+需求：用户原文「G38 运行版本不可观测：`flowgate_status` 不返回任何版本字段，验的是新版还是旧版无从确认」。插件早已算好两套指纹——宿主实际加载的模块指纹（`moduleRevisions()` 把七个模块的 `name:revision` 拼起来再 sha256）与页面实际执行的客户端指纹（`client.js` 的 factory 标记）——但只在布局证据回执这一条链路上读它。Agent 最常调用的 `flowgate_status` 返回的八个字段里一个版本信息都没有，于是在「改完必须重启才能验证」的循环里，Agent 只能相信「已经重启过了」。
+
+方案（十二轮问答定稿，含用户明确点名的三处取舍）：
+
+- **两侧判据拆开**：`lib/runtime.js` 拆出 `hostState(revisions)` 与 `clientState(reported, expected, now)`，各自只按自己的证据判定，再由 `describeRuntime(state)` 拼文案。原来的 `runtimeState()` 保留并继续返回合并态 `status`：`lib/index.js` 的 `runtimeOf`、`lib/client.js` 的视觉采集前置核对、`lib/acceptance.js` 的 `visualResult` 三处还在读它。
+- **`expectedClientRevision` 从宿主层移出**：原判定把「页面期望指纹」混进宿主层，`client.js` 一行 factory 标记损坏就会让宿主层报 `unverified`，把 Agent 引向查模块加载和重启——这条直接决定 G38 是否有效。拆开后它只影响 `clientStatus`。
+- **宿主三态**：`verified`（`hostRevision` 与 `diskHostRevision` 相等且 `stale` 为空）；`mismatch`（不等，或有模块未重新盖章）；`unverified`（读不到完整指纹或模块未登记）。
+- **页面四态**：`verified` / `mismatch` / `absent`（没有上报，含上报已过期）/ `unverified`（期望指纹读不到，或上报被拒）。`absent` 与 `unverified` 的两种来源各有独立文案，不合并成一句。
+- **非法上报记 `rejected` 而不是删除**：`/state` 路由原来对不合法上报直接 `runtimeClients.delete(sessionId)`，于是「上报了垃圾」与「根本没参与」在 status 输出里同值。改为写入 `{ rejected: true, reason, clientRevision, reportedAt }`，且不保留旧的可信记录，否则旧页面能借同会话新页面的已核对状态。`clientRevision` 截到 64 字符；`pageId` 不记（这张表的 `pageId` 只在可信上报分支被 `view()` 读且要求 `verified`，rejected 记录读不到，非法原因已写在 `reasons` 里）。
+- **过期归页面层，且排在所有记录形态之前**：`runtimeOf` 先判宿主层再判页面层，过期只在页面层落成 `absent`，不再让 `unverified` 变成三来源混合态。`clientState()` 内部的 TTL 判定也提到了 `rejected` 与 `reported` 两支之前——排在后面时，页面关掉后旧记录会把 `clientStatus` 永久钉在 `unverified`，Agent 会去查一个没在跑的页面。过期时原记录的原因降为结构化字段 `rejectedReason` / `reportedWithoutRevision` 保留，由 `describeRuntime` 的 `expiredNote()` 补在文案末尾。`clientState` 返回的 `expired` 也是结构化标记，`describeRuntime` 不再用 `reason.includes('过期')` 做字符串匹配；`reason` 里也不再拼「；另：上报被拒（…）」，一半结构化一半拼串同样算断。
+- **TTL 只在一处判定**：`clientState()` 判过期，`runtimeOf()` 不再用 `Date.now() - page.reportedAt <= CLIENT_REPORT_TTL` 判第二遍。两处各比一次时阈值一旦漂移，页面层与合并层会对「过期」给出不同结论，而 G38 的价值就在这两层可互相核对。合并层因此只看 `client.status`；`verified` 却缺 pageId / 视口时按「页面实例不全」念，不借用「已核对」的文案。
+- **版本字段只有一处产出**：新增 `runtimeFields(version, host, client)`，`status` 的两个分支、`summary` 首行、`view()` 的 `runtime` 全部从它取；`STATUS_RUNTIME_KEYS` 定名单、`pickRuntime` 按名单挑字段。`describeRuntime` 只认对外名 `moduleRevision` / `diskModuleRevision`，删掉 `diskModuleRevision ?? diskHostRevision` 兜底；`hostRevision` / `diskHostRevision` 降为内部别名，仅供 scope 外的布局证据链路。加第八个版本字段仍要动三处：`runtimeFields` 的返回值、`STATUS_RUNTIME_KEYS`、以及 `output.schema` 的 `properties` 与 `required`（`properties` 手写，漏了就被 `additionalProperties: false` 拒掉）；`test/host.test.mjs` 另有独立断言证明十二个内部字段既不进 `properties` 也不进返回值，`pickRuntime` 的剔除名单不是自证。
+- **status 增七个字段**：`version`（`package.json` 的 `version`，本次提到 0.1.4）、`moduleRevision`、`diskModuleRevision`、`runtimeStatus`、`clientRevision`、`clientStatus`、`staleModules`。全部写进 `required`，`additionalProperties` 仍为 false；无流程分支也一并带齐（`clientStatus` 为 `absent`，`runtimeStatus` 取宿主层实测）。
+- **summary 首行就是版本**：`describeRuntime` 的结果插在 `lines[0]`，位于流程标题之前。宿主 `mismatch` 时第二行逐个念出未重新盖章的模块名，并明写「加载的是旧模块，验证结论不可用」；宿主 `unverified` 时明写「无法核对」。
+
+改动范围：`lib/runtime.js`、`lib/index.js`、`package.json`、`test/runtime.test.mjs`、`test/host.test.mjs`、`test/integration.test.mjs`、`docs/verification.md`、`docs/development.md`。
+
+| 验收项 | 状态 | 证据与限制 |
+| :--- | :--- | :--- |
+| AC-1 status 在两个分支都返回七个版本字段，schema 与返回值同步 | 通过 | `test/host.test.mjs:238` 断言无流程分支七个字段的类型；同文件新增「G38 status 的 output.schema 把七个版本字段都列为 required」逐键核对 `required` 与 `properties`，并断言 `properties` 的键集合与无流程分支返回值完全一致（`additionalProperties` 为 false，多一个少一个都会当场露出来） |
+| AC-2 宿主层不受页面层拖累 | 通过 | `test/runtime.test.mjs`「宿主层只按模块指纹判定，页面侧问题不拖累它」：七个模块全通过、期望指纹为空时，宿主层仍是 `verified`，只有页面层降级为 `unverified` |
+| AC-3 页面层四态可区分 | 通过 | `test/runtime.test.mjs`「页面层四态可区分：已核对、不一致、未参与、读不懂」：五种输入依次得到 `verified` / `mismatch` / `absent` / `unverified`（期望读不到）/ `unverified`（带 `rejected` 标记），且后两种 `reason` 文本不同；同文件「被拒或没指纹的旧上报同样会过期，过期后一律 absent」断言 `rejected` 与 `reported` 两条旧记录在 30 秒后都落成 `absent`、`expired` 为 `true`，并断言原因走结构化字段（`rejectedReason` 为「指纹不是 64 位十六进制」、`reportedWithoutRevision` 为 `true`），`describeRuntime` 据此补出「上次记录被拒（…）」，未过期时仍区分 |
+| AC-4 非法上报记 `rejected` 且清掉旧可信记录 | 通过 | `test/integration.test.mjs`「非法指纹记 rejected 并清掉旧可信记录，只有完全不带上报才算没参与」：`invalid` 上报后 `clientStatus` 为 `unverified`、`runtimeStatus` 仍为 `verified`、`clientReason` 匹配「上报被拒」；同一会话不带上报再查为 `absent` |
+| AC-5 过期归 `absent` 且只判一次 | 通过 | `test/runtime.test.mjs`「上报过期归 absent 且文案写明过期，宿主层判定不受影响」：合法上报在 `1000 + CLIENT_REPORT_TTL` 仍 `verified`、`+1` 变 `absent` 且 `reason` 含「过期」，`hostState` 仍 `verified`；`rejected` / `reported` 两条旧记录同样过期归 `absent`。TTL 只在 `clientState()` 里比一次，`runtimeOf()` 不再比第二遍（`lib/index.js` 已不引用 `CLIENT_REPORT_TTL`） |
+| AC-6 summary 首行是运行版本 | 通过 | `test/host.test.mjs`「G38 有流程时 status 首行是运行版本」断言 `summary.split('\n')[0]` 以 `运行版本：` 开头、含 `host xxxxxxxx（与磁盘一致）`；mismatch 与 unverified 两支文案由 `test/runtime.test.mjs` 的文案夹具覆盖，含逐个念出未盖章模块名 |
+| AC-7 文案函数可用纯对象断言 | 通过 | `describeRuntime` 只做字符串拼接，`test/runtime.test.mjs` 不启动页面、不加载真实模块，直接传普通对象断言首行 |
+| AC-8 version 等于 package.json 且已提升到 0.1.4 | 通过 | `test/runtime.test.mjs`「插件版本号来自 package.json」读盘比对；`test/host.test.mjs` 两个分支都断言 `version` 匹配 `^\d+\.\d+\.\d+$` |
+| AC-9 全量测试与盖章校验 | 见限制 | 盖章校验 `--check` 报七个模块通过；全量测试的实测结果与本机两处既有失败见下方限制 |
+
 ## 命令判定绑定换行与执行目录（2026-11-24）
 
 需求：用户原文「G02 命令判定看到的不是完整命令：漏了换行，也不看它在哪个目录下跑」。两处缺陷：`SHELL_ESCAPE_HINTS` 的字符类里没有 `\r\n`，而 shell 确实把换行当命令分隔符——审批器可能只认可第一行，执行器却会读取全部输入；`shellDenial` 只取 `args.command`，`scopeCommandMatches` 只比 `head.name` 与 `rest`，没有 cwd 维度，`working_directory` 又在 `PASSIVE_TOOLS` 里任何阶段都能 cd。合起来：批准过的命令与实际执行的命令之间没有绑定关系，而撤销授权、事后追责都依赖这个绑定。

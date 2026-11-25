@@ -234,6 +234,40 @@ console.log('flowgate host 单测')
 
 const status0 = await runTool('flowgate_status', {})
 check('无流程时 status 返回 active=false', () => assert.equal(status0.active, false))
+// G38：没有流程时也要能确认「验的是哪一版」，否则 Agent 连自己跑的是不是刚发布的那一版都不知道。
+check('G38 无流程时 status 也带齐七个版本字段', () => {
+  // AC-8：版本号必须来自 package.json，且本次已提升——写成常量会把「没读盘」也断言成通过。
+  assert.equal(status0.version, JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version)
+  assert.equal(status0.version, '0.1.4')
+  assert.match(status0.moduleRevision, /^[a-f0-9]{64}$/)
+  assert.equal(status0.diskModuleRevision, status0.moduleRevision)
+  assert.equal(status0.runtimeStatus, 'verified')
+  assert.equal(status0.clientRevision, '')
+  assert.equal(status0.clientStatus, 'absent')
+  assert.deepEqual(status0.staleModules, [])
+  // AC-6：没有流程时 summary 也必须首行念版本——接手任务的那一刻往往还没启动流程。
+  assert.equal(status0.summary.split('\n')[0].startsWith('运行版本：'), true)
+  assert.match(status0.summary.split('\n')[0], /host [a-f0-9]{8}（与磁盘一致）/)
+  assert.match(status0.summary, /当前会话还没有流程/)
+})
+// AC-1：schema 与返回值必须同时增字段——additionalProperties 为 false，漏写 required 时宿主侧会拒收。
+check('G38 status 的 output.schema 把七个版本字段都列为 required', () => {
+  const schema = host.tools.get('flowgate_status').output.schema
+  const added = ['version', 'moduleRevision', 'diskModuleRevision', 'runtimeStatus', 'clientRevision', 'clientStatus', 'staleModules']
+  assert.equal(schema.additionalProperties, false)
+  for (const key of added) {
+    assert.ok(schema.required.includes(key), 'required 缺 ' + key)
+    assert.ok(schema.properties[key], 'properties 缺 ' + key)
+  }
+  assert.deepEqual(Object.keys(schema.properties).sort(), [...Object.keys(status0)].sort())
+  // 键集合全等挡不住「properties 里误加内部字段」——那种情况下两边同样相等。
+  // 这里独立证明内部字段既不进契约也不进返回值，pickRuntime 的剔除名单才真的有效。
+  const internal = ['expectedClientRevision', 'clientReason', 'clientExpired', 'clientRejectedReason', 'clientReportedWithoutRevision', 'hostRevision', 'diskHostRevision', 'stale', 'hostStatus', 'pageId', 'viewport', 'layoutEvidence']
+  for (const key of internal) {
+    assert.equal(Object.prototype.hasOwnProperty.call(schema.properties, key), false, 'properties 不该含内部字段 ' + key)
+    assert.equal(Object.prototype.hasOwnProperty.call(status0, key), false, 'status 返回值不该含内部字段 ' + key)
+  }
+})
 
 const started = await runTool('flowgate_start', { title: '会话过期检测', preset: 'fast' })
 check('start 进入 S1', () => assert.equal(started.stage, 'S1'))
@@ -1160,6 +1194,20 @@ const statusS2 = await runTool('flowgate_status', {})
 check('PRD 4.5 S2 的 status 给出逐条检查清单', () => {
   assert.match(statusS2.summary, /开发规则检查清单/)
   assert.match(statusS2.summary, /只改 scope 内的文件/)
+})
+// G38：summary 首行必须是运行版本，Agent 第一眼就能看到验的是哪一版。
+check('G38 有流程时 status 首行是运行版本', () => {
+  assert.equal(statusS2.summary.split('\n')[0].startsWith('运行版本：'), true)
+  assert.match(statusS2.summary.split('\n')[0], /host [a-f0-9]{8}（与磁盘一致）/)
+  assert.match(statusS2.version, /^\d+\.\d+\.\d+$/)
+  assert.match(statusS2.moduleRevision, /^[a-f0-9]{64}$/)
+  assert.equal(statusS2.diskModuleRevision, statusS2.moduleRevision)
+  assert.equal(statusS2.runtimeStatus, 'verified')
+  assert.ok(['verified', 'mismatch', 'absent', 'unverified'].includes(statusS2.clientStatus))
+  assert.ok(Array.isArray(statusS2.staleModules))
+  // 键集合必须与 schema 全等：只在有流程分支多给字段时，additionalProperties:false 会在宿主侧拒收。
+  const schemaBoth = host.tools.get('flowgate_status').output.schema
+  assert.deepEqual(Object.keys(statusS2).sort(), Object.keys(schemaBoth.properties).sort())
 })
 
 const ruleOff = await postAction('toggleRule', { id: 'no-debug-leftovers', enabled: false })

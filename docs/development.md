@@ -301,6 +301,22 @@ S4 退回只有 S2 一个目标，所以「AC 本身测不了」的缺口回 S2 
 
 服务一律 `ctx.get(name)` 软取，不写进 `exports.inject`：本插件可能先于 `ui-workspace` 激活，且缺服务时插件其余部分必须照常工作。缺 `workspaces` 时「添加工作区」没有候选（只剩「添加目录…」可用）、登记会报错；缺 `uiWorkspace` 时目录选择器不弹（返回 `null`）、「打开会话」提示从左侧栏进入。`workspaces.list` 传给面板的时机也推迟到 `main` 的 inject factory 首次运行（面板挂载时），避免在插件 apply 阶段拿到 `undefined`。
 
+## 运行版本可观测
+
+插件在运行时算两套指纹，`flowgate_status` 每次调用都把它们念出来，Agent 不必相信「已经重启过了」。
+
+- **宿主侧**：`moduleRevisions()` 读出七个模块已加载的 `name:revision` 拼起来再取 sha256，同时按磁盘源码独立算一遍 `diskHostRevision`。`hostState()` 只按这两者判定——相等且 `stale` 为空是 `verified`，不等或有模块没重新盖章是 `mismatch`，读不到完整指纹或模块未登记是 `unverified`。
+- **页面侧**：`client.js` 里 `flowgate-factory` 起止标记之间的源码算出的指纹是页面实际执行的那一份，页面上报后宿主按 30 秒 TTL 验收。`clientState()` 分四态：`verified`、`mismatch`、`absent`（没有上报，含上报过期）、`unverified`（期望指纹读不到，或页面参与了轮询却没有指纹可报，或上报被拒）。三种 unverified 的文案各不相同：标记缺失念「页面源码标记缺失」，页面上报被拒念「上报被拒」。
+- **过期判定排在所有记录形态之前**：TTL 检查必须早于 `rejected` 与 `reported` 两支。排在后面时，页面关掉之后那条旧记录会一直把 `clientStatus` 钉在 `unverified`——`absent` 与 `unverified` 的分界变成「历史上报过垃圾」而不是「现在有没有在跑」，Agent 会去查一个根本没在跑的页面。过期后一律返回 `absent`，原记录的原因降为结构化字段 `rejectedReason` / `reportedWithoutRevision` 留着排查，由 `describeRuntime` 的 `expiredNote()` 在文案末尾补一句；不再往 `reason` 里拼「；另：上报被拒（…）」，也不再从 `reason` 里正则捞。`clientState` 返回的 `expired` 同样是结构化标记——改文案就断的判定不算判定，一半结构化一半拼串同样算断。
+- **TTL 只在一处判定**：`clientState()` 判过期，`runtimeOf()` 不再用 `Date.now() - page.reportedAt <= CLIENT_REPORT_TTL` 判第二遍。两处各比一次时，阈值一旦漂移，页面层与合并层就会对「过期」给出不同结论，而 G38 的全部价值就在这两层结论可互相核对。合并层因此只看 `client.status`：`verified` 即没过期，`verified` 却缺 pageId / 视口时按「页面实例不全」念，不借用「已核对」的文案。
+- **两侧互不拖累**：期望指纹的读取从宿主层判据里移出去了。`client.js` 的 factory 标记损坏只会让 `clientStatus` 变成 `unverified`，`runtimeStatus` 照旧按模块指纹给结论——混在一起时，一行页面源码就能把 Agent 引去查模块加载和重启。
+- **保留合并态**：`runtimeState()` 仍然返回合并后的 `status`，`lib/index.js` 的 `runtimeOf`、`lib/client.js` 的视觉采集前置核对、`lib/acceptance.js` 的 `visualResult` 三处继续读它。新代码优先用 `hostState` / `clientState`，需要一句话文案时用 `describeRuntime`。
+- **上报被拒与没参与不是一件事**：`/state` 收到不合法上报时写入 `{ rejected: true, reason, clientRevision, reportedAt }` 而不是删记录，也不保留旧的可信记录。删记录会让「上报了垃圾」与「根本没参与」在输出里同值，而这两件事的排查方向完全相反。只有参数存在且格式非法时才记 rejected。`clientRevision` 落内存前截到 64 字符；`pageId` 干脆不记——这张表的 `pageId` 只在可信上报分支被 `view()` 读（且要求 `status` 为 `verified`），rejected 记录永远读不到，哪个参数不合法已经写在 `reasons` 里。
+- **「没有指纹」与「指纹非法」也要分开**：factory 标记损坏时 client.js 压根没有指纹可报，但它仍会带着 pageId 和视口来轮询。这种情况写入 reported 标记，clientState() 念成「页面参与了轮询但没有可上报的指纹，页面源码标记缺失」——念成「上报被拒」会把 Agent 引去查上报参数，而真正要查的是构建期标记。当期望指纹本身读不到时，「标记缺失」是主因，被拒原因留在结构化的 `rejectedReason` 里，不进 `reason` 拼串。
+- **版本字段只有一处产出**：`runtimeFields(version, host, client)` 统一算七个字段，`flowgate_status` 的两个分支、`summary` 首行、`view()` 的 `runtime` 都从它取；`STATUS_RUNTIME_KEYS` 定名单，`pickRuntime` 按名单挑字段返回。`describeRuntime` 只认对外名 `moduleRevision` / `diskModuleRevision`，删掉了 `diskModuleRevision ?? diskHostRevision` 的兜底。`hostRevision` / `diskHostRevision` 只作内部别名，留给 scope 外仍读旧名的布局证据链路（`lib/acceptance.js`、`lib/client.js`），不进 `status` 输出。加第八个版本字段仍要动三处：`runtimeFields` 的返回值、`STATUS_RUNTIME_KEYS`、以及 `output.schema` 的 `properties` 与 `required`——`properties` 是手写的，`additionalProperties` 为 `false` 时漏写就被宿主直接拒掉。`test/host.test.mjs` 有一组独立断言证明内部字段（`clientReason`、`clientExpired`、`hostRevision` 等十二个）既不进 `properties` 也不进返回值，`pickRuntime` 的剔除名单才不是自证。
+- **status 的七个版本字段**：`version`、`moduleRevision`、`diskModuleRevision`、`runtimeStatus`、`clientRevision`、`clientStatus`、`staleModules`，全部在 `required` 里，`additionalProperties` 仍是 `false`。没有流程时也带齐（此时 `clientStatus` 为 `absent`）。`summary` 首行固定是 `运行版本：<version> / host <前 8 位>（…） / client <前 8 位>（…）`；宿主 `mismatch` 时第二行逐个念出没重新盖章的模块名，并明写验证结论不可用。
+- **两个前提仍要人做**：改完 `lib/*.js` 必须跑盖章命令，重新加载插件才会生效。`status` 能证明的是「加载的这一份与磁盘是不是同一份」，不能代替重新加载。
+
 ## 工具索引
 
 普通使用只需操作工作台，以下供 Agent 集成和开发时查阅：
@@ -308,7 +324,7 @@ S4 退回只有 S2 一个目标，所以「AC 本身测不了」的缺口回 S2 
 | 工具 | 用途 |
 | :--- | :--- |
 | `flowgate_start` | 启动流程；`brief` 是分析依据，`title` 可省略且只用于界面显示，`preset` 选择档位 |
-| `flowgate_status` | 读取阶段、范围、规则和等待状态 |
+| `flowgate_status` | 读取阶段、范围、规则、等待状态和运行版本（`version` / `moduleRevision` / `diskModuleRevision` / `runtimeStatus` / `clientRevision` / `clientStatus` / `staleModules`） |
 | `flowgate_ask` | S1 提出决策问题，等待用户点选 |
 | `flowgate_doc` | 提交需求 HTML、scope 和档位建议，等待批准；`commands` 要从项目里读出来并配 `command_sources` |
 | `flowgate_gate` | 请求当前阶段出口门禁 |

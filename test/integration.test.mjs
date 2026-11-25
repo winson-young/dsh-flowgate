@@ -796,9 +796,33 @@ await check('state 只根据真实上报的客户端代码指纹核对页面版�
   const query = async (revision) => (await stateRoute.fetch({ url: 'http://host/api/flowgate/state?sessionId=sess-proof&clientRevision=' + revision + '&pageId=de54a6e1-b162-42c9-910a-470575847521&viewportWidth=1280&viewportHeight=800' })).json()
   assert.equal((await query(digest)).runtime.status, 'verified')
   assert.equal((await query('f'.repeat(64))).runtime.status, 'mismatch')
-  assert.equal((await query('invalid')).runtime.status, 'unverified', '非法或缺失指纹必须清除旧页面核验')
   assert.equal((await query(digest)).runtime.status, 'verified')
-  assert.equal((await getState('sess-proof')).runtime.status, 'unverified', '旧页面不带指纹不能借用同会话新页面的已核对状态')
+})
+
+// G38：非法上报必须留痕，不能和「没参与」同值——否则 status 会沉默地把垃圾读成 absent。
+await check('非法指纹记 rejected 并清掉旧可信记录，只有完全不带上报才算没参与', async () => {
+  const digest = clientFactoryRevision(readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8'))
+  const query = async (revision) => (await stateRoute.fetch({ url: 'http://host/api/flowgate/state?sessionId=sess-proof&clientRevision=' + revision + '&pageId=de54a6e1-b162-42c9-910a-470575847521&viewportWidth=1280&viewportHeight=800' })).json()
+  assert.equal((await query(digest)).runtime.status, 'verified')
+  const rejected = (await query('invalid')).runtime
+  assert.equal(rejected.status, 'unverified', '非法指纹不能被当成已核对')
+  assert.equal(rejected.clientStatus, 'unverified', 'rejected 必须与 absent 分开记')
+  assert.match(rejected.clientReason, /上报被拒/)
+  assert.equal(rejected.clientRevision, '', '非法指纹不能顶替旧的可信指纹')
+  assert.equal((await getState('sess-proof')).runtime.clientStatus, 'absent', '完全不带参数才算没参与')
+})
+
+// G38/AC-2：factory 标记损坏时客户端没有指纹可报，但仍会带 pageId+viewport 上报。
+// 端到端必须念成「页面源码标记缺失」——念成「上报被拒」会把 Agent 引去查上报参数而不是查构建标记。
+await check('页面参与了轮询却没有指纹可报时念成源码标记缺失，不是上报被拒', async () => {
+  const noMark = await (await stateRoute.fetch({ url: 'http://host/api/flowgate/state?sessionId=sess-proof&pageId=de54a6e1-b162-42c9-910a-470575847521&viewportWidth=1280&viewportHeight=800' })).json()
+  assert.equal(noMark.runtime.clientStatus, 'unverified', '参与了但读不懂，不能算没参与')
+  assert.match(noMark.runtime.clientReason, /页面源码标记缺失/)
+  assert.doesNotMatch(noMark.runtime.clientReason, /指纹不是 64 位十六进制/)
+  assert.equal(noMark.runtime.hostStatus, 'verified', '页面侧的问题不能拖累宿主层判定')
+  const invalid = await (await stateRoute.fetch({ url: 'http://host/api/flowgate/state?sessionId=sess-proof&clientRevision=zzz&pageId=de54a6e1-b162-42c9-910a-470575847521&viewportWidth=1280&viewportHeight=800' })).json()
+  assert.match(invalid.runtime.clientReason, /上报被拒/)
+  assert.match(invalid.runtime.clientReason, /指纹不是 64 位十六进制/)
 })
 
 await check('布局采集回执绑定内容、页面实例和视口，视口变化会使证据失效', async () => {
