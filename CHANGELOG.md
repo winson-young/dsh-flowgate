@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **审计流水只记「允许 / 拒绝」：权限模式、退出码与提权申请一概不落盘**：起因是 `auditShell` 的 `detail` 只有命令原文、`outcome`、`reason` 与执行目录。一次 `shell.allowed` 说不清它是在 `workspace-write` 下跑的还是 `danger-full-access` 下跑的，也说不清跑完到底成功没有——`exitCode` 不在事件里，失败与成功在流水上长得一模一样；提权更是完全不落盘：模型重试时带 `sandbox_permissions` + `justification`，判定侧只会照常写一条 `shell.allowed`，事后既看不出「这次执行是在申请放宽权限」，也看不出「放宽有没有真的生效」。三件事叠在一起，事后追责只能回到对话记录里翻，而 `flows.jsonl` 本来就是为了不依赖对话记录而存在的。
+
+  修法分三处。`auditShell(flow, command, outcome, reason, directory, mode = 'unknown')` 新增 `mode` 字段并一路穿到底：`scopeDenial` / `shellDenial` / `runCodeDenial` 各加一个 `mode` 形参（默认 `'unknown'`），pre-execute 入口用 `sandboxModeOf(exec)` 取一次再往下传，`childDenial` 那条审计也补上同一取值。取不到时（宿主没装 `sandboxPolicy`、`resolve` 抛错、返回值不在 `read-only` / `workspace-write` / `danger-full-access` 之内）一律写字符串 `'unknown'`，不省略这个键——省略会让「这次确实没有权限信息」和「这是老版本写下的事件」变成同一种形状，读流水的人没法区分。
+
+  执行结果另起一条事件。新增 `tools/result` 监听（effect 名 `flowgate: shell result audit`），对 `SHELL_TOOLS` 里的工具写 `shell.result`，`detail` 带 `command` / `truncated` / `exitCode`（非整数写 `null`，后台任务与超时都是这个形状）/ `signal` / `timedOut` / `background`（`value.kind === 'background'` 或 `value.jobId` 是字符串）/ `mode`（优先取结果里的 `value.sandbox.mode`，取不到回落到 `sandboxModeOf(exec)`），另有 `sandboxDenied` 与 `failed` 两个只在成立时出现的键。判定与结果是两条事件，不合并：判定发生在执行前、结果发生在执行后，中间可能隔着一次提权重试，合成一条会丢掉「这一轮被判了两次」这个事实。
+
+  提权拆成申请与结论两条。`sandbox_permissions` 落在 `SANDBOX_MODES` 之内时，pre-execute 在判定之前先写 `sandbox.escalated`（`tool` / `command`（shell 工具才带，截断到 200 字）/ `from` / `to` / `justification`），主 Agent 与子代理都记；`tools/result` 里再按结果写结论——结果里实际生效的 `value.sandbox.mode` 等于目标就写 `sandbox.approved`，否则写 `sandbox.denied` 并在 `detail.reason` 写明「提权未生效」。宿主没有可监听的独立提权事件，结论只能从「请求的目标」与「实际生效的模式」两边比对得出，而这两个值现在都落进了流水。
+
+  测试：`test/integration.test.mjs` 新增「审计流水记录权限模式、退出码与提权申请」，断言放行事件的 `detail.mode` 是 `'unknown'`（夹具宿主没有 `sandboxPolicy`，取不到就该写这个字面量）、`tools/result` 监听已注册、`exitCode: 3` 的结果事件、后台任务那条 `exitCode` 为 `null` 且 `background === true`、带 `sandbox_permissions` 的调用写出 `sandbox.escalated` 且 `from` 与 `to` 分别是 `'unknown'` 与目标模式、同一窗口内判定侧照旧有一条 `shell.allowed`（两条事件可以分别过滤），以及 `effective` 命中与未命中分别落成 `sandbox.approved` / `sandbox.denied`。既有断言一条没放宽：`test/subagents.test.mjs:418-421` 的 `deepEqual` 只映射 `[type, detail.dir, detail.cwd]`，新增字段不影响它。`node --check lib/index.js`、`npm run check`（七个模块修订通过）与 `npm test` 十三套全 PASS。同步升到 0.1.11。
 - **默认链路「接入即红」：元测试那条「没有 Git 时宿主退出 0」和 publish 的顺序断言同时失效**：`npm test` 里 `runner=FAIL`、`publish=FAIL`，而这两个套件各自单独跑又能过——红的是链路，不是断言。两处根因摞在一起：其一，用例原本把 `PATH` 换成空的临时目录来模拟「没有 Git」，`npm` 跟着一起消失，宿主套件里带 `commands: ['npm test']` 的 scope 提交时体检报「命令本身找不到：npm」，`lib/index.js` 在提交路径上抛出未捕获错误、宿主以 1 退出，剧本从「无 Git 就 SKIP」变成「无 Git 顺带崩」；其二，宿主套件 G40-20 的第二个 `flowgate_doc` 用生产默认上限真实等待 10 分钟，`runSuites` 的 180 秒上限到点直接 `SIGKILL`——只修 `PATH` 的话仍然超时，所以两处必须一起改。
 
   用例现在只从 `PATH` 里摘掉含 `git` 可执行文件的目录段，`node` 与 `npm` 所在目录原样保留；`node` 目录本身含 git 时，把 `node` 与 `npm` 复制进一个干净的临时目录顶到最前。构造完先用 `spawnSync('git', ['--version'])` 断言 `error.code === 'ENOENT'`，证明「Git 确实不可见」再跑聚合器，断言没有被放宽。G40-20 改为注入 `service.gateWaitOverrideMs = 60`，并在 `finally` 里恢复；顺带修正 `currentService()` 的取值时机（必须在 `makeHost` 之后，否则模拟宿主还没装好，`service.get(sid)` 返回 null）。`test/publish.test.mjs` 的「接入汇总」用例同步到新顺序：`publish` 在 `runner` 之前，`runner` 才是最后一套。

@@ -573,6 +573,75 @@ await check('AC-7 空命令拒绝有审计且不进入待补队列', async () =>
   assert.equal(event.detail.cwd, join(CWD, 'packages', 'web'))
 })
 
+// 审计流水只记「放行 / 拒绝」回答不了两个问题：它当时有多少权限、最后跑成没跑成。
+// 权限模式、退出码、提权申请各记一条独立事件——合进 shell.allowed 会让「判定」与「结果」混成一条。
+await check('审计流水记录权限模式、退出码与提权申请', async () => {
+  const auditPath = join(CWD, '.dsh-flowgate', 'flows.jsonl')
+  const events = () => readFileSync(auditPath, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+  const since = (start) => events().slice(start)
+
+  // 判定事件：取不到宿主沙箱策略时写 unknown，而不是省略这个字段。
+  // 省略会让「这条事件没有权限信息」和「老版本写的事件」长得一样。
+  let start = events().length
+  assert.equal((await guard('ops_bash', { command: 'pwd' })).kind, 'allow')
+  const judged = since(start).filter((item) => item.type === 'shell.allowed').at(-1)
+  assert.equal(judged.detail.mode, 'unknown')
+
+  // 结果事件：判定放行之后，退出码由 tools/result 单独记一条。
+  const resultListener = host.listeners.get('tools/result')
+  assert.ok(resultListener, 'tools/result 必须注册')
+  start = events().length
+  resultListener(execFor(SESSION, 'ops_bash', { command: 'pwd' }), {
+    isError: false, value: { exitCode: 3, signal: null, timedOut: false }, content: [],
+  })
+  const result = since(start).find((item) => item.type === 'shell.result')
+  assert.ok(result, '执行结果必须留一条独立事件')
+  assert.equal(result.detail.command, 'pwd')
+  assert.equal(result.detail.exitCode, 3, '退出码是区分「跑成功」与「跑失败」的唯一硬证据')
+  assert.equal(result.detail.mode, 'unknown')
+  // 拿不到退出码（后台任务、宿主未提供）时写 null：省略会被读成成功。
+  start = events().length
+  resultListener(execFor(SESSION, 'ops_bash', { command: 'npm test' }), {
+    isError: false, value: { kind: 'background', jobId: 'bash-1' }, content: [],
+  })
+  const background = since(start).find((item) => item.type === 'shell.result')
+  assert.equal(background.detail.exitCode, null)
+  assert.equal(background.detail.background, true)
+
+  // 提权申请：模型带上 sandbox_permissions 重试的那一刻就留痕，与判定结果无关。
+  start = events().length
+  await guard('ops_bash', { command: 'pwd', sandbox_permissions: 'danger-full-access', justification: '需要写 dist' })
+  const applied = since(start).find((item) => item.type === 'sandbox.escalated')
+  assert.ok(applied, '提权申请必须留一条独立事件')
+  assert.equal(applied.detail.tool, 'ops_bash')
+  assert.equal(applied.detail.command, 'pwd')
+  assert.equal(applied.detail.from, 'unknown')
+  assert.equal(applied.detail.to, 'danger-full-access')
+  assert.equal(applied.detail.justification, '需要写 dist')
+  // 提权是独立的一条事件，不是塞进判定里的字段：判定照旧记它自己的结果，
+  // 「申请升权」与「判定放行」在流水里必须是两个能分别过滤的类型。
+  assert.ok(since(start).some((item) => item.type === 'shell.allowed' && item.detail.command === 'pwd'),
+    '判定本身照旧记一条 shell.allowed')
+
+  // 批准与驳回分开记：实际生效的那一档才是证据，调用有没有报错不算。
+  const escalate = { command: 'pwd', sandbox_permissions: 'danger-full-access' }
+  start = events().length
+  resultListener(execFor(SESSION, 'ops_bash', escalate), {
+    isError: false, value: { exitCode: 0, sandbox: { mode: 'danger-full-access', denied: false } }, content: [],
+  })
+  const approved = since(start).find((item) => item.type === 'sandbox.approved')
+  assert.ok(approved, '批准必须单独记一条')
+  assert.equal(approved.detail.effective, 'danger-full-access')
+  start = events().length
+  resultListener(execFor(SESSION, 'ops_bash', escalate), {
+    isError: false, value: { exitCode: 0, sandbox: { mode: 'workspace-write', denied: false } }, content: [],
+  })
+  const declined = since(start).find((item) => item.type === 'sandbox.denied')
+  assert.ok(declined, '驳回必须单独记一条')
+  assert.equal(declined.detail.effective, 'workspace-write', '驳回时生效的还是原档位')
+  assert.equal(declined.detail.to, 'danger-full-access')
+})
+
 await check('AC-10 目录无法确认时禁止补录，同名命令按目录分别处理', async () => {
   const command = 'pnpm run docs-check'
   assert.equal((await guard('bash', { command, workdir: 'packages/missing' })).kind, 'deny')

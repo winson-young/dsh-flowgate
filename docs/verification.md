@@ -6,6 +6,32 @@
 
 历史记录中的 `by: 'subagents'` 仅表明调用了子代理聚合入口；聚合报告通过、`blocking: 0` 或流程走完，均不能证明真实子代理成功执行并返回有效报告。下文原有结论保留，其证据范围受此限定。
 
+## 审计流水补权限模式、退出码与提权事件（2026-11-26）
+
+需求：用户原文「审计流水不记录权限提升与退出码」。三件事——`auditShell` 的 `detail` 补宿主当前沙箱模式 `mode`（取不到写 `'unknown'`，不省略）；执行结果补一条独立事件带 `exitCode`；提权申请与批准各写一条独立事件，与 `shell.allowed` 分开。执行目录已在上一轮补上，本次不重复。
+
+方案：
+
+- **模式一路穿到底**：`auditShell` 加第 6 参 `mode = 'unknown'`；`scopeDenial` → `shellDenial` / `runCodeDenial` 各加同名形参并在 6 处 `auditShell` 调用上追加实参；`childDenial` 补 `sandboxModeOf(exec)`。取值只有一个来源 `sandboxModeOf(exec)`（`exec.agent.ctx.get('sandboxPolicy').resolve({ session })`），不在 `SANDBOX_MODES` 内或抛错一律 `'unknown'`——写 `null` 或省略会让「没有权限信息」与「老版本事件」不可区分。
+- **结果事件独立**：新增 `tools/result` 监听写 `shell.result`，只对 `SHELL_TOOLS` 生效，`detail` 带 `command` / `truncated` / `exitCode`（非整数 `null`）/ `signal` / `timedOut` / `background` / `mode`，`sandboxDenied` 与 `failed` 只在成立时出现。被 pre-execute 拒绝的调用不产生结果事件，判定事件已经写过一次，不重复记账。
+- **提权拆两条**：`sandbox_permissions` 合法时 pre-execute 先写 `sandbox.escalated`（`tool` / `command?` / `from` / `to` / `justification`），`tools/result` 再按「实际生效模式是否等于目标」写 `sandbox.approved` 或 `sandbox.denied`。宿主没有独立提权事件，只能这样两边比对。
+- **判定与提权不互斥**：提权申请照旧走一次 `scopeDenial`，因此同一窗口内既有 `sandbox.escalated` 也有 `shell.allowed`。这是有意的——两条事件可以分别过滤，合成一条则丢失「判定本身也发生过」。
+
+改动范围：`lib/index.js`、`test/integration.test.mjs`、`CHANGELOG.md`、`docs/development.md`、`docs/verification.md`、`package.json`。
+
+| 验收项 | 状态 | 证据与限制 |
+| :--- | :--- | :--- |
+| AC-1 判定事件的 `detail.mode` 是合法模式或 `'unknown'` | 通过 | `test/integration.test.mjs`「审计流水记录权限模式、退出码与提权申请」断言放行事件 `detail.mode === 'unknown'`（夹具宿主未提供 `sandboxPolicy`，取不到就必须是这个字面量，而不是缺键） |
+| AC-2 执行结果独立成 `shell.result` 并带 `exitCode` | 通过 | 同一条用例注入 `exitCode: 3` 的结果，断言事件类型与数值；后台任务那条断言 `exitCode === null` 且 `background === true` |
+| AC-3 提权申请写 `sandbox.escalated`，与 `shell.allowed` 分开 | 通过 | 同一条用例断言 `tool` / `command` / `from` / `to` / `justification` 五个字段，并断言同一窗口内判定侧仍有一条 `shell.allowed` |
+| AC-4 提权结论分别落成 `sandbox.approved` / `sandbox.denied` | 通过 | `effective` 等于目标时 approved、仍是 `workspace-write` 时 denied 且 `detail.reason` 为「提权未生效」 |
+| AC-5 既有审计断言未被放宽 | 通过 | `test/subagents.test.mjs:418-421` 的 `deepEqual` 只映射 `[type, detail.dir, detail.cwd]`，新增字段不影响；`npm test` 十三套全 PASS |
+
+限制：
+
+- 提权结论只能推断。宿主没有暴露独立的提权 / 审批事件，`sandbox.approved` 的判据是「结果里 `value.sandbox.mode` 等于请求的目标」；结果不携带 `sandbox` 字段时退化为「没有报错就算批准」，这一点在 `auditEscalationOutcome` 的注释里写明，属于推断而非事实记录。
+- 只有 `isError === false` 的结果才取 `value`，失败结果没有 `exitCode` 可记，`shell.result` 在这种情况下仍会写一条 `failed: true` 的事件，但不伪造退出码。
+- 真实宿主里的模式切换没有在本次验证中实跑（夹具宿主不提供 `sandboxPolicy`），`mode` 的三个合法取值只在单元层面被断言。
 ## 运行版本可观测：status 念出版本与两侧指纹（2026-11-25）
 
 需求：用户原文「G38 运行版本不可观测：`flowgate_status` 不返回任何版本字段，验的是新版还是旧版无从确认」。插件早已算好两套指纹——宿主实际加载的模块指纹（`moduleRevisions()` 把七个模块的 `name:revision` 拼起来再 sha256）与页面实际执行的客户端指纹（`client.js` 的 factory 标记）——但只在布局证据回执这一条链路上读它。Agent 最常调用的 `flowgate_status` 返回的八个字段里一个版本信息都没有，于是在「改完必须重启才能验证」的循环里，Agent 只能相信「已经重启过了」。
