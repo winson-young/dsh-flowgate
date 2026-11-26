@@ -1,6 +1,6 @@
 {
   "name": "dsh-flowgate",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "四阶段流程约束开发工作台：需求分析 → 开发 → 评审 → 测试，以代码级门禁控制阶段流转",
   "type": "module",
   "main": "lib/index.js",
@@ -45,6 +45,7 @@
     "test:integration": "node test/integration.test.mjs",
     "test:install": "node test/install.test.mjs",
     "test:publish": "node --test --test-reporter=tap test/publish.test.mjs",
+    "test:runner": "node --test --test-reporter=tap test/test-runner.test.mjs",
     "stamp": "node scripts/stamp-revisions.mjs",
     "cdp": "node scripts/start-cdp.mjs",
     "ui": "node docs/capture-ui.mjs",

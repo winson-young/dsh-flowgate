@@ -14,18 +14,32 @@ const exec = promisify(execFile)
 const options = { cwd: root, encoding: 'utf8', windowsHide: true, timeout: 90000 }
 const suiteFor = (name) => suites.find((entry) => entry.name === name)
 
+// node --test 会给自己起的子进程塞 NODE_TEST_CONTEXT，让子进程按测试协议输出。
+// 这套件断言的是子进程的普通 stdout，所以起子进程前统一洗掉它：直跑与 node --test
+// 两个入口因此走同一条输出通道，同一条断言不会一边绿一边红。
+const TEST_CONTEXT_ENV = ['NODE_TEST_CONTEXT']
+function childEnv(env = process.env) {
+  const next = { ...env }
+  for (const key of TEST_CONTEXT_ENV) delete next[key]
+  return next
+}
+
 function run(args, env = process.env) {
-  const result = spawnSync(process.execPath, args, { ...options, env })
+  const result = spawnSync(process.execPath, args, { ...options, env: childEnv(env) })
   assert.ifError(result.error)
   return result
 }
 
+// capture 把两条输出通道分开：汇总行仍走 console.log，子进程 stdout 走 sink。
+// 不分开的话，node --test 下子进程输出会混进测试运行器要解析的 TAP 流。
 function capture(callback) {
   const messages = []
+  const child = []
   const original = console.log
   try {
     console.log = (message) => messages.push(message)
-    return { status: callback(), output: messages.join(String.fromCharCode(10)) }
+    const status = callback({ write: (chunk) => child.push(String(chunk)) })
+    return { status, output: messages.join(String.fromCharCode(10)), child: child.join('') }
   } finally {
     console.log = original
   }
@@ -69,7 +83,7 @@ test('默认测试汇总过期指纹，继续运行其余十套且不改写模�
     const fd = openSync(path, 'w')
     let result
     try {
-      result = spawnSync(process.execPath, args, { ...options, cwd, stdio: ['ignore', fd, fd] })
+      result = spawnSync(process.execPath, args, { ...options, cwd, env: childEnv(), stdio: ['ignore', fd, fd] })
     } finally {
       closeSync(fd)
     }
@@ -120,15 +134,15 @@ test('失败后继续，汇总四种状态并返回真实退出码', (t) => {
   const skip = fixture('skip', ['FLOWGATE_TEST_SKIP ' + JSON.stringify({ reason: 'Git missing' }), 'complete'])
   const later = fixture('later', ['complete'])
   const missing = { name: 'missing', script: 'test:missing' }
-  const mixed = capture(() => runSuites([failure, early, skip, missing, later], { cwd }))
+  const mixed = capture((sink) => runSuites([failure, early, skip, missing, later], { cwd, env: childEnv(), ...sink }))
   assert.equal(mixed.status, 1)
   assert.match(mixed.output, /first=FAIL .*退出码 7/)
   assert.match(mixed.output, /early=NOT_RUN .*缺少完成记录/)
   assert.match(mixed.output, /skip=SKIP .*Git missing/)
   assert.match(mixed.output, /missing=NOT_RUN .*test:missing/)
   assert.match(mixed.output, /later=PASS/)
-  assert.equal(capture(() => runSuites([skip, later], { cwd })).status, 0)
-  assert.equal(capture(() => runSuites([early], { cwd })).status, 1)
+  assert.equal(capture((sink) => runSuites([skip, later], { cwd, env: childEnv(), ...sink })).status, 0)
+  assert.equal(capture((sink) => runSuites([early], { cwd, env: childEnv(), ...sink })).status, 1)
 })
 
 test('缺少有效跳过原因时判为失败', (t) => {
@@ -137,7 +151,7 @@ test('缺少有效跳过原因时判为失败', (t) => {
   for (const payload of ['', '{', '{}', 'null', '{"reason":" "}', '{"reason":1}']) {
     const marker = 'FLOWGATE_TEST_SKIP' + (payload ? ' ' + payload : '')
     writeFileSync(join(cwd, 'invalid.mjs'), 'console.log(' + JSON.stringify(marker) + '); console.log("complete")')
-    const result = capture(() => runSuites([{ name: 'invalid', command, completion: /^complete$/m }], { cwd }))
+    const result = capture((sink) => runSuites([{ name: 'invalid', command, completion: /^complete$/m }], { cwd, env: childEnv(), ...sink }))
     assert.equal(result.status, 1, payload)
     assert.match(result.output, /invalid=FAIL .*跳过记录格式无效/)
   }
@@ -154,7 +168,7 @@ test('真实 TAP 子进程的嵌套跳过计入套件汇总', (t) => {
     })
   `)
   const suite = { ...suiteFor('provenance'), name: 'nested', command: 'node --test --test-reporter=tap nested.mjs' }
-  const result = capture(() => runSuites([suite], { cwd }))
+  const result = capture((sink) => runSuites([suite], { cwd, env: childEnv(), ...sink }))
   assert.equal(result.status, 0)
   assert.match(result.output, /nested=SKIP .*fixture unavailable/)
 })
@@ -174,15 +188,15 @@ test('默认安装夹具忽略覆盖路径，真实入口读取覆盖路径', (t
 test('没有 Git 时宿主退出 0，汇总标记 SKIP 并显示原因', (t) => {
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toLowerCase() !== 'path'))
   env.PATH = temp(t)
-  const result = capture(() => runSuites([suiteFor('host')], { env }))
+  const result = capture((sink) => runSuites([suiteFor('host')], { env: childEnv(env), ...sink }))
   assert.equal(result.status, 0)
   assert.match(result.output, /host=SKIP .*Git 不可用（ENOENT）/)
 })
 
 test('两个集成进程各用独立临时目录并清理', async () => {
   const outputs = await Promise.all([
-    exec(process.execPath, ['test/integration.test.mjs'], options),
-    exec(process.execPath, ['test/integration.test.mjs'], options),
+    exec(process.execPath, ['test/integration.test.mjs'], { ...options, env: childEnv() }),
+    exec(process.execPath, ['test/integration.test.mjs'], { ...options, env: childEnv() }),
   ])
   const dirs = outputs.map(({ stdout }) => {
     assert.match(stdout, /全部通过：[1-9]\d* 项/)
@@ -192,6 +206,68 @@ test('两个集成进程各用独立临时目录并清理', async () => {
   })
   assert.notEqual(dirs[0], dirs[1])
   for (const dir of dirs) assert.equal(existsSync(dir), false, dir)
+})
+
+test('默认链路把元测试自己接在最后，并复用同一份 TAP 完成标记', () => {
+  const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+  const runner = suiteFor('runner')
+  assert.ok(runner, '默认链路应当包含 runner 套件')
+  assert.equal(runner.command, manifest.scripts['test:runner'])
+  assert.equal(runner.command, 'node --test --test-reporter=tap test/test-runner.test.mjs')
+  assert.equal(runner.completion, suiteFor('provenance').completion)
+  assert.equal(suites[0].name, 'revisions')
+  assert.equal(suites[suites.length - 1].name, 'runner')
+  assert.equal(suites.length, 12 + (existsSync(join(root, 'test/publish.test.mjs')) ? 1 : 0))
+})
+
+test('接上输出通道时子进程输出不进汇总通道', (t) => {
+  const cwd = temp(t)
+  writeFileSync(join(cwd, 'echo.mjs'), 'console.log("child stdout line")')
+  const suite = { name: 'echo', command: 'node echo.mjs', completion: /^child stdout line$/m }
+  const result = capture((sink) => runSuites([suite], { cwd, env: childEnv(), ...sink }))
+  assert.equal(result.status, 0)
+  assert.match(result.child, /child stdout line/)
+  assert.match(result.output, /echo=PASS/)
+  assert.ok(!result.output.includes('child stdout line'), result.output)
+})
+
+test('测试运行器上下文下子进程不继承测试协议', (t) => {
+  // 先直接钉住清洗本身：直跑时父进程本来就没有 NODE_TEST_CONTEXT，
+  // 只靠下面那条子进程观察对「清洗被删掉」没有区分力（直跑仍绿）。
+  const polluted = childEnv({ ...process.env, NODE_TEST_CONTEXT: 'child' })
+  for (const key of TEST_CONTEXT_ENV) assert.equal(key in polluted, false, key)
+  const cwd = temp(t)
+  writeFileSync(join(cwd, 'context.mjs'), 'console.log("context=" + String(process.env.NODE_TEST_CONTEXT === undefined))')
+  const suite = { name: 'context', command: 'node context.mjs', completion: /^context=true$/m }
+  const result = capture((sink) => runSuites([suite], { cwd, env: childEnv(), ...sink }))
+  assert.equal(result.status, 0, result.output)
+})
+
+test('不接管输出通道时子进程输出仍写进程 stdout', (t) => {
+  const cwd = temp(t)
+  writeFileSync(join(cwd, 'plain.mjs'), 'console.log("default channel line")')
+  const suite = { name: 'plain', command: 'node plain.mjs', completion: /^default channel line$/m }
+  const events = []
+  const originalWrite = process.stdout.write
+  const originalLog = console.log
+  try {
+    console.log = (message) => events.push({ from: 'log', text: String(message) })
+    process.stdout.write = (chunk) => {
+      events.push({ from: 'child', text: String(chunk) })
+      return true
+    }
+    assert.equal(runSuites([suite], { cwd, env: childEnv() }), 0)
+  } finally {
+    process.stdout.write = originalWrite
+    console.log = originalLog
+  }
+  const texts = events.map((event) => event.text)
+  const title = texts.findIndex((text) => text.includes('=== plain ==='))
+  const child = texts.findIndex((text) => text.includes('default channel line'))
+  const summary = texts.findIndex((text) => text.includes('plain=PASS'))
+  assert.ok(title >= 0, '缺省通道应打出套件标题')
+  assert.ok(child > title, '子进程输出应排在套件标题之后')
+  assert.ok(summary > child, '汇总行应排在子进程输出之后')
 })
 
 for (const name of ['provenance', 'acceptance', 'runtime', 'layout']) {

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **聚合器的元测试自己不在链路上，用 `node --test` 跑还会假失败**：起因是 `scripts/run-tests.mjs` 的默认链路就是 `suites` 这一个常量——`revisions` 套件加 `...testSuites` 十套，里面没有 `runner`，所以 `test/test-runner.test.mjs` 只靠人记得手工跑：谁改坏了 `resultFor` 或 `suites` 都不会有人发现，而改坏的典型形态恰恰是「汇总器开始骗人」，正是当初加 G12 / G14 要解决的那个问题以更难发现的方式回来。三处缺陷是同一条链上的：元测试不在链路里；要接进去得先给聚合器留一条输出通道，否则元测试的 `capture` 只替换 `console.log`，子进程 stdout 会直接写穿到真实标准输出、混进 `node --test` 的 TAP 流；而 `node --test test/test-runner.test.mjs` 本身会假失败——测试运行器给子进程设了 `NODE_TEST_CONTEXT`，元测试 spawn 出来的 `node scripts/run-tests.mjs` 继承它之后按子测试协议自报，父进程看到的是一份伪造的测试结果。
+
+  `runSuites` 的 `options.write` 成为唯一输出通道：缺省仍是 `process.stdout.write`，`resultFor` 在 `spawnSync` 之后按「是不是函数」决定写哪里，既有调用点一行都不用改；`suites` 末尾按 `existsSync(root + 'test/test-runner.test.mjs')` 接入 `['runner', 'test:runner', tap]`，与 `publish` 同款存在性判断——元测试第一个用例的临时夹具只复制 `scripts/` 与 `lib/`、不复制 `test/`，那里仍是 `revisions` 加十套，所以这条接入不会自己套自己。`package.json` 新增 `"test:runner": "node --test --test-reporter=tap test/test-runner.test.mjs"`，与其它 `test:*` 同形。
+
+  元测试自己建输出通道并清洗环境：`capture(callback)` 现在把两个 sink（`write` 与 `console.log`）一起交给回调，调用点写成 `capture((sink) => runSuites([...], { cwd, env: childEnv(), ...sink }))`；`childEnv()` 浅拷贝 `process.env` 后删掉 `NODE_TEST_CONTEXT`，`run`、`runFixture`、两进程并发那组子进程全部改走它。
+
+  测试：`test/test-runner.test.mjs` 新增三条用例——默认链路把元测试自己接在最后并复用 `provenance` 的 TAP 完成标记（断言 `suiteFor('runner')` 存在、command 等于 `package.json` 的 `test:runner`、`suites[0]` 仍是 `revisions`、条数按 `publish` 是否存在算）、接上输出通道时子进程输出不进汇总通道、`NODE_TEST_CONTEXT` 下子进程不继承测试协议；原有 11 条断言一条未放宽。
+
+  文档：`docs/development.md` 的测试章节把默认链路的套数改成「十三套」，`npm run test:runner` 与直跑入口分成两行并说明二者对同一缺陷给同一个结论，另补一段讲接入条件、夹具为何不会自套、以及 `options.write` 与 `NODE_TEST_CONTEXT` 两处机制。
+
 - **门禁等待器只活在进程内存里、还不设超时：发布重启之后 Agent 永久悬挂**：起因是 `GateHub` 的 `this.waiters` 是一个纯内存 `Map`，而 `awaitGate` 调 `service.gates.wait(sessionId, kind, 0, exec.signal)` 时把超时写死成 0——`GateHub.wait` 里 `if (timeoutMs > 0)` 才装 `setTimeout`，0 就是不装。于是「改代码 → 发布 → 重启 → 验证」这条路上每一次重启都会把正在等的门禁等待器一起杀掉，Agent 侧表现为工具调用永久挂起（只有宿主自己的工具超时或用户手动中断才结束）；恢复之后它只知道「停下来等确认」，不知道上次等的是哪一个门禁，也分不清「没提交」与「提交了但没人点」，而 `flowgate_status` 同样查不回这个 id，只能重跑一遍。修 G38、G39 都要走这条路，所以它是「用 flowgate 修 flowgate」唯一会直接阻断的条目。
   门禁请求现在落盘成对象。`markGateRequested(flow, kind)` 写 `{ id: 'gate_' + randomUUID().slice(0, 8), at, kind, endedAt: null, endKind: null }` 到 `flow.stages[stage].gateRequested`，`emptyStage()` 的默认值由 `false` 改为 `null`；旧快照里那个布尔 `true` 由 `gateRequestOf(record)` 兼容成「id / at / kind 都是 null、也没收尾」的五字段对象——`repairFlow` 的 `{ ...emptyStage(), ...saved }` 会把旧布尔原样带回，读 `=== true` 的地方（`doc.interrupted`、`gate.interrupted`）必须同时改，否则重启后旧流程会被判成「没请求过门禁」。
   超时上限默认 10 分钟，工作台可配。`GATE_WAIT_DEFAULT_MINUTES = 10`、`GATE_WAIT_MIN_MINUTES = 1`、`GATE_WAIT_MAX_MINUTES = 60`，`normalizeGateWaitMinutes` 把非有限数、0、负数与越界值一律改回 10——它只接受数字与非空数字字符串，布尔 `true` 不会被解释成 1 分钟（那样「配置写错了」会静默变成「上限被设成最小值」，而写错的人以为自己在用默认值），`gateWaitTimeoutMs(workspace)` 换算成毫秒；`awaitGate` 与 `flowgate_ask` 都改走 `service.gateWaitMs(flow)` 这个唯一解析点（测试用 `gateWaitOverrideMs` 注入毫秒级上限，生产路径永远 null）。0 在配置层明确不接受：不超时正是这条缺陷的来路，界面上写的是「不能设成 0」，服务端遇到越界值会保存默认值并抛一条说明。上限是工作区级的（`config.json` 的 `gateWaitMinutes`，随 `setWorkspaceStages` 一并写回），改了对进行中的流程立即生效，已经挂着的等待器保持它自己的计时。

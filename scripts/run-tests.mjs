@@ -19,10 +19,12 @@ const testSuites = [
   ['client', 'test:client', completed],
   ['install', 'test:install:fixture', completed],
   ['layout', 'test:layout', /"checks": 25\s*}/m],
-  // 发布脚本的用例接在这里。但只有工作副本里真有那个测试文件时才接：
+  // 发布脚本与聚合器元测试的用例接在这里。但只有工作副本里真有那个测试文件时才接：
   // test/test-runner.test.mjs 的 fixture 只复制 scripts/ 与 lib/，不复制 test/，
   // 按存在与否决定接入，才不会把那个 fixture 的汇总行数与顺序打乱。
+  // 元测试自己也在其中：聚合器的判定与清单从此有回归保护，改坏了默认链路直接红。
   ...(existsSync(root + 'test/publish.test.mjs') ? [['publish', 'test:publish', tap]] : []),
+  ...(existsSync(root + 'test/test-runner.test.mjs') ? [['runner', 'test:runner', tap]] : []),
 ].map(([name, script, completion]) => ({ name, script, command: scripts[script], completion }))
 
 export const suites = [
@@ -50,7 +52,11 @@ function resultFor(suite, options) {
     killSignal: 'SIGKILL',
     maxBuffer: 16 * 1024 * 1024,
   })
-  if (child.stdout) process.stdout.write(child.stdout)
+  // 子进程输出默认直接写进程 stdout；需要接管这条通道的调用方传 options.write。
+  // 元测试要在 node --test 下跑，那里 stdout 会被测试运行器当 TAP 解析，
+  // 所以接管是显式参数，缺省路径保持逐字节不变。
+  const writeStdout = typeof options.write === 'function' ? options.write : (chunk) => process.stdout.write(chunk)
+  if (child.stdout) writeStdout(child.stdout)
   if (child.stderr) process.stderr.write(child.stderr)
 
   const reasons = []
