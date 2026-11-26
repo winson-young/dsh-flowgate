@@ -1,6 +1,6 @@
-import { spawnSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { captureSync } from './capture-child.mjs'
 import { fileURLToPath } from 'node:url'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
@@ -14,11 +14,16 @@ const testSuites = [
   ['runtime', 'test:runtime', /^Runtime: [1-9]\d* checks passed\s*$/m],
   ['host', 'test:host', /^(?:全部通过：|通过：)[1-9]\d* 项\s*$/m],
   ['gatemode', 'test:gatemode', completed],
-  ['subagents', 'test:subagents', tap],
+  // subagents 用例是顶层 `await test(...)` 顺序执行的：Node 26 的 --experimental-test-isolation=none
+  // 配上顶层 await 会挂死（最小复现三行即可，EXIT=124），所以这一套直跑，完成标记用直跑的汇总行。
+  ['subagents', 'test:subagents', /^ℹ tests [1-9]\d*\s*$/m],
   ['integration', 'test:integration', completed],
   ['client', 'test:client', completed],
   ['install', 'test:install:fixture', completed],
   ['layout', 'test:layout', /"checks": 25\s*}/m],
+  // check 契约扫描器：它守的是「用例名后面真的有断言」。同样按存在与否接入——
+  // 隔离夹具只复制 scripts/ 与 lib/，没有 test/ 目录，硬接会让夹具汇总多出一套 NOT_RUN。
+  ...(existsSync(root + 'test/host.test.mjs') ? [['checks', 'test:checks', /^check contracts verified \([1-9]\d* calls in [1-9]\d* files\)\.$/m]] : []),
   // 发布脚本与聚合器元测试的用例接在这里。但只有工作副本里真有那个测试文件时才接：
   // test/test-runner.test.mjs 的 fixture 只复制 scripts/ 与 lib/，不复制 test/，
   // 按存在与否决定接入，才不会把那个 fixture 的汇总行数与顺序打乱。
@@ -37,20 +42,20 @@ export const suites = [
   ...testSuites,
 ]
 
+// 捕获走 captureSync：受限沙箱里管道 stdio 会 EPERM，文件描述符不会。
+function runCaptured(args, { cwd, env }) {
+  return captureSync(process.execPath, args, { cwd, env, timeout: 180_000, killSignal: 'SIGKILL' })
+}
+
 function resultFor(suite, options) {
   const { command, completion } = suite
   // Suite commands are simple Node invocations. Run them without a shell or npm.cmd.
   if (!/^node(?: [\w./:=\-]+)+$/.test(command ?? '')) {
     return { status: 'NOT_RUN', reason: `缺少有效的 ${suite.script} Node 入口` }
   }
-  const child = spawnSync(process.execPath, command.split(' ').slice(1), {
+  const child = runCaptured(command.split(' ').slice(1), {
     cwd: options.cwd ?? root,
     env: options.env ?? process.env,
-    encoding: 'utf8',
-    windowsHide: true,
-    timeout: 180_000,
-    killSignal: 'SIGKILL',
-    maxBuffer: 16 * 1024 * 1024,
   })
   // 子进程输出默认直接写进程 stdout；需要接管这条通道的调用方传 options.write。
   // 元测试要在 node --test 下跑，那里 stdout 会被测试运行器当 TAP 解析，

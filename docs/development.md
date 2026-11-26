@@ -498,8 +498,8 @@ README 的界面图使用真实插件组件与示例数据；[预览页](ui-prev
 
 ```bash
 pnpm install --frozen-lockfile
-npm run check             # 模块指纹核验 + 全量语法检查（lib/、docs/、scripts/、test/ 按目录展开）+ 布局脚本 25 项纯函数自检
-npm test                  # 顺序执行默认链路（全量十三套；publish 与 runner 按测试文件是否存在接入）
+npm run check             # 模块指纹核验 + 全量语法检查（lib/、docs/、scripts/、test/ 按目录展开）+ 布局脚本 25 项纯函数自检 + check 契约扫描
+npm test                  # 顺序执行默认链路（全量十四套；checks、publish 与 runner 按测试文件是否存在接入）
 npm run test:provenance    # 取证范围、链接处理与夹具清理
 npm run test:acceptance    # 验收标准与证据判定
 npm run test:runtime       # 运行时验证
@@ -510,14 +510,17 @@ npm run test:integration   # 假宿主运行真实 apply()，检查工具、路�
 npm run test:client        # React 渲染与按钮行为、布局契约、主题变量
 npm run test:install:fixture # 使用临时 profile 检查安装契约
 npm run test:layout        # 单独跑 25 项布局脚本自检（check 里也会跑一次）
+npm run test:checks        # check 契约扫描：用例名后面必须真有断言
 npm run test:install       # 检查真实 profile 的安装就绪度
-npm run test:runner        # 聚合器元测试（node --test --test-reporter=tap 入口）
+npm run test:runner        # 聚合器元测试（经 scripts/node-test.mjs 入口）
 node test/test-runner.test.mjs # 同一套断言的直跑入口，结论与上一条一致
 ```
 
 `npm test` 会在单套失败后继续执行，并汇总 `PASS`、`FAIL`、`SKIP` 和 `NOT_RUN`。子进程无法启动或在退出 0 时缺少完成记录会报 `NOT_RUN`。任何 `FAIL` 或 `NOT_RUN` 都使总退出码为 1。只有通过或显式跳过时返回 0，跳过会附上原因，例如宿主测试找不到 Git。
 
 聚合器的元测试自己也在链路里（`runner` 套件，排在最后）：`scripts/run-tests.mjs` 的 `suites` 按 `test/test-runner.test.mjs` 是否存在决定接入，与 `publish` 同款判断——元测试第一个用例的临时夹具只复制 `scripts/` 与 `lib/`，那里仍是 `revisions` 加十套，所以这条接入不会自己套自己。`npm run test:runner` 与 `node test/test-runner.test.mjs` 跑的是同一套断言、对同一缺陷给同一个结论；元测试自己建输出通道接子进程 stdout（`runSuites` 的 `options.write`，缺省仍是 `process.stdout.write`），并给所有子进程清洗 `NODE_TEST_CONTEXT`，因此在 `node --test` 下不会把子进程输出混进 TAP 流。这条套件内部会把约十一个子套件再跑一遍，`npm test` 的总耗时因此明显上升；首次接入后请人工跑一次确认 `runner=PASS`，它超时时原因会写成 `ETIMEDOUT`。
+
+受限沙箱里子进程的捕获走 [scripts/capture-child.mjs](../scripts/capture-child.mjs)：沙箱拒绝的是「用管道 stdio 派生进程」（`spawn EPERM`），不是派生本身，所以捕获先把子进程输出指向临时文件描述符、读回、再删，临时文件打不开才回落管道。`test/subagents.test.mjs` 是顶层 `await test(...)` 顺序执行的，配上 `--experimental-test-isolation=none` 在 Node 26 下会挂死，因此这一套直跑而不是经 `scripts/node-test.mjs`。
 
 默认安装套件使用临时 profile。真实安装检查 `test:install` 默认读取 `~/.dsh/profiles/desktop`，可通过 `FLOWGATE_PROFILE_DIR` 指定绝对路径。布局自检无需打开 DSH，真实页面的布局取证请按上面的 CDP 步骤执行。子代理测试使用测试替身，入口、门禁按钮和回退可在真实 DSH 中进一步确认。
 

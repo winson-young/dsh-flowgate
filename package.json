@@ -1,6 +1,6 @@
 {
   "name": "dsh-flowgate",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "四阶段流程约束开发工作台：需求分析 → 开发 → 评审 → 测试，以代码级门禁控制阶段流转",
   "type": "module",
   "main": "lib/index.js",
@@ -33,24 +33,25 @@
   },
   "scripts": {
     "test": "node scripts/run-tests.mjs",
-    "test:provenance": "node --test --test-reporter=tap test/provenance.test.mjs",
-    "test:acceptance": "node --test --test-reporter=tap test/acceptance.test.mjs",
+    "test:provenance": "node scripts/node-test.mjs test/provenance.test.mjs",
+    "test:acceptance": "node scripts/node-test.mjs test/acceptance.test.mjs",
     "test:runtime": "node test/runtime.test.mjs",
     "test:install:fixture": "node test/install.test.mjs --fixture",
     "test:layout": "node docs/verify-layout.mjs --self-test",
+    "test:checks": "node scripts/verify-checks.mjs",
     "test:host": "node test/host.test.mjs",
     "test:gatemode": "node test/gatemode.test.mjs",
-    "test:subagents": "node --test --test-reporter=tap test/subagents.test.mjs",
+    "test:subagents": "node test/subagents.test.mjs",
     "test:client": "node test/client.test.mjs",
     "test:integration": "node test/integration.test.mjs",
     "test:install": "node test/install.test.mjs",
-    "test:publish": "node --test --test-reporter=tap test/publish.test.mjs",
-    "test:runner": "node --test --test-reporter=tap test/test-runner.test.mjs",
+    "test:publish": "node scripts/node-test.mjs test/publish.test.mjs",
+    "test:runner": "node scripts/node-test.mjs test/test-runner.test.mjs",
     "stamp": "node scripts/stamp-revisions.mjs",
     "cdp": "node scripts/start-cdp.mjs",
     "ui": "node docs/capture-ui.mjs",
     "ui:verify": "node docs/capture-ui.mjs --verify-only",
-    "check": "node scripts/stamp-revisions.mjs --check && node scripts/check-syntax.mjs && node docs/verify-layout.mjs --self-test"
+    "check": "node scripts/stamp-revisions.mjs --check && node scripts/check-syntax.mjs && node docs/verify-layout.mjs --self-test && node scripts/verify-checks.mjs"
   },
   "dsh": {
     "bundle": {

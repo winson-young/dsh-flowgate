@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync } from 'node:fs'
-import { execFileSync } from 'node:child_process'
+import { captureSync } from './capture-child.mjs'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -61,18 +61,20 @@ files.sort()
 let degraded = false
 function checkWithChild(file) {
   if (degraded) return checkInProcess(file)
-  try {
-    execFileSync(process.execPath, ['--check', file], { stdio: 'pipe' })
-    return null
-  } catch (error) {
-    const code = error && error.code
+  // 捕获走 captureSync：受限沙箱拒绝管道 stdio（EPERM），文件描述符不拒绝。
+  // 用 execFileSync(..., { stdio: 'pipe' }) 的话，沙箱里每一套都会降级成进程内解析。
+  const result = captureSync(process.execPath, ['--check', file], { windowsHide: true, timeout: 60000 })
+  if (result.error) {
+    const code = result.error.code
     if (code === 'EPERM' || code === 'EACCES' || code === 'ENOENT') {
       degraded = true
       return checkInProcess(file)
     }
-    const stderr = error && error.stderr ? String(error.stderr).trim() : String(error && error.message)
-    return stderr || 'node --check failed'
+    return String(result.error.message || result.error)
   }
+  if (result.status === 0) return null
+  const stderr = String(result.stderr || '').trim()
+  return stderr || 'node --check failed'
 }
 
 // 懒加载：只有在真要降级时才碰这个实验性 API。能起子进程的环境因此完全不会看到那条警告。

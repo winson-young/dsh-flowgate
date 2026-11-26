@@ -7,6 +7,7 @@ import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { HOST_MODULES } from '../lib/runtime.js'
+import { capture as captureAsync, captureSync } from '../scripts/capture-child.mjs'
 import { runSuites, suites } from '../scripts/run-tests.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
@@ -25,7 +26,8 @@ function childEnv(env = process.env) {
 }
 
 function run(args, env = process.env) {
-  const result = spawnSync(process.execPath, args, { ...options, env: childEnv(env) })
+  // 捕获走 captureSync：受限沙箱拒绝管道 stdio（spawn EPERM），文件描述符不拒绝。
+  const result = captureSync(process.execPath, args, { ...options, env: childEnv(env) })
   assert.ifError(result.error)
   return result
 }
@@ -54,7 +56,8 @@ function temp(t) {
 test('默认测试汇总过期指纹，继续运行其余十套且不改写模块', (t) => {
   const cwd = join(temp(t), 'test project')
   for (const dir of ['lib', 'scripts']) mkdirSync(join(cwd, dir), { recursive: true })
-  for (const file of ['scripts/run-tests.mjs', 'scripts/stamp-revisions.mjs', ...HOST_MODULES.map((name) => 'lib/' + name)]) {
+  // capture-child.mjs 是 run-tests.mjs 的直接依赖（受限沙箱里靠它捕获子进程输出），夹具必须一起复制。
+  for (const file of ['scripts/run-tests.mjs', 'scripts/stamp-revisions.mjs', 'scripts/capture-child.mjs', ...HOST_MODULES.map((name) => 'lib/' + name)]) {
     copyFileSync(join(root, file), join(cwd, file))
   }
   const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
@@ -64,7 +67,9 @@ test('默认测试汇总过期指纹，继续运行其余十套且不改写模�
     ['runtime', 'test:runtime', 'Runtime: 1 checks passed'],
     ['host', 'test:host', '通过：1 项'],
     ['gatemode', 'test:gatemode', '全部通过：1 项'],
-    ['subagents', 'test:subagents', '# tests 1'],
+    // subagents 直跑（顶层 await test 与 --experimental-test-isolation=none 在 Node 26 下会挂死），
+    // 完成标记因此是直跑打印的 `ℹ tests N`，不是 TAP 的 `# tests N`。
+    ['subagents', 'test:subagents', 'ℹ tests 1'],
     ['integration', 'test:integration', '全部通过：1 项'],
     ['client', 'test:client', '全部通过：1 项'],
     ['install', 'test:install:fixture', '全部通过：1 项'],
@@ -167,7 +172,9 @@ test('真实 TAP 子进程的嵌套跳过计入套件汇总', (t) => {
       })
     })
   `)
-  const suite = { ...suiteFor('provenance'), name: 'nested', command: 'node --test --test-reporter=tap nested.mjs' }
+  // 走 node-test.mjs 包装：受限沙箱里 `node --test` 自己派生子进程会用管道，直接 EPERM。
+  const wrapper = join(root, 'scripts', 'node-test.mjs').split('\\').join('/')
+  const suite = { ...suiteFor('provenance'), name: 'nested', command: 'node ' + wrapper + ' nested.mjs' }
   const result = capture((sink) => runSuites([suite], { cwd, env: childEnv(), ...sink }))
   assert.equal(result.status, 0)
   assert.match(result.output, /nested=SKIP .*fixture unavailable/)
@@ -226,7 +233,7 @@ test('没有 Git 时宿主退出 0，汇总标记 SKIP 并显示原因', (t) => 
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toLowerCase() !== 'path'))
   env.PATH = pathWithoutGit(t)
   // 先证明构造真的生效：构造失败时要报「PATH 上还有 git」，而不是让下面的断言红得没头没脑。
-  const probe = spawnSync('git', ['--version'], { env: childEnv(env), windowsHide: true, timeout: 5000 })
+  const probe = captureSync('git', ['--version'], { env: childEnv(env), windowsHide: true, timeout: 5000 })
   assert.equal(probe.error?.code, 'ENOENT', 'PATH 上仍然找得到 git，这条用例证明不了「Git 不可用」')
   const result = capture((sink) => runSuites([suiteFor('host')], { env: childEnv(env), ...sink }))
   assert.equal(result.status, 0)
@@ -235,8 +242,8 @@ test('没有 Git 时宿主退出 0，汇总标记 SKIP 并显示原因', (t) => 
 
 test('两个集成进程各用独立临时目录并清理', async () => {
   const outputs = await Promise.all([
-    exec(process.execPath, ['test/integration.test.mjs'], { ...options, env: childEnv() }),
-    exec(process.execPath, ['test/integration.test.mjs'], { ...options, env: childEnv() }),
+    captureAsync(process.execPath, ['test/integration.test.mjs'], { ...options, env: childEnv() }),
+    captureAsync(process.execPath, ['test/integration.test.mjs'], { ...options, env: childEnv() }),
   ])
   const dirs = outputs.map(({ stdout }) => {
     assert.match(stdout, /全部通过：[1-9]\d* 项/)
@@ -253,11 +260,12 @@ test('默认链路把元测试自己接在最后，并复用同一份 TAP 完成
   const runner = suiteFor('runner')
   assert.ok(runner, '默认链路应当包含 runner 套件')
   assert.equal(runner.command, manifest.scripts['test:runner'])
-  assert.equal(runner.command, 'node --test --test-reporter=tap test/test-runner.test.mjs')
+  // 命令走 node-test.mjs 包装：受限沙箱里 `node --test` 自己派生隔离子进程会用管道，直接 EPERM。
+  assert.equal(runner.command, 'node scripts/node-test.mjs test/test-runner.test.mjs')
   assert.equal(runner.completion, suiteFor('provenance').completion)
   assert.equal(suites[0].name, 'revisions')
   assert.equal(suites[suites.length - 1].name, 'runner')
-  assert.equal(suites.length, 12 + (existsSync(join(root, 'test/publish.test.mjs')) ? 1 : 0))
+  assert.equal(suites.length, 13 + (existsSync(join(root, 'test/publish.test.mjs')) ? 1 : 0))
 })
 
 test('接上输出通道时子进程输出不进汇总通道', (t) => {

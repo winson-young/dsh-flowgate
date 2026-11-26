@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
+import { captureSync } from '../scripts/capture-child.mjs'
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { test } from 'node:test'
+import { after, test } from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { suites } from '../scripts/run-tests.mjs'
 import {
@@ -28,13 +28,19 @@ function temp(t, prefix = 'flowgate-publish-') {
   return dir
 }
 
+// npm 打包前要往自己的 cache 目录写日志。受限沙箱把 %LOCALAPPDATA% 的默认位置
+// 判成不可写，npm 于是直接退出 1（"Log files were not written"），打包本身没跑。
+// 夹具因此给它一个临时目录当 cache：测的是 publish.mjs，不是宿主 ACL。
+const npmCache = mkdtempSync(join(tmpdir(), 'flowgate-npm-cache-'))
+after(() => rmSync(npmCache, { recursive: true, force: true }))
+
 function publish(args, env) {
-  return spawnSync(process.execPath, ['scripts/publish.mjs', ...args], {
+  // 捕获走 captureSync：受限沙箱拒绝管道 stdio（spawn EPERM），文件描述符不拒绝。
+  return captureSync(process.execPath, ['scripts/publish.mjs', ...args], {
     cwd: root,
-    encoding: 'utf8',
     windowsHide: true,
     timeout: 300000,
-    env: { ...process.env, ...env },
+    env: { ...process.env, npm_config_cache: npmCache, ...env },
   })
 }
 
@@ -504,7 +510,8 @@ test('bundles 不是数组时明说无法确认，不靠子串匹配蒙混', (t)
 
 test('package.json 暴露 test:publish 入口，指向本文件的 TAP 报告', () => {
   const { scripts } = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
-  assert.equal(scripts['test:publish'], 'node --test --test-reporter=tap test/publish.test.mjs')
+  // 包装脚本负责在受限沙箱里换成不派生子进程的隔离模式，命令串因此不是裸 node --test。
+  assert.equal(scripts['test:publish'], 'node scripts/node-test.mjs test/publish.test.mjs')
   // run-tests.mjs 只认以 node 开头的简单命令，新脚本要能被它执行。
   assert.match(scripts['test:publish'], /^node(?: [\w./:=\-]+)+$/)
 })
@@ -517,7 +524,7 @@ test('run-tests.mjs 把 publish 接进汇总，但只在测试文件真的存在
   const live = suites.find((entry) => entry.name === 'publish')
   assert.ok(live, suites.map((entry) => entry.name).join(', '))
   assert.equal(live.script, 'test:publish')
-  assert.equal(live.command, 'node --test --test-reporter=tap test/publish.test.mjs')
+  assert.equal(live.command, 'node scripts/node-test.mjs test/publish.test.mjs')
   assert.equal(suites.at(-2).name, 'publish')
   assert.equal(suites.at(-1).name, 'runner')
 
@@ -525,7 +532,10 @@ test('run-tests.mjs 把 publish 接进汇总，但只在测试文件真的存在
   // 那里必须仍是原来那十套，否则那个回归测试的汇总行数会错位。
   const project = temp(t, 'flowgate-runner-')
   mkdirSync(join(project, 'scripts'), { recursive: true })
-  copyFileSync(join(root, 'scripts', 'run-tests.mjs'), join(project, 'scripts', 'run-tests.mjs'))
+  // run-tests.mjs 现在直接 import capture-child.mjs（受限沙箱里靠它捕获子进程输出），夹具要一起复制。
+  for (const file of ['run-tests.mjs', 'capture-child.mjs']) {
+    copyFileSync(join(root, 'scripts', file), join(project, 'scripts', file))
+  }
   writeFileSync(join(project, 'package.json'), JSON.stringify({ scripts: {} }, null, 2) + '\n')
   const loaded = await import(pathToFileURL(join(project, 'scripts', 'run-tests.mjs')).href)
   assert.equal(loaded.suites.some((entry) => entry.name === 'publish'), false)

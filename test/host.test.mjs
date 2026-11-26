@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import fs, { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { syncBuiltinESMExports } from 'node:module'
-import { execFileSync } from 'node:child_process'
+import { captureSync } from '../scripts/capture-child.mjs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply, scopeDenial, shellDenial, currentService, parseChanges } from '../lib/index.js'
@@ -255,6 +255,19 @@ function check(label, fn) {
 
 console.log('flowgate host 单测')
 
+
+// 用例体里需要 await 时必须走这个入口：交给同步 check 的话，它在断言跑完之前就记了通过，
+// 失败也带不上用例名。
+async function checkAsync(label, fn) {
+  try {
+    await fn()
+    passed.push(label)
+    console.log('  ok   ' + label)
+  } catch (error) {
+    console.log('  FAIL ' + label + ' -> ' + error.message)
+    throw error
+  }
+}
 const status0 = await runTool('flowgate_status', {})
 check('无流程时 status 返回 active=false', () => assert.equal(status0.active, false))
 // G38：没有流程时也要能确认「验的是哪一版」，否则 Agent 连自己跑的是不是刚发布的那一版都不知道。
@@ -422,79 +435,83 @@ check('未登记进白名单的工具默认被拒绝', () => {
     flow.stage = 'S1'
     const invalid = [undefined, null, 0, -1, 1.5, '1', NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]
     for (const depth of invalid) assert.equal((await run(cx, { ...child('invalid', owner), delegationDepth: depth })).kind, 'allow')
-    for (const header of [
-      child('', owner), child('self', 'self'), child('broken', 'missing'),
-      { ...child('no-origin', owner), origin: undefined }, child('blank-parent', ''),
-      child('null-parent', null), { id: 'top-parent', cwd: ws, parentSession: owner, delegationDepth: 0 },
-    ]) assert.equal((await run(cx, header)).kind, 'allow', header.id)
-    headers.set('cycle-a', child('cycle-a', 'cycle-b'))
-    headers.set('cycle-b', child('cycle-b', 'cycle-a'))
-    assert.equal((await run(cx, headers.get('cycle-a'))).kind, 'allow')
-    for (const id of ['ASCII', '会话 🧪', 'x'.repeat(10000)]) {
-      assert.equal((await run(cx, child(id, owner))).kind, 'deny')
-      assert.equal((await run(cx, { id, cwd: ws, delegationDepth: 0 })).kind, 'allow')
-    }
-    services.sessions.get = () => { throw new Error('session store unavailable') }
-    services.agents.get = (id) => id === 'middle' ? { session: { header: headers.get(id) } } : undefined
-    assert.equal((await run(cx, child('agent-fallback', 'middle', ws, 2))).kind, 'deny')
-    services.agents.get = () => { throw new Error('agent store unavailable') }
-    assert.equal((await run(cx, child('unresolved', 'middle', ws, 2))).kind, 'allow')
-    services.sessions.get = (id) => headers.has(id) ? { header: headers.get(id) } : undefined
-    services.agents.get = () => undefined
-    service.flows.set('finished-middle', { sessionId: 'finished-middle', finished: true })
-    headers.set('finished-middle', child('finished-middle', owner))
-    assert.equal((await run(cx, child('after-finish', 'finished-middle', ws, 2))).kind, 'allow')
-    check('G07 异常元数据、循环、断链、服务异常与已结束最近流程安全终止', () => assert.ok(true))
+    await checkAsync('G07 异常元数据、循环、断链、服务异常与已结束最近流程安全终止', async () => {
+      for (const header of [
+        child('', owner), child('self', 'self'), child('broken', 'missing'),
+        { ...child('no-origin', owner), origin: undefined }, child('blank-parent', ''),
+        child('null-parent', null), { id: 'top-parent', cwd: ws, parentSession: owner, delegationDepth: 0 },
+      ]) assert.equal((await run(cx, header)).kind, 'allow', header.id)
+      headers.set('cycle-a', child('cycle-a', 'cycle-b'))
+      headers.set('cycle-b', child('cycle-b', 'cycle-a'))
+      assert.equal((await run(cx, headers.get('cycle-a'))).kind, 'allow')
+      for (const id of ['ASCII', '会话 🧪', 'x'.repeat(10000)]) {
+        assert.equal((await run(cx, child(id, owner))).kind, 'deny')
+        assert.equal((await run(cx, { id, cwd: ws, delegationDepth: 0 })).kind, 'allow')
+      }
+      services.sessions.get = () => { throw new Error('session store unavailable') }
+      services.agents.get = (id) => id === 'middle' ? { session: { header: headers.get(id) } } : undefined
+      assert.equal((await run(cx, child('agent-fallback', 'middle', ws, 2))).kind, 'deny')
+      services.agents.get = () => { throw new Error('agent store unavailable') }
+      assert.equal((await run(cx, child('unresolved', 'middle', ws, 2))).kind, 'allow')
+      services.sessions.get = (id) => headers.has(id) ? { header: headers.get(id) } : undefined
+      services.agents.get = () => undefined
+      service.flows.set('finished-middle', { sessionId: 'finished-middle', finished: true })
+      headers.set('finished-middle', child('finished-middle', owner))
+      assert.equal((await run(cx, child('after-finish', 'finished-middle', ws, 2))).kind, 'allow')
+    })
 
     // 全新服务第一次执行的就是守卫，不先调用任何工作台或 flowgate 查询。
-    for (const header of [headers.get(owner), child('cold-direct', owner), child('cold-grandchild', 'middle', ws, 2), child('cold-moved', 'middle', tmpdir(), 2)]) {
-      const cold = makeHost(ws, owner, { services })
-      assert.equal((await run(cold, header)).kind, 'deny', header.id)
-    }
-    for (const header of [...ordinary, child('cold-missing', 'missing', ws, 2)]) {
-      const cold = makeHost(ws, owner, { services })
-      assert.equal((await run(cold, header)).kind, 'allow', header.id)
-    }
-    check('G07 冷启动先恢复再核对身份：本人和完整后代受限，无关及缺失链放行', () => assert.ok(true))
+    await checkAsync('G07 冷启动先恢复再核对身份：本人和完整后代受限，无关及缺失链放行', async () => {
+      for (const header of [headers.get(owner), child('cold-direct', owner), child('cold-grandchild', 'middle', ws, 2), child('cold-moved', 'middle', tmpdir(), 2)]) {
+        const cold = makeHost(ws, owner, { services })
+        assert.equal((await run(cold, header)).kind, 'deny', header.id)
+      }
+      for (const header of [...ordinary, child('cold-missing', 'missing', ws, 2)]) {
+        const cold = makeHost(ws, owner, { services })
+        assert.equal((await run(cold, header)).kind, 'allow', header.id)
+      }
+    })
 
     flow.stage = 'S2'
     flow.scope.data = { in_scope: { commands: ['npm test'], files_expected_to_change: ['allowed.js', 'nested/allowed-nested.js'] } }
     const nested = child('relative-child', owner, join(ws, 'nested'))
     const outside = child('relative-outside', owner, tmpdir())
-    const writes = [
-      ['write', { file_path: 'allowed.js', content: 'x' }, 'deny'],
-      ['write', { file_path: '../allowed.js', content: 'x' }, 'allow'],
-      ['edit', { file_path: 'allowed-nested.js', old_string: 'a', new_string: 'b' }, 'allow'],
-      ['write', { file_path: join(ws, 'allowed.js'), content: 'x' }, 'allow'],
-      ['write', { file_path: join(ws, 'nested', 'allowed.js'), content: 'x' }, 'deny'],
-      ['ops_move', { path: '../allowed.js', to: 'allowed.js' }, 'deny'],
-      ['ops_copy', { path: '../allowed.js', to: 'allowed-nested.js' }, 'allow'],
-      ['ops_batch', { root: '.', action: 'run', operations: [{ op: 'remove', path: 'allowed.js' }] }, 'deny'],
-      ['ops_batch', { root: '..', action: 'run', operations: [{ op: 'remove', path: 'allowed.js' }] }, 'allow'],
-      ['decompress', { toFile: 'allowed.js' }, 'deny'],
-      ['run_code', { code: 'return await tools.write({"file_path":"allowed.js","content":"x"})' }, 'deny'],
-      ['run_code', { code: 'return await tools.write({"file_path":"../allowed.js","content":"x"})' }, 'allow'],
-    ]
-    for (const [name, args, expected] of writes) assert.equal((await run(cx, nested, name, args)).kind, expected, name + ': ' + JSON.stringify(args))
-    assert.equal((await run(cx, outside, 'write', { file_path: 'allowed.js', content: 'x' })).kind, 'deny')
-    assert.equal((await run(cx, outside, 'write', { file_path: join(ws, 'allowed.js'), content: 'x' })).kind, 'allow')
-    check('G07 后代相对目标按执行目录解析，嵌套调用和批量 root 不得绕出 scope', () => assert.ok(true))
+    await checkAsync('G07 后代相对目标按执行目录解析，嵌套调用和批量 root 不得绕出 scope', async () => {
+      const writes = [
+        ['write', { file_path: 'allowed.js', content: 'x' }, 'deny'],
+        ['write', { file_path: '../allowed.js', content: 'x' }, 'allow'],
+        ['edit', { file_path: 'allowed-nested.js', old_string: 'a', new_string: 'b' }, 'allow'],
+        ['write', { file_path: join(ws, 'allowed.js'), content: 'x' }, 'allow'],
+        ['write', { file_path: join(ws, 'nested', 'allowed.js'), content: 'x' }, 'deny'],
+        ['ops_move', { path: '../allowed.js', to: 'allowed.js' }, 'deny'],
+        ['ops_copy', { path: '../allowed.js', to: 'allowed-nested.js' }, 'allow'],
+        ['ops_batch', { root: '.', action: 'run', operations: [{ op: 'remove', path: 'allowed.js' }] }, 'deny'],
+        ['ops_batch', { root: '..', action: 'run', operations: [{ op: 'remove', path: 'allowed.js' }] }, 'allow'],
+        ['decompress', { toFile: 'allowed.js' }, 'deny'],
+        ['run_code', { code: 'return await tools.write({"file_path":"allowed.js","content":"x"})' }, 'deny'],
+        ['run_code', { code: 'return await tools.write({"file_path":"../allowed.js","content":"x"})' }, 'allow'],
+      ]
+      for (const [name, args, expected] of writes) assert.equal((await run(cx, nested, name, args)).kind, expected, name + ': ' + JSON.stringify(args))
+      assert.equal((await run(cx, outside, 'write', { file_path: 'allowed.js', content: 'x' })).kind, 'deny')
+      assert.equal((await run(cx, outside, 'write', { file_path: join(ws, 'allowed.js'), content: 'x' })).kind, 'allow')
+    })
 
     // 最近已结束的流程是父链边界；热态与第一次调用即守卫的冷态必须一致。
-    const endedCwd = join(ws, 'ended workspace')
-    mkdirSync(endedCwd)
-    const endedHost = makeHost(endedCwd, 'finished-middle', { services })
-    await endedHost.tool('flowgate_start', { title: '已经结束的最近流程' })
-    await endedHost.tool('flowgate_cancel', { reason: '结束边界回归' })
-    headers.set('finished-middle', child('finished-middle', owner, endedCwd))
-    for (const header of [headers.get('finished-middle'), child('cold-after-finish', 'finished-middle', endedCwd, 2)]) {
-      assert.equal((await run(cx, header)).kind, 'allow')
-      const cold = makeHost(ws, owner, { services })
-      assert.equal((await run(cold, header)).kind, 'allow', header.id)
-      assert.equal(currentService().get('finished-middle'), null, '不改变 hydrate 对结束快照的处理')
-      assert.equal((await run(cold, child('still-owned', owner))).kind, 'deny', '其他真实后代仍受活动流程约束')
-    }
-    check('G07 已结束最近流程的持久化边界在冷热态一致，不套用更远祖先', () => assert.ok(true))
+    await checkAsync('G07 已结束最近流程的持久化边界在冷热态一致，不套用更远祖先', async () => {
+      const endedCwd = join(ws, 'ended workspace')
+      mkdirSync(endedCwd)
+      const endedHost = makeHost(endedCwd, 'finished-middle', { services })
+      await endedHost.tool('flowgate_start', { title: '已经结束的最近流程' })
+      await endedHost.tool('flowgate_cancel', { reason: '结束边界回归' })
+      headers.set('finished-middle', child('finished-middle', owner, endedCwd))
+      for (const header of [headers.get('finished-middle'), child('cold-after-finish', 'finished-middle', endedCwd, 2)]) {
+        assert.equal((await run(cx, header)).kind, 'allow')
+        const cold = makeHost(ws, owner, { services })
+        assert.equal((await run(cold, header)).kind, 'allow', header.id)
+        assert.equal(currentService().get('finished-middle'), null, '不改变 hydrate 对结束快照的处理')
+        assert.equal((await run(cold, child('still-owned', owner))).kind, 'deny', '其他真实后代仍受活动流程约束')
+      }
+    })
   } finally {
     rmSync(ws, { recursive: true, force: true })
     host.activate()
@@ -1479,19 +1496,26 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
 // 这时必须改用 child_process 直接跑 git，不能把变更摘要丢成空。
 // ---------------------------------------------------------------------------
 {
-  // 受限沙箱会禁止 spawn git（EPERM）：这时构造不出真实仓库，跳过这段而不是中断整套测试。
+  // 受限沙箱会禁止管道 stdio 的 spawn（EPERM），捕获一律走文件描述符，探到的才是真结论。
+  // 真找不到 git 时构造不出真实仓库，跳过这段而不是中断整套测试。
+  const probe = captureSync('git', ['--version'], { windowsHide: true, timeout: 5000 })
   let skipReason
-  try {
-    execFileSync('git', ['--version'], { windowsHide: true, timeout: 5000 })
-  } catch (error) {
-    if (!['ENOENT', 'EACCES', 'EPERM'].includes(error.code)) throw error
-    skipReason = '宿主无 shell 时的 Git 子进程用例未执行：Git 不可用（' + error.code + '）'
+  if (probe.error) {
+    if (!['ENOENT', 'EACCES', 'EPERM'].includes(probe.error.code)) throw probe.error
+    skipReason = '宿主无 shell 时的 Git 子进程用例未执行：Git 不可用（' + probe.error.code + '）'
+  } else if (probe.status !== 0) {
+    skipReason = '宿主无 shell 时的 Git 子进程用例未执行：git --version 退出码 ' + probe.status
   }
   if (skipReason) {
     console.log('FLOWGATE_TEST_SKIP ' + JSON.stringify({ reason: skipReason }))
   } else {
   const repo = mkdtempSync(join(tmpdir(), 'flowgate-repo-'))
-  const git = (args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8', windowsHide: true })
+  const git = (args) => {
+    const result = captureSync('git', args, { cwd: repo, windowsHide: true })
+    if (result.error) throw result.error
+    if (result.status !== 0) throw new Error('git ' + args.join(' ') + ' 失败：' + result.stderr)
+    return result.stdout
+  }
   git(['init', '-q'])
   git(['config', 'user.email', 'test@example.com'])
   git(['config', 'user.name', 'test'])
@@ -2728,24 +2752,33 @@ for (const [kind, reason, expected] of [
     check('Hub 空集固定第一页且总页数为1', () => {
       assert.deepEqual(emptyPage.body, { flows: [], currentFlow: null, total: 0, page: 1, pageSize: 10, totalPages: 1 })
     })
+    const invalidPages = []
     for (const body of [{ page: 0 }, { page: -1 }, { page: 1.5 }, { page: '2' }, { page: null }, { page: Number.MAX_SAFE_INTEGER + 1 }, { pageSize: 0 }, { pageSize: '10' }, { pageSize: null }]) {
-      assert.equal((await post('flows', { path: ws, ...body })).status, 400)
+      invalidPages.push((await post('flows', { path: ws, ...body })).status)
     }
     const plainFile = join(root, 'plain-file')
     writeFileSync(plainFile, 'text')
+    const invalidPaths = []
     for (const path of ['relative/path', plainFile, unlisted, join(root, 'missing')]) {
-      assert.equal((await post('flows', { path })).status, 400)
-      assert.equal((await post('rules', { path, rules: null })).status, 400)
+      invalidPaths.push((await post('flows', { path })).status)
+      invalidPaths.push((await post('rules', { path, rules: null })).status)
     }
-    assert.equal((await post('add', { path: plainFile })).status, 400)
+    const plainAdd = await post('add', { path: plainFile })
+    const invalidBodies = []
     for (const route of ['flows', 'rules']) {
-      assert.equal((await post(route, null)).status, 400)
-      assert.equal((await post(route, [])).status, 400)
+      invalidBodies.push((await post(route, null)).status)
+      invalidBodies.push((await post(route, [])).status)
       const spec = cx.routes.find((item) => item.path.endsWith('/hub/' + route))
       const response = await spec.fetch(new Request('http://host/api/flowgate/hub/' + route, { method: 'POST', body: '{' }))
-      assert.equal(response.status, 400)
+      invalidBodies.push(response.status)
     }
-    check('Hub 拒绝非法页码、未登记/相对/文件路径与非法请求体', () => {})
+    // 断言必须写进回调：写在 check 之前时，失败不会带上用例名，用例计数也照旧算通过（G13）。
+    check('Hub 拒绝非法页码、未登记/相对/文件路径与非法请求体', () => {
+      assert.deepEqual(invalidPages, Array.from({ length: 9 }, () => 400))
+      assert.deepEqual(invalidPaths, Array.from({ length: 8 }, () => 400))
+      assert.equal(plainAdd.status, 400)
+      assert.deepEqual(invalidBodies, Array.from({ length: 6 }, () => 400))
+    })
 
     const changed = { ...fixture(24), updatedAt: '2099-01-01T00:00:00.000Z', title: '外部更新' }
     writeFileSync(join(flowsDir, 'f_24.json'), JSON.stringify(changed))
@@ -2755,17 +2788,23 @@ for (const [kind, reason, expected] of [
       assert.equal(snapshotReads, 26)
     })
     writeFileSync(join(flowsDir, 'f_25.json'), JSON.stringify(fixture(25)))
-    assert.equal((await post('flows', { path: ws })).body.total, 26)
+    const pageAfterAdd = await post('flows', { path: ws })
     rmSync(join(flowsDir, 'f_00.json'))
-    assert.equal((await post('members', {})).body.members[0].flowCount, 25)
+    const membersAfterRemove = await post('members', {})
     writeFileSync(join(flowsDir, 'f_01.json'), '{bad')
-    assert.equal((await post('flows', { path: ws })).body.total, 24)
+    const pageAfterCorrupt = await post('flows', { path: ws })
     const afterCorruptRead = snapshotReads
     await post('flows', { path: ws, page: 2 })
-    assert.equal(snapshotReads, afterCorruptRead, '损坏快照不应每页重读')
+    const readsAfterPaging = snapshotReads
     writeFileSync(join(flowsDir, 'f_01.json'), JSON.stringify(fixture(1)))
-    assert.equal((await post('flows', { path: ws })).body.total, 25)
-    check('Hub 外部新增、删除、损坏与修复快照及时更新计数', () => {})
+    const pageAfterRepair = await post('flows', { path: ws })
+    check('Hub 外部新增、删除、损坏与修复快照及时更新计数', () => {
+      assert.equal(pageAfterAdd.body.total, 26)
+      assert.equal(membersAfterRemove.body.members[0].flowCount, 25)
+      assert.equal(pageAfterCorrupt.body.total, 24)
+      assert.equal(readsAfterPaging, afterCorruptRead, '损坏快照不应每页重读')
+      assert.equal(pageAfterRepair.body.total, 25)
+    })
 
     const defaults = await post('rules', { path: ws })
     const custom = { id: 'project-logs', name: '结构化日志', points: ['输出结构化字段'] }
@@ -2793,9 +2832,13 @@ for (const [kind, reason, expected] of [
       { ids: [], custom: [{ ...custom, name: '  ' }] },
       { ids: [], custom: [{ ...custom, points: [1] }] },
     ]
-    for (const rules of invalid) assert.equal((await post('rules', { path: ws, rules })).status, 400)
-    assert.deepEqual((await post('rules', { path: ws })).body, saved.body)
-    check('Hub 拒绝重复/未知/冲突规则ID、空名称和非法字段类型', () => {})
+    const invalidStatuses = []
+    for (const rules of invalid) invalidStatuses.push((await post('rules', { path: ws, rules })).status)
+    const afterInvalidRules = await post('rules', { path: ws })
+    check('Hub 拒绝重复/未知/冲突规则ID、空名称和非法字段类型', () => {
+      assert.deepEqual(invalidStatuses, Array.from({ length: invalid.length }, () => 400))
+      assert.deepEqual(afterInvalidRules.body, saved.body)
+    })
 
     fs.writeFileSync = function (file, ...args) {
       if (String(file).startsWith(configFile)) throw Object.assign(new Error('写入失败 EACCES'), { code: 'EACCES' })
@@ -2840,13 +2883,16 @@ for (const [kind, reason, expected] of [
     stale.finished = true
     writeFileSync(diskFile, JSON.stringify(stale))
     const memoryPage = await post('flows', { path: ws, pageSize: 50 })
-    assert.equal(memoryPage.body.flows.find((flow) => flow.id === state.body.id).title, '从 Hub 规则启动')
-    assert.equal((await post('members', {})).body.members[0].activeCount, 1)
+    const activeBefore = await post('members', {})
     await cx.request('/api/flowgate/action', { sessionId: 'hub-new-flow', action: 'cancel', payload: {} })
     const cancelled = await post('members', {})
-    assert.equal(cancelled.body.members[0].activeCount, 0)
-    assert.equal((await post('flows', { path: ws })).body.currentFlow, null, '放弃后恢复空闲主入口')
-    check('Hub 内存状态优先，取消后摘要计数立即刷新', () => {})
+    const afterCancelPage = await post('flows', { path: ws })
+    check('Hub 内存状态优先，取消后摘要计数立即刷新', () => {
+      assert.equal(memoryPage.body.flows.find((flow) => flow.id === state.body.id).title, '从 Hub 规则启动')
+      assert.equal(activeBefore.body.members[0].activeCount, 1)
+      assert.equal(cancelled.body.members[0].activeCount, 0)
+      assert.equal(afterCancelPage.body.currentFlow, null, '放弃后恢复空闲主入口')
+    })
 
     writeFileSync(configFile, JSON.stringify({ version: 1, rules: { ids: ['match-style', 'unknown', 'match-style'], custom: [] } }))
     const external = await post('rules', { path: ws })
@@ -2861,12 +2907,17 @@ for (const [kind, reason, expected] of [
       assert.equal(existsSync(configFile), false)
     })
     await post('remove', { path: ws })
-    assert.equal((await post('rules', { path: ws, rules: null })).status, 400)
+    const rulesAfterRemove = await post('rules', { path: ws, rules: null })
     rmSync(empty, { recursive: true })
-    assert.equal((await post('flows', { path: empty })).status, 400)
-    assert.equal((await post('rules', { path: empty })).status, 400)
-    assert.equal((await post('members', {})).body.members[0].missing, true)
-    check('Hub 已移除成员或已消失目录拒绝读取和写入', () => {})
+    const flowsAfterGone = await post('flows', { path: empty })
+    const rulesAfterGone = await post('rules', { path: empty })
+    const membersAfterGone = await post('members', {})
+    check('Hub 已移除成员或已消失目录拒绝读取和写入', () => {
+      assert.equal(rulesAfterRemove.status, 400)
+      assert.equal(flowsAfterGone.status, 400)
+      assert.equal(rulesAfterGone.status, 400)
+      assert.equal(membersAfterGone.body.members[0].missing, true)
+    })
   } finally {
     Object.assign(fs, originals)
     syncBuiltinESMExports()
@@ -2906,20 +2957,21 @@ for (const [kind, reason, expected] of [
       syncBuiltinESMExports()
       const restarted = makeHost(ws, 'read-new')
       const readService = currentService()
-      for (const header of [
-        { id: 'independent', cwd: ws, delegationDepth: 0 },
-        { id: 'independent-child', cwd: ws, delegationDepth: 1, origin: 'subagent', parentSession: 'independent' },
-        { id: 'unconfirmed-child', cwd: ws, delegationDepth: 1, origin: 'subagent', parentSession: 'read-existing' },
-      ]) {
-        const result = await restarted.handlers.get('tools/pre-execute')(
-          { name: 'write', arguments: { file_path: 'ordinary.js', content: 'x' }, agent: { session: { header } } },
-          async () => ({ kind: 'allow' }),
-        )
-        assert.equal(result.kind, 'allow', kind + ': ' + header.id)
-      }
-      assert.equal(readService.activity.size, 0)
-      assert.equal(readService.loaded.has(ws), false, '读失败不标记已恢复，权限修复后必须能重试')
-      check('G07 ' + kind + '失败不打断无关或归属无法确认的普通操作，不污染进度', () => assert.ok(true))
+      await checkAsync('G07 ' + kind + '失败不打断无关或归属无法确认的普通操作，不污染进度', async () => {
+        for (const header of [
+          { id: 'independent', cwd: ws, delegationDepth: 0 },
+          { id: 'independent-child', cwd: ws, delegationDepth: 1, origin: 'subagent', parentSession: 'independent' },
+          { id: 'unconfirmed-child', cwd: ws, delegationDepth: 1, origin: 'subagent', parentSession: 'read-existing' },
+        ]) {
+          const result = await restarted.handlers.get('tools/pre-execute')(
+            { name: 'write', arguments: { file_path: 'ordinary.js', content: 'x' }, agent: { session: { header } } },
+            async () => ({ kind: 'allow' }),
+          )
+          assert.equal(result.kind, 'allow', kind + ': ' + header.id)
+        }
+        assert.equal(readService.activity.size, 0)
+        assert.equal(readService.loaded.has(ws), false, '读失败不标记已恢复，权限修复后必须能重试')
+      })
       for (let retry = 0; retry < 2; retry++) {
         const page = await restarted.request('/api/flowgate/hub/flows', { path: ws })
         assert.equal(page.status, 500)
@@ -5167,13 +5219,20 @@ for (const listedCommands of [[], ['node --check lib/index.js']]) {
   try {
     writeFileSync(preload, 'require("node:fs").writeFileSync(' + JSON.stringify(marker) + ', "preload")\n')
     writeFileSync(source, 'require("node:fs").writeFileSync(' + JSON.stringify(bodyMarker) + ', "body")\n')
-    const options = { cwd: ws, env: { ...process.env, NODE_OPTIONS: '' }, stdio: 'pipe' }
-    // 沙箱里禁止 spawn 子进程时这里会抛 EPERM。那是环境限制，不是 --check 的语义变了：
-    // 真进程验证只在具备该能力的环境跑，跳过时留痕，免得整套测试在中途被环境问题吞掉，
-    // 连后面真正的用例一起跑不到。
+    // 捕获走 captureSync：受限沙箱拒绝管道 stdio，文件描述符不拒绝。
+    // 真起不来进程时跳过并留痕，免得整套测试被环境问题吞掉、连后面真正的用例一起跑不到。
+    const nodeCheck = (args) => {
+      const result = captureSync(process.execPath, ['--check', ...args], {
+        cwd: ws,
+        env: { ...process.env, NODE_OPTIONS: '' },
+      })
+      if (result.error) throw result.error
+      if (result.status !== 0) throw new Error('node --check 失败：' + result.stderr)
+      return result
+    }
     let spawnable = true
     try {
-      execFileSync(process.execPath, ['--check', source], options)
+      nodeCheck([source])
     } catch (error) {
       if (error?.code !== 'EPERM') throw error
       spawnable = false
@@ -5184,7 +5243,7 @@ for (const listedCommands of [[], ['node --check lib/index.js']]) {
         assert.equal(existsSync(bodyMarker), false)
         assert.equal(existsSync(marker), false)
       })
-      execFileSync(process.execPath, ['--check', '--require', preload, source], options)
+      nodeCheck(['--require', preload, source])
       check('真实 Node --check --require 仍执行 preload 并写盘', () => {
         assert.equal(readFileSync(marker, 'utf8'), 'preload')
         assert.equal(existsSync(bodyMarker), false)

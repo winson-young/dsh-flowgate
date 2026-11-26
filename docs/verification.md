@@ -8,6 +8,26 @@
 
 历史记录中的 `by: 'subagents'` 仅表明调用了子代理聚合入口；聚合报告通过、`blocking: 0` 或流程走完，均不能证明真实子代理成功执行并返回有效报告。下文原有结论保留，其证据范围受此限定。
 
+## 受限沙箱下的测试链路自证（2026-11-27）
+
+需求：用户原文「这个问题还存在吗？」（承接 G13：五处 `check()` 传空函数），随后授权「做元验证吧」并贴来外部建议「DSH 沙箱拦的是管道 stdio 派生进程，试试文件描述符」。本条同时记录元验证落地与 EPERM 移植两件事。
+
+**元验证（G13 的防线）**：新增 [scripts/verify-checks.mjs](../scripts/verify-checks.mjs)，对 `test/*.test.mjs` 做手写词法扫描——`codeMask` 逐字区分代码态与注释 / 字符串 / 模板 / 正则，`findCalls` 找裸 `check(` 并按括号配平取回调，`classify` 判空回调、只有 `assert.ok(true)`、自己等于自己三类退化。扫描器自带 18 例 `SELF_TESTS`，走与真实扫描相同的 `scanSource`，默认先自检再扫描。`test/host.test.mjs` 五处 `assert.ok(true)` 占位一并换成 `await checkAsync(名称, async () => {...})` 的真断言。
+
+**EPERM 移植**：实证结论是沙箱拦管道不拦 spawn——`stdio: 'pipe'` 报 `EPERM`，`stdio: ['ignore', fd, fd]` 正常退出并写满输出。新增 `scripts/capture-child.mjs`（`captureSync` / `capture`），把 `test/host.test.mjs`、`test/test-runner.test.mjs`、`scripts/run-tests.mjs`、`scripts/publish.mjs`、`scripts/check-syntax.mjs` 的子进程捕获全部改走文件描述符；`lib/index.js` 的 `gitSummaryText` 也从 `promisify(execFile)` 换成同款 `captureCommand`（宿主没有 shell 服务时的兜底采集）。
+
+| 验收项 | 状态 | 证据与限制 |
+| --- | --- | --- |
+| check 契约扫描能拦住退化 | 通过 | `node scripts/verify-checks.mjs` 输出 `check 契约自检通过：18 个用例` 与 `check contracts verified (668 calls in 11 files).`；临时夹具里放空回调 / `assert.ok(true)` / `assert.equal(1,1)` 三条，脚本逐条报出并退出 1 |
+| 占位断言换成真断言且项数不减 | 通过 | `node test/host.test.mjs` 414 项；把其中一处期望值临时改成错的，输出 `FAIL G07 异常元数据…` 且退出 1，证明用例名真的绑上了失败 |
+| 沙箱里一条命令跑全量 | 通过 | `node scripts/run-tests.mjs` 从「十四套全 NOT_RUN、EXIT=1」变成 `revisions=PASS … runner=PASS`、`EXIT=0`、91 秒 |
+| 兜底采集在沙箱里能跑通 | 通过 | `test/host.test.mjs` 从 414 项变成 417 项，多出的三条正是原先被跳过 / 失败的「没有 shell 服务时改用 child_process 采集变更摘要」 |
+| `npm pack` 在沙箱里能跑 | 通过 | `test/publish.test.mjs` 26/26；根因是 npm 要往默认 cache 写日志被判不可写，夹具改为临时 `npm_config_cache`（`loglevel=silent` 实测无效） |
+
+限制：此前各节记的「`npm run test:host` 在本机跑不完（`execFileSync` 抛 `spawnSync ... EPERM`）」与「`npm test` 全 `NOT_RUN`」都是当时快照，现状见上表。
+
+`test/subagents.test.mjs` 只能直跑——顶层 `await test(...)` 与 `--experimental-test-isolation=none` 在 Node 26.13.1 下会挂死（三行最小复现，超时退出 124），聚合器里它的完成标记因此是直跑的 `ℹ tests N`。以上全部在本机会话实测，没有在别的机器或 CI 上复现过。
+
 ## 审计流水补权限模式、退出码与提权事件（2026-11-26）
 
 需求：用户原文「审计流水不记录权限提升与退出码」。三件事——`auditShell` 的 `detail` 补宿主当前沙箱模式 `mode`（取不到写 `'unknown'`，不省略）；执行结果补一条独立事件带 `exitCode`；提权申请与批准各写一条独立事件，与 `shell.allowed` 分开。执行目录已在上一轮补上，本次不重复。

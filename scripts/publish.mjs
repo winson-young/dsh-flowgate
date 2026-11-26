@@ -15,11 +15,12 @@
  *   FLOWGATE_PKG_DIR       发布目录，默认 D:/Plugins/flowgate-pkg
  *   FLOWGATE_PROFILE_DIR   profile 目录，默认 ~/.dsh/profiles/desktop
  */
-import { execFileSync } from 'node:child_process'
+import { spawnSync } from 'node:child_process'
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { homedir, tmpdir } from 'node:os'
+import { captureSync } from './capture-child.mjs'
 import {
   evaluateVersionGate,
   fingerprintLines,
@@ -55,7 +56,20 @@ function readJson(path) {
 
 /** npm 在 Windows 上是 npm.cmd，统一走 shell 才能跨平台。 */
 function run(command, args, options = {}) {
-  return execFileSync(command, args, { cwd: ROOT, shell: true, encoding: 'utf8', ...options })
+  // stdio 显式给了值（例如 'inherit'）就原样透传：那不是管道，沙箱不拦。
+  if (options.stdio) return spawnSync(command, args, { cwd: ROOT, shell: true, ...options })
+  // 默认捕获走 captureSync：受限沙箱拒绝管道 stdio，文件描述符不拒绝。
+  const result = captureSync(command, args, { cwd: ROOT, shell: true, ...options })
+  if (result.error) throw result.error
+  if (result.status !== 0) {
+    const error = new Error(`命令失败：${command} ${args.join(' ')}`)
+    error.status = result.status
+    error.signal = result.signal
+    error.stdout = result.stdout
+    error.stderr = result.stderr
+    throw error
+  }
+  return result.stdout
 }
 
 const pkg = readJson(join(ROOT, 'package.json'))
