@@ -4,6 +4,8 @@
 
 以下记录迁自原使用说明，保留当时的环境与结果，不代表本次文档修改重新执行了这些测试。表中的 AC / D 编号沿用当时验收项编号。当前操作方法以[使用指南](../README.md)为准，测试命令见[开发与维护](development.md#测试)。
 
+**怎么读这份记录。** 每一节是一个时间点的快照，节内数字只对那一刻成立：测试套数与项数随用例增补逐节变大（758、760、763、799 …），彼此不同不是矛盾；「六个模块」是 `lib/ecosystems.js` 加入之前的说法，现在是七个，唯一来源是 `lib/runtime.js` 的 `HOST_MODULES`，不要照抄本节数字。**引用测试位置一律用用例标题，不写行号**——行号随用例增补必漂，标题不会；早期出现过的 `test/xxx.test.mjs:行号` 已按当前文件改成标题引用。要看当前值请直接跑 `npm test` 与 `npm run check`。
+
 历史记录中的 `by: 'subagents'` 仅表明调用了子代理聚合入口；聚合报告通过、`blocking: 0` 或流程走完，均不能证明真实子代理成功执行并返回有效报告。下文原有结论保留，其证据范围受此限定。
 
 ## 审计流水补权限模式、退出码与提权事件（2026-11-26）
@@ -25,7 +27,7 @@
 | AC-2 执行结果独立成 `shell.result` 并带 `exitCode` | 通过 | 同一条用例注入 `exitCode: 3` 的结果，断言事件类型与数值；后台任务那条断言 `exitCode === null` 且 `background === true` |
 | AC-3 提权申请写 `sandbox.escalated`，与 `shell.allowed` 分开 | 通过 | 同一条用例断言 `tool` / `command` / `from` / `to` / `justification` 五个字段，并断言同一窗口内判定侧仍有一条 `shell.allowed` |
 | AC-4 提权结论分别落成 `sandbox.approved` / `sandbox.denied` | 通过 | `effective` 等于目标时 approved、仍是 `workspace-write` 时 denied 且 `detail.reason` 为「提权未生效」 |
-| AC-5 既有审计断言未被放宽 | 通过 | `test/subagents.test.mjs:418-421` 的 `deepEqual` 只映射 `[type, detail.dir, detail.cwd]`，新增字段不影响；`npm test` 十三套全 PASS |
+| AC-5 既有审计断言未被放宽 | 通过 | `test/subagents.test.mjs` 的 `deepEqual` 只映射 `[type, detail.dir, detail.cwd]`，新增字段不影响；`npm test` 十三套全 PASS |
 
 限制：
 
@@ -53,7 +55,7 @@
 
 | 验收项 | 状态 | 证据与限制 |
 | :--- | :--- | :--- |
-| AC-1 status 在两个分支都返回七个版本字段，schema 与返回值同步 | 通过 | `test/host.test.mjs:238` 断言无流程分支七个字段的类型；同文件新增「G38 status 的 output.schema 把七个版本字段都列为 required」逐键核对 `required` 与 `properties`，并断言 `properties` 的键集合与无流程分支返回值完全一致（`additionalProperties` 为 false，多一个少一个都会当场露出来） |
+| AC-1 status 在两个分支都返回七个版本字段，schema 与返回值同步 | 通过 | `test/host.test.mjs`「G38 无流程时 status 也带齐七个版本字段」断言无流程分支七个字段的类型；同文件新增「G38 status 的 output.schema 把七个版本字段都列为 required」逐键核对 `required` 与 `properties`，并断言 `properties` 的键集合与无流程分支返回值完全一致（`additionalProperties` 为 false，多一个少一个都会当场露出来） |
 | AC-2 宿主层不受页面层拖累 | 通过 | `test/runtime.test.mjs`「宿主层只按模块指纹判定，页面侧问题不拖累它」：七个模块全通过、期望指纹为空时，宿主层仍是 `verified`，只有页面层降级为 `unverified` |
 | AC-3 页面层四态可区分 | 通过 | `test/runtime.test.mjs`「页面层四态可区分：已核对、不一致、未参与、读不懂」：五种输入依次得到 `verified` / `mismatch` / `absent` / `unverified`（期望读不到）/ `unverified`（带 `rejected` 标记），且后两种 `reason` 文本不同；同文件「被拒或没指纹的旧上报同样会过期，过期后一律 absent」断言 `rejected` 与 `reported` 两条旧记录在 30 秒后都落成 `absent`、`expired` 为 `true`，并断言原因走结构化字段（`rejectedReason` 为「指纹不是 64 位十六进制」、`reportedWithoutRevision` 为 `true`），`describeRuntime` 据此补出「上次记录被拒（…）」，未过期时仍区分 |
 | AC-4 非法上报记 `rejected` 且清掉旧可信记录 | 通过 | `test/integration.test.mjs`「非法指纹记 rejected 并清掉旧可信记录，只有完全不带上报才算没参与」：`invalid` 上报后 `clientStatus` 为 `unverified`、`runtimeStatus` 仍为 `verified`、`clientReason` 匹配「上报被拒」；同一会话不带上报再查为 `absent` |
@@ -81,25 +83,25 @@
 
 | 验收项 | 状态 | 证据与限制 |
 | :--- | :--- | :--- |
-| AC-1 含换行的命令在任何阶段都被拒，理由指认换行 | 通过 | `test/host.test.mjs:3892` 覆盖四个阶段、首尾换行、纯换行、`\r` 和 `\r\n`。拒绝理由点明多行命令和换行分隔符 |
-| AC-2 带目录后缀的条目剥掉后缀后仍按前缀通配 | 通过 | `test/host.test.mjs:3908` 验证无后缀通配在流程根放行 `npm run build`。带后缀的通配在 `packages/web` 放行同一命令，在流程根拒绝 |
-| AC-3 S1 提交含换行的清单条目被拒并说明换行是分隔符 | 通过 | `test/host.test.mjs:3759` 断言命令体、目录后缀前和条目末尾的换行均导致提交失败，报错指出换行问题 |
-| AC-4 不带目录后缀的条目只在流程根放行 | 通过 | `test/host.test.mjs:3917`；无 cwd 与流程根都放行，`packages/web` 拒。另由 `test/host.test.mjs:3935`「AC-4 workdir 参数同样决定执行目录，不能用它绕过目录后缀」覆盖 `ops_bash({ command, workdir })` 这个入口：`workdir: '.'` 与流程根都放行，相对 `packages/web`、绝对子目录、`tmpdir()` 全部拒；反过来条目声明了子目录时只认 `workdir` 指向的那一个目录，不带 `workdir` 仍按流程根判定 |
-| AC-5 带 `[packages/web]` 的条目只在该目录精确匹配 | 通过 | `test/host.test.mjs:3924` 验证目标目录放行，拒绝父目录、子目录和根外目录。`:3969` 验证目录链接指向与声明路径不一致时拒绝授权 |
-| AC-6 S2 / S4 的 `working_directory` 只能在流程根内换目录 | 通过 | `test/host.test.mjs:3826` 经 S2 宿主守卫验证相对子目录放行、根外绝对路径拒绝、查询放行。`test/host.test.mjs:3953` 和 `:3969` 覆盖 S2 和 S4 的其他路径输入、缺失目录与目录链接 |
-| AC-7 每次 shell 判定审计事件带 cwd，待补队列条目带 cwd | 通过 | `test/integration.test.mjs`「AC-7 审计流水与待补队列都记下执行目录」；`test/integration.test.mjs:484` 验证审计事件和待补条目都记录 `dir` 与绝对路径 `cwd`。第二个入口由 `test/integration.test.mjs:529`「AC-7 命令带 workdir 时按 workdir 判定，审计与待补队列都记子目录」覆盖：`ops_bash({ command, workdir: 'packages/web' })` 被拒后待补条目 `dir === 'packages/web'`，同一命令不带 `workdir` 再拒一次，两次审计分别记录子目录与流程根的相对 `dir` 和绝对 `cwd`。`:553` 验证空命令拒绝也写审计，且不加入待补队列。`test/subagents.test.mjs:413` 验证直达守卫的子代理调用各生成一条审计 |
-| AC-8 S3 / S4 子代理 shell 与主 Agent 同一套 cwd 规则 | 通过 | `test/subagents.test.mjs:382`「AC-8 子代理 shell 与主 Agent 同一套目录规则」；子会话在流程根跑 `node --test … [packages/web]` 被拒、`npm test` 放行、含换行命令拒且理由点名换行。同一条用例的 `:405` 起覆盖 `workdir` 这个入口：子会话 `header.cwd` 在流程根但带 `workdir: 'packages/web'` 时，指向被批准子目录的命令放行、流程根批准的命令被拒；主 Agent 侧同样两向断言 |
-| AC-9 工作台展示带目录后缀条目时补「仅限 packages/web 目录」 | 通过 | `test/client.test.mjs:1746`「AC-9 命令清单里带目录的条目补一句执行目录」；断言含条目原文、`仅限 packages/web 目录内执行`、`方括号后缀是执行目录`、`没有后缀的条目只认流程根目录` |
-| AC-10 补进清单自动带上被拒时所在目录的后缀 | 通过 | `test/integration.test.mjs:512`「AC-10 补进清单时自动带上被拒时的目录后缀」；退回 S1 后 `pendingScope.commands` 深等于 `[command + ' [packages/web]']`，重新批准后冻结清单保留带后缀条目。`:565` 验证无效目录无法补录，同名待补命令按目录独立处理 |
+| AC-1 含换行的命令在任何阶段都被拒，理由指认换行 | 通过 | `test/host.test.mjs`「AC-1 含换行的命令在任何阶段都被拒，理由指认换行」覆盖四个阶段、首尾换行、纯换行、`\r` 和 `\r\n`。拒绝理由点明多行命令和换行分隔符 |
+| AC-2 带目录后缀的条目剥掉后缀后仍按前缀通配 | 通过 | `test/host.test.mjs`「AC-2 带目录后缀的条目剥掉后缀后仍按前缀通配」验证无后缀通配在流程根放行 `npm run build`。带后缀的通配在 `packages/web` 放行同一命令，在流程根拒绝 |
+| AC-3 S1 提交含换行的清单条目被拒并说明换行是分隔符 | 通过 | `test/host.test.mjs`「无法生效的命令条目在提交时就拒绝，不留待批准文档」断言命令体、目录后缀前和条目末尾的换行均导致提交失败，报错指出换行问题 |
+| AC-4 不带目录后缀的条目只在流程根放行 | 通过 | `test/host.test.mjs`「AC-4 不带目录后缀的条目只在流程根放行」；无 cwd 与流程根都放行，`packages/web` 拒。另由 `test/host.test.mjs`「AC-4 workdir 参数同样决定执行目录，不能用它绕过目录后缀」覆盖 `ops_bash({ command, workdir })` 这个入口：`workdir: '.'` 与流程根都放行，相对 `packages/web`、绝对子目录、`tmpdir()` 全部拒；反过来条目声明了子目录时只认 `workdir` 指向的那一个目录，不带 `workdir` 仍按流程根判定 |
+| AC-5 带 `[packages/web]` 的条目只在该目录精确匹配 | 通过 | `test/host.test.mjs`「AC-5 带 [packages/web] 的条目只在该目录精确匹配」验证目标目录放行，拒绝父目录、子目录和根外目录。同文件「AC-5 / AC-6 按实际目录拒绝不一致的目录别名」验证目录链接指向与声明路径不一致时拒绝授权 |
+| AC-6 S2 / S4 的 `working_directory` 只能在流程根内换目录 | 通过 | `test/host.test.mjs`「AC-6 S2 / S4 的 working_directory 只能在流程根之内换目录」经 S2 宿主守卫验证相对子目录放行、根外绝对路径拒绝、查询放行。同文件「AC-5 / AC-6 按实际目录拒绝不一致的目录别名」覆盖 S2 和 S4 的其他路径输入、缺失目录与目录链接 |
+| AC-7 每次 shell 判定审计事件带 cwd，待补队列条目带 cwd | 通过 | `test/integration.test.mjs`「AC-7 审计流水与待补队列都记下执行目录」；同一条用例验证审计事件和待补条目都记录 `dir` 与绝对路径 `cwd`。第二个入口由 `test/integration.test.mjs`「AC-7 命令带 workdir 时按 workdir 判定，审计与待补队列都记子目录」覆盖：`ops_bash({ command, workdir: 'packages/web' })` 被拒后待补条目 `dir === 'packages/web'`，同一命令不带 `workdir` 再拒一次，两次审计分别记录子目录与流程根的相对 `dir` 和绝对 `cwd`。「AC-7 空命令拒绝有审计且不进入待补队列」验证空命令拒绝也写审计，且不加入待补队列。`test/subagents.test.mjs` 验证直达守卫的子代理调用各生成一条审计 |
+| AC-8 S3 / S4 子代理 shell 与主 Agent 同一套 cwd 规则 | 通过 | `test/subagents.test.mjs`「AC-8 子代理 shell 与主 Agent 同一套目录规则」；子会话在流程根跑 `node --test … [packages/web]` 被拒、`npm test` 放行、含换行命令拒且理由点名换行。同一条用例还覆盖 `workdir` 这个入口：子会话 `header.cwd` 在流程根但带 `workdir: 'packages/web'` 时，指向被批准子目录的命令放行、流程根批准的命令被拒；主 Agent 侧同样两向断言 |
+| AC-9 工作台展示带目录后缀条目时补「仅限 packages/web 目录」 | 通过 | `test/client.test.mjs`「AC-9 命令清单里带目录的条目补一句执行目录」；断言含条目原文、`仅限 packages/web 目录内执行`、`方括号后缀是执行目录`、`没有后缀的条目只认流程根目录` |
+| AC-10 补进清单自动带上被拒时所在目录的后缀 | 通过 | `test/integration.test.mjs`「AC-10 补进清单时自动带上被拒时的目录后缀」；退回 S1 后 `pendingScope.commands` 深等于 `[command + ' [packages/web]']`，重新批准后冻结清单保留带后缀条目。`test/client.test.mjs`「待补命令按目录单独勾选，无法补录的目录只显示原因」验证无效目录无法补录，同名待补命令按目录独立处理 |
 | 超宽判定不被后缀绕过 | 通过 | `test/acceptance.test.mjs`；`npm * [.]`、`node * [packages/web]`、`* [packages/web]`、`PYTHON * [ a/b ]` 仍为 true，`npm run * [packages/web]` 与 `node test/host.test.mjs [.]` 为 false |
 
 限制：
 
-- `npm run test:host` 在本机跑不完。`test/host.test.mjs:4777` 的 `execFileSync(process.execPath, ['--check', source], options)` 抛 `spawnSync C:\nvm4w\nodejs\node.exe EPERM`（errno -4048），本机沙箱禁止测试进程再起 Node 子进程；该用例在本次改动之前同样失败，与本次改动无关。本轮 360 项输出 `ok`，其中包含 AC-1 至 AC-6 对应断言。
-- 客户端 239 项、集成 41 项、子代理 75 项、验收体检 39 项和门禁 10 项全部通过。`npm run check` 校验 7 个模块的修订和语法。
-- 改完 `lib/*.js` 必须跑 `npm run stamp`：本轮两次遇到 `test/integration.test.mjs:733` 断言 `runtime.status === 'verified'` 实际为 `mismatch`，都是模块 revision 没重算，stamp 后（`Updated module revisions: 2/7.`）通过。
+- `npm run test:host` 在本机跑不完。`test/host.test.mjs`「batch root 与执行 cwd 按流程根 scope 隔离」里的 `execFileSync(process.execPath, ['--check', source], options)` 抛 `spawnSync C:\nvm4w\nodejs\node.exe EPERM`（errno -4048），本机沙箱禁止测试进程再起 Node 子进程；该用例在本次改动之前同样失败，与本次改动无关。本轮 360 项输出 `ok`，其中包含 AC-1 至 AC-6 对应断言。
+- 当时逐套跑的结果：客户端、集成、子代理、验收体检与门禁各套全部通过（当时记录的项数分别为 239 / 41 / 75 / 39 / 10；用例此后有增补，这组数字不再维护）。`npm run check` 校验七个宿主模块的修订并做全量语法检查。
+- 改完 `lib/*.js` 必须跑 `npm run stamp`：本轮两次遇到 `test/integration.test.mjs`「state 只根据真实上报的客户端代码指纹核对页面版本」断言 `runtime.status === 'verified'` 实际为 `mismatch`，都是模块 revision 没重算，stamp 后（`Updated module revisions: 2/7.`）通过。
 - 界面部分只做了组件渲染断言（`test/client.test.mjs`），没有在真实宿主里点过带目录后缀的条目；真实门禁交互仍需重载插件后手动确认。
-- `npm test` 的首套 `test/provenance.test.mjs` 在本机有一项失败：第 14 项 `external directory junction is rejected before reading its target` 的清理阶段抛 `ENOTEMPTY: directory not empty, rmdir 'C:\\Users\\lonsdor\\AppData\\Local\\Temp\\dsh-Dn98Xt\\flowgate-provenance-gp0y96\\workspace'`（`test/provenance.test.mjs:32` 的 `fixture` 收尾 `fs.rmSync`）。断言本身在此之前都已通过，失败出在临时目录里那个 Windows junction 的删除上，与本次改动无关——本次没有动 `lib/provenance.js`，也没有动 `test/provenance.test.mjs`（`git status` 里两者都不在改动列表）。因此 `npm test` 的串行链在首套就中断，后八套改为逐条单独跑：`test:host` 受上面的 EPERM 限制，此前逐套运行的其余七套均通过。本轮验收使用上面列出的回归结果。
+- `npm test` 的首套 `test/provenance.test.mjs` 在本机有一项失败：第 14 项 `external directory junction is rejected before reading its target` 的清理阶段抛 `ENOTEMPTY: directory not empty, rmdir 'C:\\Users\\lonsdor\\AppData\\Local\\Temp\\dsh-Dn98Xt\\flowgate-provenance-gp0y96\\workspace'`（`test/provenance.test.mjs` 的 `fixture` 收尾 `fs.rmSync`）。断言本身在此之前都已通过，失败出在临时目录里那个 Windows junction 的删除上，与本次改动无关——本次没有动 `lib/provenance.js`，也没有动 `test/provenance.test.mjs`（`git status` 里两者都不在改动列表）。因此 `npm test` 的串行链在首套就中断，后八套改为逐条单独跑：`test:host` 受上面的 EPERM 限制，此前逐套运行的其余七套均通过。本轮验收使用上面列出的回归结果。
 
 ## CDP 调试通道与界面验证脚本落地（2026-11-23）
 
@@ -120,7 +122,7 @@
 | AC-3 capture-ui 在 Electron 上能跑完 | 通过 | 复用模式：130 个场景、260 次布局快照、652 项检查，`failedChecks` / `errors` / `overflows` / `layoutIssues` 全为空，`originalTabsPreserved: true`，退出码 0 |
 | AC-4 capture-ui 在普通 Chrome 上仍走新建标签 | 通过 | headless Chrome 157.0.8103.79（9229）同样 130 / 260 / 652，无异常，退出码 0；该路径下未触发复用分支 |
 | AC-5 三处过时断言已修正 | 通过 | 修正前两处必错（`startsWith` of undefined、`null.click`），修正后两处环境 0 失败 |
-| AC-6 `npm run check` 覆盖新脚本 | 通过 | `package.json` 的 `check` 追加 `docs/capture-ui.mjs` 与 `scripts/start-cdp.mjs` 的 `node --check`，输出 `Module revisions verified (7 modules).` 后退出码 0 |
+| AC-6 `npm run check` 覆盖新脚本 | 通过 | 当时在 `package.json` 的 `check` 里追加了 `docs/capture-ui.mjs` 与 `scripts/start-cdp.mjs` 的 `node --check`，输出 `Module revisions verified (7 modules).` 后退出码 0。现在 `check` 已改为按目录展开（`node scripts/check-syntax.mjs` 遍历 `lib/`、`docs/`、`scripts/`、`test/`），新增脚本自动纳入，不再逐条手写 |
 | AC-7 真实门禁元素的视觉取证 | 未执行 | 当前 `.dsh-flowgate/flows/` 没有未完成流程，取不到真实门禁元素；`inspectLayout` 在无 sessionId 时按设计返回 `status: uncovered`（reason「必须明确指定真实任务的 sessionId。」）。截图本轮用 `--verify-only`，未覆盖 `docs/images/` 下的既有图片 |
 
 限制：以上界面结果全部来自 `file:` 预览加载源码组件与模拟接口，不证明真实 DSH 已加载本轮改动；`verify-layout` 那次取证用的是已认证的真实桌面端页面，只证明版本核对与布局测量链路可用，不证明门禁交互通过。
@@ -141,13 +143,13 @@
 
 | 验收项 | 状态 | 证据与限制 |
 | :--- | :--- | :--- |
-| AC-1 被拒命令进待补队列，不再是单值字段 | 通过 | `test/host.test.mjs:569` 断言 `pendingCommands` 含 `git checkout -- src/api/middleware.ts` 且 `stage === 'S2'`，并断言 `'deniedCommand' in body === false` |
-| AC-2 拒绝文案指向待补决定，且禁止换写法重试 | 通过 | `test/host.test.mjs:561`、`:885`、`:3664` 三处断言 /已记进待补清单/；S2 那处另断言 /不要换别的写法再试一次/ |
+| AC-1 被拒命令进待补队列，不再是单值字段 | 通过 | `test/host.test.mjs`「被拒命令进待补队列，供门禁二选一」断言 `pendingCommands` 含 `git checkout -- src/api/middleware.ts` 且 `stage === 'S2'`，并断言 `'deniedCommand' in body === false` |
+| AC-2 拒绝文案指向待补决定，且禁止换写法重试 | 通过 | `test/host.test.mjs` 的「变更性 shell 在 S2 被拒，并指向 scope 清单与待补决定」「S4 清单外的测试命令被拒，只给待补队列」「S2 清单内命令不需要开关就放行，清单外仍然拒」三处断言 /已记进待补清单/；S2 那处另断言 /不要换别的写法再试一次/ |
 | AC-3 门禁只给补 / 不补两个按钮 | 通过 | `test/client.test.mjs` 「被拒命令在门禁上给出补 / 不补二选一」断言命令原文、「本轮评审与测试需要重跑」、「这些命令之后仍然会被拒」，点「补进清单并重新批准」提交 `reopenScopeForCommands` 且 `payload.commands === ['npm run build']` |
 | AC-4 不补要二次确认，确认后记账继续 | 通过 | `test/client.test.mjs` 「点「不补」先要确认」断言首次点击不发请求、确认区含「依赖它们的验收标准会记成未覆盖」，确认后提交 `declineScopeCommands` |
 | AC-5 勾选可去掉某条，只补剩下的 | 通过 | `test/client.test.mjs` 「取消勾选后只补剩下的那条，按钮文案跟着变」：两条待补命令两个勾选框、默认全选，取消第一条后按钮变「补进清单（1 条）并重新批准」，提交只剩第二条 |
-| AC-6 补清单没有旁路：队列外的命令加不进去 | 通过 | `supplementScopeCommands` 经 `resolveChosenCommands` 逐条核对，队列外的命令抛「只能补待补清单里的命令」；队列为空时抛「没有「顺手加一条」的旁路」。由 `test/host.test.mjs:3818` 组的改写作前提（先让命令真被拒再补） |
-| AC-7 流程结束后视图不再带队列 | 通过 | `test/host.test.mjs:975` 断言 `pendingCommands` 与 `declinedCommands` 均为空数组 |
+| AC-6 补清单没有旁路：队列外的命令加不进去 | 通过 | `supplementScopeCommands` 经 `resolveChosenCommands` 逐条核对，队列外的命令抛「只能补待补清单里的命令」；队列为空时抛「没有「顺手加一条」的旁路」。由 `test/host.test.mjs`「补全 scope 后缺口消失，不需要接受例外就能冻结」那组的改写作前提（先让命令真被拒再补） |
+| AC-7 流程结束后视图不再带队列 | 通过 | `test/host.test.mjs`「AC6 流程结束后视图不再有授权字段」断言 `pendingCommands` 与 `declinedCommands` 均为空数组 |
 | 实机点击验证 | 未执行 | 需要在运行中的宿主里重载插件后手动走一遍「被拒 → 门禁二选一」；本轮只做自动化验证 |
 
 ## 快捷入口与工作台对齐，S1 缺口不再交给用户接受（2026-11-23）
@@ -196,12 +198,12 @@
 
 | 验收项 | 状态 | 证据与限制 |
 | :--- | :--- | :--- |
-| AC-1 变更性命令只有 scope 清单一个来源 | 通过 | `test/host.test.mjs:425`「变更性 shell 在 S2 被拒，并指向 scope 清单与退回入口」断言拒绝文案含「变更性命令只有一条通道」与「退回 S1 补命令清单」，且 `'shellGrant' in body === false`；`:451`「清单外的构建命令被拒，没有可勾选的授权通道」断言 `npm run build` 被拒且 `view.deniedCommand.command === 'npm run build'` |
-| AC-2 授权开关的动作与字段全部消失 | 通过 | `test/host.test.mjs:331`「命令授权开关已退场，S1 也开不了」断言 `toggleShellGrant` 返回 409「未知操作」；D2 段断言 `toggleWriteGrant` / `declareDirectionWrite` 同样 409，方向对象无 `needsWrite` / `writeGranted`，视图无 `writeGrants` / `directionWriteDeclared` |
-| AC-3 被拒命令能一键退回 S1 补清单 | 通过 | `test/client.test.mjs:1984`「被拒命令给出退回 S1 补清单的入口」断言提示含命令原文、「不在 scope 命令清单里」「本轮评审与测试需要重跑」，点按钮后提交 `action: 'reopenScopeForCommands'` 且 `payload.command` 为被拒命令；服务端侧由 `test/host.test.mjs:3407` 附近的命令清单用例覆盖 `scope.reopened` 与预填 |
-| AC-4 旧快照的授权字段冷恢复后被清洗 | 通过 | `test/host.test.mjs:2796`「旧快照里的授权字段冷恢复后被清洗」手写 `shellGrant: true` / `writeGrants: ['smoke']` / `directionWriteDeclared: ['smoke']` 落盘，新宿主读回后视图与磁盘均无这些字段 |
-| AC-5 测试子代理只按清单放行，方向不带权限 | 通过 | `test/subagents.test.mjs:642`「S4 子代理只看 scope 清单：清单内放行、清单外一律拒，没有方向级写权限」：`npm test` 放行，`touch fixture-output`、`ops_write_file`、未知工具、带 `sandbox_permissions` 的 `pwd` 全部拒绝；`:928` 覆盖运行中改方向配置后约束不变 |
-| AC-6 界面没有任何权限勾选框 | 通过 | `test/client.test.mjs:1937`「S2 不再提供命令授权勾选框，只说明清单放行」与 `:1966`「S4 命令入口只列 scope 清单，不给勾选」均断言 `checkboxNodes(tree).length === 0` 且不含「允许执行构建/测试命令」；`:2633`「测试方向面板不再出现写权限声明与授权」断言三处旧文案消失 |
+| AC-1 变更性命令只有 scope 清单一个来源 | 通过 | `test/host.test.mjs`「变更性 shell 在 S2 被拒，并指向 scope 清单与待补决定」断言拒绝文案含「变更性命令只有一条通道」与「已记进待补清单」，且 `'shellGrant' in body === false`；同文件「清单外的构建命令被拒，没有可勾选的授权通道」断言 `npm run build` 被拒并进待补队列，视图不带可勾选的授权通道 |
+| AC-2 授权开关的动作与字段全部消失 | 通过 | `test/host.test.mjs`「命令授权开关已退场，S1 也开不了」断言 `toggleShellGrant` 返回 409「未知操作」；D2 段断言 `toggleWriteGrant` / `declareDirectionWrite` 同样 409，方向对象无 `needsWrite` / `writeGranted`，视图无 `writeGrants` / `directionWriteDeclared` |
+| AC-3 被拒命令能一键退回 S1 补清单 | 通过 | `test/client.test.mjs`「被拒命令在门禁上给出补 / 不补二选一」断言提示含命令原文与「本轮评审与测试需要重跑」，点「补进清单」后提交 `action: 'reopenScopeForCommands'` 且 `payload.command` 为被拒命令；服务端侧由 `test/host.test.mjs` 的命令清单用例覆盖 `scope.reopened` 与预填 |
+| AC-4 旧快照的授权字段冷恢复后被清洗 | 通过 | `test/host.test.mjs`「旧快照里的授权字段冷恢复后被清洗」手写 `shellGrant: true` / `writeGrants: ['smoke']` / `directionWriteDeclared: ['smoke']` 落盘，新宿主读回后视图与磁盘均无这些字段 |
+| AC-5 测试子代理只按清单放行，方向不带权限 | 通过 | `test/subagents.test.mjs`「S4 子代理只看 scope 清单：清单内放行、清单外一律拒，没有方向级写权限」：`npm test` 放行，`touch fixture-output`、`ops_write_file`、未知工具、带 `sandbox_permissions` 的 `pwd` 全部拒绝；同文件另有用例覆盖运行中改方向配置后约束不变 |
+| AC-6 界面没有任何权限勾选框 | 通过 | `test/client.test.mjs`「S2 不再提供命令授权勾选框，只说明清单放行」与「S4 命令入口只列 scope 清单，不给勾选」均断言 `checkboxNodes(tree).length === 0` 且不含「允许执行构建/测试命令」；同文件「测试方向面板不再出现写权限声明与授权」断言三处旧文案消失 |
 | AC-7 真实界面视觉对齐 | 未覆盖 | 本轮无已认证的桌面端接入与真实页面 CDP，未执行 `docs/verify-layout.mjs`；`docs/capture-ui.mjs:201` 的断言已改为「保存后不含 `needsWrite`」，但脚本本身未运行 |
 
 执行记录（本地，Node 24.21.0）：`node test/provenance.test.mjs`（20 项）、`acceptance`（30 项）、`runtime`（18 checks）、`host`（310 项）、`gatemode`（10 项）、`subagents`（74 项）、`integration`（33 项）、`client`（231 项）、`install`（17 项）全部通过；`node scripts/stamp-revisions.mjs --check` 输出 `Module revisions verified (6 modules).`；`node --check` 对六个模块与 `docs/verify-layout.mjs` 均通过。项数相对上一节下降来自删除的授权用例：host 321→310、subagents 82→74、client 243→231。
@@ -265,7 +267,7 @@
 "C:/Users/lenovo/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/node/bin/node.exe" test/<entry>.test.mjs
 ```
 
-覆盖 `npm test` 的全部九个入口。`npm run check` 的 `stamp-revisions.mjs --check` 在本机受沙箱限制无法写盘，改为只读计算六个模块的 `moduleSourceRevision`（CRLF→LF 规范化、抹掉 `FLOWGATE_MODULE_REVISION` 字面量后取 sha256）再手工更新字面量，结果与脚本口径一致。
+覆盖 `npm test` 当时的全部九个入口（本节是当时的记录，套数以 `npm test` 实际聚合的为准）。`npm run check` 的 `stamp-revisions.mjs --check` 在本机受沙箱限制无法写盘，改为只读计算六个模块的 `moduleSourceRevision`（CRLF→LF 规范化、抹掉 `FLOWGATE_MODULE_REVISION` 字面量后取 sha256）再手工更新字面量，结果与脚本口径一致。
 
 ### 已知未通过项
 
@@ -302,7 +304,7 @@
 "C:/Users/lenovo/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/node/bin/node.exe" test/<entry>.test.mjs
 ```
 
-覆盖 `npm test` 的全部八个入口，外加 `stamp-revisions.mjs --check` 与七个文件的 `node --check`，即 `npm run check` 的全部内容。命令语义与 npm 脚本一致，但**不是**通过 `npm` 发起的：npm 脚本自己的环境变量与钩子未参与。
+覆盖 `npm test` 当时的全部八个入口，外加 `stamp-revisions.mjs --check` 与七个文件的 `node --check`——这是本节记录时 `npm run check` 的全部内容，现已改为 `scripts/check-syntax.mjs` 按目录展开。命令语义与 npm 脚本一致，但**不是**通过 `npm` 发起的：npm 脚本自己的环境变量与钩子未参与。
 
 ### 已知未通过项
 
@@ -390,7 +392,7 @@ S3 评审留下 6 条非阻塞发现，其中两条是实现缺陷，按用户�
 | :--- | :--- | :--- |
 | AC-1 全部通过时仍是一步结束，且不发送例外许可 | 通过 | `test/client.test.mjs` 的「S4全部通过时沿用原按钮且不发送例外许可」：点「验收通过，结束流程」后 `payload.acceptUncovered === undefined`。`test/host.test.mjs` 的既有门禁用例断言 `acceptanceDecision.status === 'passed'`、`gate.passed` 事件、`flow.closure.kind === 'passed'` |
 | AC-2 存在未覆盖项时不得读作全部通过 | 通过 | 客户端「S4未全通过时使用明确结束文案，两步确认后才提交例外说明」断言没有「验收通过，结束流程」按钮、主按钮为「接受未覆盖并结束（需确认）」；「流程以带缺口方式结束后，门禁卡显示缺口而不是绿色已完成」断言结束态门禁卡文案不含「流程已结束」与「已完成」，只报「带缺口结束」与缺口明细 |
-| AC-3 存在未通过项时缺口逐条列出且原因必填 | 通过 | 「S4 点例外按钮先展开缺口清单，不直接投递」：第一次点击 `posted.length === 0`，展开「这些项目不会被标记为通过」「未通过的测试要点（2 个）」并逐条列出方向 · 要点 · 状态，未填原因时确认按钮 `disabled === true`；「S4 写明接受原因后才提交带缺口结项」断言 `acceptanceNote` 原样提交。宿主侧 `gateValidation` 对空白原因返回 409（`test/host.test.mjs` 的 `acceptanceNote` 相关用例、`test/integration.test.mjs:481`） |
+| AC-3 存在未通过项时缺口逐条列出且原因必填 | 通过 | 「S4 点例外按钮先展开缺口清单，不直接投递」：第一次点击 `posted.length === 0`，展开「这些项目不会被标记为通过」「未通过的测试要点（2 个）」并逐条列出方向 · 要点 · 状态，未填原因时确认按钮 `disabled === true`；「S4 写明接受原因后才提交带缺口结项」断言 `acceptanceNote` 原样提交。宿主侧 `gateValidation` 对空白原因返回 409（`test/host.test.mjs` 的 `acceptanceNote` 相关用例、`test/integration.test.mjs` 的接受例外用例） |
 | AC-4 测试要点 `failed: 0` 但 AC 零通过时两套账分别显示 | 通过 | 「测试要点 failed: 0 但 AC 一条没过时，两套账分别显示」：断言「验收标准：通过 0 · 未通过 0 · 未覆盖 3 · 待验证 0（共 3 条）」与「测试要点：通过 0 · 失败 0 · 未覆盖 1 · 环境受限 0（共 1 个）」同时出现，且不提供「验收通过，结束流程」 |
 | AC-5 快捷入口不能绕开例外确认 | 通过 | 「阶段提示：放弃要两次确认，S4 带缺口时不提供一键结束」：dock 不渲染「接受未通过项并结束」与「接受未覆盖并结束」，只留「退回开发修复」，并给出「验收标准通过 0 / 1」与「带缺口结束要在『出口门禁』里看清缺口并写明原因」，且不投递任何请求 |
 | AC-6 持久化状态与事件区分结束方式 | 通过 | `test/host.test.mjs` 与 `test/integration.test.mjs` 的例外结项用例断言 `acceptanceDecision.status === 'accepted-with-gaps'`、`flow.closure.kind === 'accepted_with_gaps'`、阶段 `gate: 'accepted_with_gaps'` 与 `gate.accepted_with_gaps` 事件；`test/integration.test.mjs` 的 flows.jsonl 事件用例确认事件类型与 `closure` 字段落盘 |
@@ -405,6 +407,8 @@ S3 评审留下 6 条非阻塞发现，其中两条是实现缺陷，按用户�
 门禁卡的「验收账本」行、「例外结项确认」区块与结束态「带缺口结束」徽标只在 `test/client.test.mjs` 的组件树层面核对文案、置灰与提交载荷，未在真实 DSH 工作台加载确认排版（尤其缺口清单较长时的换行与高度）；`.fg-warn` 只用了主题里已定义的 `state-warn-secondary` / `state-warn-label`，实际观感未取色测量。宿主侧的三分结束方式均有直接断言，但未在真实模型驱动的一次完整流程里端到端跑通「展开缺口 → 填原因 → 结束」这条路径。
 
 ## 只读边界放宽与例外入口（2026-11-21）
+
+> 本节 AC-1 记录的「方向级写权限声明」已在后续轮次整体移除：`shellGrant` / `writeGrants` / `needsWrite` / `directionWriteDeclared` 四个字段与 `toggleShellGrant` / `toggleWriteGrant` / `declareDirectionWrite` 三个动作都已删除，见下文「权限勾选退场：命令清单是唯一通道（2026-11-22）」。AC-1 保留为当时的记录，不代表现在还能这样做。
 
 需求：把「命令执行范围限制」放宽到不阻碍评审与测试，同时不放弃默认拒绝。六条：内置测试方向可声明写权限；只读子代理可用只读 Git；scope 命令清单的无效条目在 S1 就报错；已授权命令放行 `2>&1` / `| tail` 这类无害收尾；只读子代理的 `run_code` 允许 `Promise.all` 并行只读；未登记的只读工具可由用户声明豁免。
 
@@ -448,11 +452,11 @@ S3 评审留下 6 条非阻塞发现，其中两条是实现缺陷，按用户�
 | AC-6 结束流程入口常驻且需两次确认 | 通过 | 同一用例断言首次点击不发请求、`再想想` 回到原按钮、确认后投递 `cancel` 且带 `reason`；「投递失败要留下可诊断的错误行」验证 HTTP 500 时出现 `role=alert` 与宿主错误文案 |
 | AC-7 四阶段按钮集合两两不同 | 通过 | 「dock 给出本阶段的流转按钮，四个阶段各不相同」用 `Set` 比对四组文案；无效 stage 的按钮兜底与工作台一致 |
 | AC-8 新增按钮不破坏 dock 宽度契约 | 未覆盖真实视觉 | `.fg-hint` 的 `width` / `max-width` 公式未改，既有「阶段提示样式：沿用宿主宽度变量和居中规则」仍通过；按钮组自带 `flex-wrap: wrap` 与 `min-width: 0`，文字可换行 |
-| AC-9 无回归 | 部分通过 | `node test/client.test.mjs` 203 项全通过；`npm run check`（六模块版本标记 + 七个文件语法检查）退出码 0；`npm test` 在 `test/provenance.test.mjs` 的既有用例 14「external directory junction is rejected before reading its target」上失败，见下 |
+| AC-9 无回归 | 部分通过 | `node test/client.test.mjs` 203 项全通过；`npm run check`（当时是六模块版本标记 + 七个文件语法检查）退出码 0；`npm test` 在 `test/provenance.test.mjs` 的既有用例 14「external directory junction is rejected before reading its target」上失败，见下 |
 
 ### 已知未通过项
 
-`npm test` 三次均在 `test/provenance.test.mjs:211` 失败，首轮报错 `ENOTEMPTY: directory not empty, rmdir 'C:\\Users\\lonsdor\\AppData\\Local\\Temp\\dsh-U05QNJ\\flowgate-provenance-jemCK5\\workspace'`，抛出点在 `test/provenance.test.mjs:32` 的 `fixture` 收尾 `fs.rmSync(home, { recursive: true, force: true })`。该文件与本轮 dock 改动无关（`lib/client.js` 未被它引入），是 junction 用例清理临时目录时的 Windows 竞态；其余 19 项在该文件内通过，后续七组测试因 `npm test` 用 `&&` 串联而未执行。本轮未修该文件（不在冻结 scope 内），如实记为未通过。此后在 Windows + node v26.13.1 环境复测，九套测试逐套通过、`npm test` 退出码 0，本条未复现；报错信息中的用户目录属于旧验证环境。
+`npm test` 三次均在 `test/provenance.test.mjs` 的 junction 用例（`external directory junction is rejected before reading its target`）失败，首轮报错 `ENOTEMPTY: directory not empty, rmdir 'C:\\Users\\lonsdor\\AppData\\Local\\Temp\\dsh-U05QNJ\\flowgate-provenance-jemCK5\\workspace'`，抛出点在该文件 `fixture` 收尾的 `fs.rmSync(home, { recursive: true, force: true })`。该文件与本轮 dock 改动无关（`lib/client.js` 未被它引入），是 junction 用例清理临时目录时的 Windows 竞态；其余 19 项在该文件内通过，后续七组测试因 `npm test` 用 `&&` 串联而未执行。本轮未修该文件（不在冻结 scope 内），如实记为未通过。此后在 Windows + node v26.13.1 环境复测，九套测试逐套通过、`npm test` 退出码 0，本条未复现；报错信息中的用户目录属于旧验证环境。
 
 ### 真实视觉未覆盖
 
@@ -467,7 +471,7 @@ S3 评审留下 6 条非阻塞发现，其中两条是实现缺陷，按用户�
 | 文档与取证脚本实现 | 已完成 | 使用指南、开发契约与变更记录说明内容哈希整轮失效、逐 AC 证据、MINOR 独立计数、退回清单、运行版本核对和真实视觉未覆盖口径 |
 | 脚本语法 | 通过 | 捆绑 Node 执行 `node --check docs/verify-layout.mjs`，退出码 0 |
 | 中文帮助 | 通过 | `node docs/verify-layout.mjs --help`，退出码 0，明确已有地址、页面、会话与两条真实参照必填 |
-| 脚本纯函数边界 | 通过 | `--self-test` 25 项断言（含参照 selector 规范为名称、版本 mismatch、页面身份/视口缺失或不一致、宿主回执 ID/内容版本缺失）：缺参、未知参数、无效容差、相同参照、file 预览、无唯一 target、版本未核对/缺失/不匹配、测量缺失/无效及超容差；不连接 CDP |
+| 脚本纯函数边界 | 通过 | `--self-test` 25 项断言（含参照 selector 规范为名称、版本 mismatch、页面身份/视口缺失或不一致、宿主回执 ID/内容版本缺失）：缺参、未知参数、无效容差、相同参照、file 预览、无唯一 target、版本未核对/缺失/不匹配、测量缺失/无效及超容差；不连接 CDP。当时这 25 项只能手工跑，现在 `npm run check` 每次都会跑一遍 |
 | 真实桌面端视觉校验 | 未覆盖 | 当前验证环境没有可用的已认证桌面页面接入或 CDP，无法采集真实参照矩形；未启动浏览器或新服务，未使用 file 预览代替 |
 | 当前运行版本已生效 | 未核对 | 尝试工作台刷新工具返回 blocked，提示“在右键菜单里打开 Agent 可以自己刷新”；未实际完成刷新，尚无运行宿主、磁盘宿主、实际执行客户端工厂与磁盘工厂四个 SHA256 一致的运行证据 |
 

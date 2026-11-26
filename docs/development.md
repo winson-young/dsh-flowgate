@@ -39,7 +39,7 @@ S1 批准或跳过文档批准后，宿主冻结 scope。S2 对写入 / 编辑 /
 
 守卫按**只读白名单**工作：只有显式登记为无磁盘副作用的工具（读取、检索、任务调度、上下文管理、flowgate 自身）直接放行，其余工具一律进入路径核对；没有登记的工具按拒绝处理。这样宿主新增一个写工具时不会静默放行，代价是漏登记的工具会被误拒。漏登记有两个出口：插件侧把它登记进 `PASSIVE_TOOLS`，或用户在工作台「阶段设置 → 只读豁免」里声明（`toolAllowlist`，最多 12 条）。豁免只对既不是写工具、也不是 shell、也不是 flowgate 自身状态工具的未知工具生效：写工具照旧按 scope 核对路径，shell 照旧按自己的命令规则判定，豁免名单不会变成后门。
 
-目标表 `TOOL_TARGETS` 逐项声明正式参数名、是否必填、能否枚举。`write` / `edit` 只取 `file_path`，`str_replace_editor` 与 OPS 单文件工具只取 `path`，移动和复制必须同时提供 `path` / `to`，不猜测 `dest`、`file`、`filename`、`source` 等别名。结果分为明确无写入、完整目标列表和无法核对；缺目标、空白、错误类型不能用空数组冒充无写入，必须明确拒绝。
+目标表 `TOOL_TARGETS` 逐项声明正式参数名、是否必填、能否枚举。`write` / `edit` 只取 `file_path`，`str_replace_editor` 与 OPS 单文件工具只取 `path`，移动和复制必须同时提供 `path` / `to`，不猜测 `dest`、`file`、`filename`、`source` 等别名（宿主实测：`ops_copy` / `ops_move` 的 schema 只接受 `path` / `to` / `expectedRevision`，传 `source` / `from` 直接返回 `INVALID_ARGUMENT: unknown field`——别名不是本插件少认的名字，而是宿主本身不收的写法）。结果分为明确无写入、完整目标列表和无法核对；缺目标、空白、错误类型不能用空数组冒充无写入，必须明确拒绝。
 
 五条额外边界：
 
@@ -414,7 +414,7 @@ node scripts/publish.mjs --force        # 确需重发同一版本时放行
 
 运行信息包含 `hostRevision`、`diskHostRevision`、`expectedClientRevision`、`clientRevision`，以及 `status: verified | mismatch | unverified` 和 `reason`。只有运行宿主等于磁盘宿主、执行工厂等于磁盘工厂且所有版本均已核对，才是 `verified`；不匹配与未核对都不能报告运行生效。
 
-宿主已加载模块不是通过当前磁盘扫描来冒充：六个宿主模块各自导出 `FLOWGATE_MODULE_REVISION` 的 64hex 字面量，加载时登记该字面量；内容摘要统一 LF 并排除标记自身。修改 `lib/index.js`、`lib/runtime.js`、`lib/provenance.js`、`lib/acceptance.js`、`lib/requirements.js` 或 `lib/revisions.js` 后，在项目根先运行 `node scripts/stamp-revisions.mjs` 更新指纹，再运行 `node scripts/stamp-revisions.mjs --check` 只读核验，之后才按宿主方式重载插件并由当前页上报实际工厂指纹。未 stamp、旧 ESM 缓存或运行/磁盘不一致时不可报告 `verified`。维护工具的 `--root` 仅用于隔离 fixture 核验。
+宿主已加载模块不是通过当前磁盘扫描来冒充：七个宿主模块各自导出 `FLOWGATE_MODULE_REVISION` 的 64hex 字面量，加载时登记该字面量；内容摘要统一 LF 并排除标记自身。模块清单只有一处定义——`lib/runtime.js:10` 的 `HOST_MODULES`（`index.js`、`runtime.js`、`provenance.js`、`acceptance.js`、`ecosystems.js`、`requirements.js`、`revisions.js`），改这个常量即可，别在文档或脚本里再抄一份。修改其中任何一个后，在项目根先运行 `node scripts/stamp-revisions.mjs` 更新指纹，再运行 `node scripts/stamp-revisions.mjs --check` 只读核验，之后才按宿主方式重载插件并由当前页上报实际工厂指纹。未 stamp、旧 ESM 缓存或运行/磁盘不一致时不可报告 `verified`。维护工具的 `--root` 仅用于隔离 fixture 核验。
 
 ### 真实桌面端布局取证
 
@@ -498,7 +498,7 @@ README 的界面图使用真实插件组件与示例数据；[预览页](ui-prev
 
 ```bash
 pnpm install --frozen-lockfile
-npm run check             # 宿主与客户端语法检查
+npm run check             # 模块指纹核验 + 全量语法检查（lib/、docs/、scripts/、test/ 按目录展开）+ 布局脚本 25 项纯函数自检
 npm test                  # 顺序执行默认链路（全量十三套；publish 与 runner 按测试文件是否存在接入）
 npm run test:provenance    # 取证范围、链接处理与夹具清理
 npm run test:acceptance    # 验收标准与证据判定
@@ -509,7 +509,7 @@ npm run test:subagents     # 新版 activation、最终守卫、取消与降级�
 npm run test:integration   # 假宿主运行真实 apply()，检查工具、路由与挂起唤醒
 npm run test:client        # React 渲染与按钮行为、布局契约、主题变量
 npm run test:install:fixture # 使用临时 profile 检查安装契约
-npm run test:layout        # 运行 25 项布局脚本自检
+npm run test:layout        # 单独跑 25 项布局脚本自检（check 里也会跑一次）
 npm run test:install       # 检查真实 profile 的安装就绪度
 npm run test:runner        # 聚合器元测试（node --test --test-reporter=tap 入口）
 node test/test-runner.test.mjs # 同一套断言的直跑入口，结论与上一条一致
