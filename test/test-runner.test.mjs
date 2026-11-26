@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import { execFile, spawnSync } from 'node:child_process'
-import { closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
@@ -185,9 +185,49 @@ test('默认安装夹具忽略覆盖路径，真实入口读取覆盖路径', (t
   assert.ok(installed.stdout.includes(missing))
 })
 
+// 宿主里的 scope 体检按 PATH 找清单里的可执行体。整条 PATH 换成空目录会把 npm 一起藏掉，
+// 体检随即报「这些命令用到的可执行体在当前 PATH 上找不到：npm test（命令本身找不到：npm）」，
+// flowgate_doc 提交时抛错、宿主退出 1——用例就从「无 Git 就 SKIP」退化成「无 Git 顺带崩」。
+// 所以只让 git 不可见：剔除含 git 可执行文件的目录，其余（node、npm、系统目录）原样保留。
+const GIT_NAMES = process.platform === 'win32' ? ['git.exe', 'git.cmd', 'git.bat', 'git.com'] : ['git']
+
+function hasGit(dir) {
+  return GIT_NAMES.some((name) => existsSync(join(dir, name)))
+}
+
+function pathWithoutGit(t) {
+  const separator = process.platform === 'win32' ? ';' : ':'
+  const dirs = String(process.env.PATH ?? process.env.Path ?? '')
+    .split(separator)
+    .map((dir) => dir.replace(/^"(.*)"$/u, '$1'))
+    .filter(Boolean)
+  const kept = dirs.filter((dir) => !hasGit(dir))
+  const nodeDir = dirname(process.execPath)
+  if (kept.includes(nodeDir)) return kept.join(separator)
+  if (!hasGit(nodeDir)) {
+    kept.unshift(nodeDir)
+    return kept.join(separator)
+  }
+  // node 与 git 装在同一个目录时（Linux 的 /usr/bin 就是这样），上面的剔除会把 node/npm
+  // 一起带走。把 node 与 npm 复制进一个干净的临时目录顶在最前面，git 仍然不可见。
+  const clean = temp(t)
+  for (const name of [basename(process.execPath), 'node', 'node.exe', 'npm', 'npm.cmd', 'npx', 'npx.cmd']) {
+    const source = join(nodeDir, name)
+    const target = join(clean, name)
+    if (!existsSync(source) || existsSync(target)) continue
+    copyFileSync(source, target)
+    if (process.platform !== 'win32') chmodSync(target, 0o755)
+  }
+  kept.unshift(clean)
+  return kept.join(separator)
+}
+
 test('没有 Git 时宿主退出 0，汇总标记 SKIP 并显示原因', (t) => {
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toLowerCase() !== 'path'))
-  env.PATH = temp(t)
+  env.PATH = pathWithoutGit(t)
+  // 先证明构造真的生效：构造失败时要报「PATH 上还有 git」，而不是让下面的断言红得没头没脑。
+  const probe = spawnSync('git', ['--version'], { env: childEnv(env), windowsHide: true, timeout: 5000 })
+  assert.equal(probe.error?.code, 'ENOENT', 'PATH 上仍然找得到 git，这条用例证明不了「Git 不可用」')
   const result = capture((sink) => runSuites([suiteFor('host')], { env: childEnv(env), ...sink }))
   assert.equal(result.status, 0)
   assert.match(result.output, /host=SKIP .*Git 不可用（ENOENT）/)

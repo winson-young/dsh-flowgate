@@ -512,12 +512,14 @@ test('package.json 暴露 test:publish 入口，指向本文件的 TAP 报告', 
 // ---- 汇总接入：publish 必须能被 npm test 跑到 ---------------------------
 
 test('run-tests.mjs 把 publish 接进汇总，但只在测试文件真的存在时', async (t) => {
-  // 工作副本里 test/publish.test.mjs 存在，套件清单里就该有 publish，且排在最后。
+  // 工作副本里 test/publish.test.mjs 存在，套件清单里就该有 publish。
+  // 它排在 runner 元测试之前：元测试自己接在最后，才能把前面所有套件的判定纳入回归保护。
   const live = suites.find((entry) => entry.name === 'publish')
   assert.ok(live, suites.map((entry) => entry.name).join(', '))
   assert.equal(live.script, 'test:publish')
   assert.equal(live.command, 'node --test --test-reporter=tap test/publish.test.mjs')
-  assert.equal(suites.at(-1).name, 'publish')
+  assert.equal(suites.at(-2).name, 'publish')
+  assert.equal(suites.at(-1).name, 'runner')
 
   // test/test-runner.test.mjs 的 fixture 只复制 scripts/ 与 lib/，没有 test/，
   // 那里必须仍是原来那十套，否则那个回归测试的汇总行数会错位。

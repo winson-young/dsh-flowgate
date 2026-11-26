@@ -499,7 +499,7 @@ README 的界面图使用真实插件组件与示例数据；[预览页](ui-prev
 ```bash
 pnpm install --frozen-lockfile
 npm run check             # 宿主与客户端语法检查
-npm test                  # 顺序执行默认链路（十二套起，publish 与 runner 按存在性接入）
+npm test                  # 顺序执行默认链路（全量十三套；publish 与 runner 按测试文件是否存在接入）
 npm run test:provenance    # 取证范围、链接处理与夹具清理
 npm run test:acceptance    # 验收标准与证据判定
 npm run test:runtime       # 运行时验证

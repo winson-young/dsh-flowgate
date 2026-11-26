@@ -5552,9 +5552,13 @@ async function keepAlive(promise) {
 {
   const ws = g40Workspace('host-superseded')
   const sid = 'g40-hostsup'
+  let service
   try {
     const cx = makeHost(ws, sid)
-    const service = currentService()
+    service = currentService()
+    // 生产上限是 10 分钟；这条用例只需要第二个等待收尾，注入毫秒级，
+    // 否则整套宿主测试会被这一个等待拖满十分钟，聚合器的 3 分钟超时直接判 FAIL。
+    service.gateWaitOverrideMs = 60
     await cx.tool('flowgate_start', { title: '宿主路径被取代', preset: 'fast' })
     const first = cx.tool('flowgate_doc', { html: '<p>第一次等待</p>', scope: G40_SCOPE })
     await tick()
@@ -5573,7 +5577,10 @@ async function keepAlive(promise) {
       assert.notEqual(onDisk.id, firstResult.gateId)
     })
     await keepAlive(second).catch(() => {})
-  } finally { rmSync(ws, { recursive: true, force: true }) }
+  } finally {
+    if (service) service.gateWaitOverrideMs = null
+    rmSync(ws, { recursive: true, force: true })
+  }
 }
 
 console.log('\n全部通过：' + passed.length + ' 项')

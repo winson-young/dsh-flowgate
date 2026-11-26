@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **默认链路「接入即红」：元测试那条「没有 Git 时宿主退出 0」和 publish 的顺序断言同时失效**：`npm test` 里 `runner=FAIL`、`publish=FAIL`，而这两个套件各自单独跑又能过——红的是链路，不是断言。两处根因摞在一起：其一，用例原本把 `PATH` 换成空的临时目录来模拟「没有 Git」，`npm` 跟着一起消失，宿主套件里带 `commands: ['npm test']` 的 scope 提交时体检报「命令本身找不到：npm」，`lib/index.js` 在提交路径上抛出未捕获错误、宿主以 1 退出，剧本从「无 Git 就 SKIP」变成「无 Git 顺带崩」；其二，宿主套件 G40-20 的第二个 `flowgate_doc` 用生产默认上限真实等待 10 分钟，`runSuites` 的 180 秒上限到点直接 `SIGKILL`——只修 `PATH` 的话仍然超时，所以两处必须一起改。
+
+  用例现在只从 `PATH` 里摘掉含 `git` 可执行文件的目录段，`node` 与 `npm` 所在目录原样保留；`node` 目录本身含 git 时，把 `node` 与 `npm` 复制进一个干净的临时目录顶到最前。构造完先用 `spawnSync('git', ['--version'])` 断言 `error.code === 'ENOENT'`，证明「Git 确实不可见」再跑聚合器，断言没有被放宽。G40-20 改为注入 `service.gateWaitOverrideMs = 60`，并在 `finally` 里恢复；顺带修正 `currentService()` 的取值时机（必须在 `makeHost` 之后，否则模拟宿主还没装好，`service.get(sid)` 返回 null）。`test/publish.test.mjs` 的「接入汇总」用例同步到新顺序：`publish` 在 `runner` 之前，`runner` 才是最后一套。
+
+  文档：`docs/development.md` 的 `npm test` 行从「十二套起」改成「全量十三套；`publish` 与 `runner` 按测试文件是否存在接入」，与 CHANGELOG 口径一致。
+
+  测试：`node --test test/test-runner.test.mjs` 与直跑入口都是 15/15，宿主 417 项、publish 26 项全过，`node scripts/run-tests.mjs` 十三套全 PASS、退出码 0；`node test/host.test.mjs` 从十分钟挂起回到秒级。
+
 - **聚合器的元测试自己不在链路上，用 `node --test` 跑还会假失败**：起因是 `scripts/run-tests.mjs` 的默认链路就是 `suites` 这一个常量——`revisions` 套件加 `...testSuites` 十套，里面没有 `runner`，所以 `test/test-runner.test.mjs` 只靠人记得手工跑：谁改坏了 `resultFor` 或 `suites` 都不会有人发现，而改坏的典型形态恰恰是「汇总器开始骗人」，正是当初加 G12 / G14 要解决的那个问题以更难发现的方式回来。三处缺陷是同一条链上的：元测试不在链路里；要接进去得先给聚合器留一条输出通道，否则元测试的 `capture` 只替换 `console.log`，子进程 stdout 会直接写穿到真实标准输出、混进 `node --test` 的 TAP 流；而 `node --test test/test-runner.test.mjs` 本身会假失败——测试运行器给子进程设了 `NODE_TEST_CONTEXT`，元测试 spawn 出来的 `node scripts/run-tests.mjs` 继承它之后按子测试协议自报，父进程看到的是一份伪造的测试结果。
 
   `runSuites` 的 `options.write` 成为唯一输出通道：缺省仍是 `process.stdout.write`，`resultFor` 在 `spawnSync` 之后按「是不是函数」决定写哪里，既有调用点一行都不用改；`suites` 末尾按 `existsSync(root + 'test/test-runner.test.mjs')` 接入 `['runner', 'test:runner', tap]`，与 `publish` 同款存在性判断——元测试第一个用例的临时夹具只复制 `scripts/` 与 `lib/`、不复制 `test/`，那里仍是 `revisions` 加十套，所以这条接入不会自己套自己。`package.json` 新增 `"test:runner": "node --test --test-reporter=tap test/test-runner.test.mjs"`，与其它 `test:*` 同形。
