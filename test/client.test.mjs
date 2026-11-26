@@ -2233,6 +2233,114 @@ const HubPanelIcon = componentOf('sidebar.panellist')
   })
 }
 
+// G40：等待器随进程一起没了，来路要分别说清，不能一律说「被中断了」。
+{
+  posted = []
+  currentView = baseView('S2', {
+    devChanges: { files: ['src/auth/session.ts'], added: 42, removed: 7, at: '2026-11-17T09:40:00Z' },
+    gate: {
+      pending: true,
+      interrupted: true,
+      request: { id: 'gate_ab12cd34', kind: 'gate', at: '2026-11-26T09:00:00Z', endedAt: null, endKind: null },
+      recovered: { gateId: 'gate_ab12cd34', kind: 'gate', stage: 'S2', at: '2026-11-26T09:05:00Z' },
+      waitReason: 'restart',
+    },
+    gateWait: { minutes: 10, min: 1, max: 60, fallback: 10, file: '.dsh-flowgate/config.json' },
+    waiting: false,
+    waitingKind: null,
+  })
+  const renderer = await render(FlowDetail, {})
+  const tree = renderer.toJSON()
+  await check('门禁等待器随进程没了：重启过要说明来源，不退回旧文案', async () => {
+    const text = flat(tree)
+    assert.ok(text.includes('宿主重启过：门禁仍在等待'), text)
+    assert.ok(text.includes('gate_ab12cd34'), '要点名门禁 id：' + text)
+    assert.ok(text.includes('不会叫醒 Agent'), '必须说清点按钮叫不醒 Agent：' + text)
+    assert.equal(text.includes('上次的门禁请求被中断'), false, '知道来路时不该退回旧文案')
+    await click(buttonByText(tree, '完成开发'))
+    assert.equal(posted.at(-1).action, 'gate')
+    assert.equal(posted.at(-1).payload.decision, 'pass')
+  })
+}
+
+{
+  for (const [reason, want] of [
+    ['timeout', '等满上限'],
+    ['superseded', '已被取代'],
+    ['aborted', '被取消了'],
+  ]) {
+    posted = []
+    currentView = baseView('S2', {
+      devChanges: { files: ['src/auth/session.ts'], added: 42, removed: 7, at: '2026-11-17T09:40:00Z' },
+      gate: {
+        pending: true,
+        interrupted: true,
+        request: { id: 'gate_ff00aa11', kind: 'gate', at: '2026-11-26T09:00:00Z', endedAt: '2026-11-26T09:10:00Z', endKind: reason },
+        recovered: null,
+        waitReason: reason,
+      },
+      gateWait: { minutes: 10, min: 1, max: 60, fallback: 10, file: '.dsh-flowgate/config.json' },
+      waiting: false,
+      waitingKind: null,
+    })
+    const tree = (await render(FlowDetail, {})).toJSON()
+    await check('门禁等待中断：' + reason + ' 有自己的文案', () => {
+      const text = flat(tree)
+      assert.ok(text.includes(want), reason + ' 应说明来路：' + text)
+      assert.ok(text.includes('gate_ff00aa11'), '要点名门禁 id：' + text)
+      assert.equal(text.includes('上次的门禁请求被中断'), false, reason + ' 知道来路时不该退回旧文案')
+    })
+  }
+}
+
+// 等待器没了、门禁还开着：提示条不能再说「等待 Agent 下一步」，否则用户会一直等下去。
+await check('阶段提示：等待器中断而门禁仍开着时如实说明', async () => {
+  currentView = baseView('S2', {
+    gate: { pending: true, interrupted: true, waitReason: 'timeout' },
+    waiting: false,
+    waitingKind: null,
+  })
+  const text = flat((await render(stageHint, {})).toJSON())
+  assert.ok(text.includes('门禁仍在等待，但等待器已中断'), text)
+  assert.equal(text.includes('等待 Agent 下一步'), false, '不能表现成还在干活')
+})
+
+// 追问卡片：Agent 已经不在了，卡片仍然有效，点选要落盘并叫醒它。
+await check('追问卡片：等待器超时后仍可点选，并说明会叫醒 Agent', async () => {
+  const base = grillView()
+  currentView = grillView({ grill: { ...base.grill, awaiting: false } })
+  const text = flat((await render(FlowDetail, {})).toJSON())
+  assert.ok(text.includes('Agent 已经不在等了'), text)
+  assert.ok(text.includes('叫醒'), '要说清点选会叫醒它：' + text)
+})
+
+// 门禁等待上限放在工作台里配：0 不接受，越界由服务端纠正。
+{
+  posted = []
+  currentView = baseView('S2', { gateWait: { minutes: 10, min: 1, max: 60, fallback: 10, file: '.dsh-flowgate/config.json' } })
+  const renderer = await render(FlowDetail, {})
+  await check('门禁等待上限可在设置面板里改', async () => {
+    await openSettings(renderer)
+    const tree = await switchGroup(renderer, '门禁等待')
+    const text = flat(tree)
+    assert.ok(text.includes('门禁等待上限'), text)
+    assert.ok(text.includes('不能设成 0'), '必须说清 0 不接受：' + text)
+    const input = findTags(tree, 'input').find((node) => node.props.type === 'number')
+    assert.ok(input, '要有分钟输入框：' + text)
+    assert.equal(input.props.min, 1)
+    assert.equal(input.props.max, 60)
+    await changeValue(input, '25')
+    await click(buttonByText(renderer.toJSON(), '保存上限'))
+    await settle()
+    assert.equal(posted.at(-1).action, 'setGateWaitMinutes')
+    assert.equal(posted.at(-1).payload.minutes, 25)
+    await click(buttonByText(renderer.toJSON(), '恢复默认'))
+    await settle()
+    assert.equal(posted.at(-1).payload.minutes, 10)
+    await click(buttonByText(renderer.toJSON(), '关闭'))
+  })
+}
+
 // 未跟踪文件是开发阶段的常态：git diff --numstat 看不见它们，摘要必须单独标出来。
 {
   currentView = baseView('S2', {

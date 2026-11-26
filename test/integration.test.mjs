@@ -235,7 +235,9 @@ await check('Hub 无流程时保存规则，不建立流程或 scope 授权', as
   assert.deepEqual(saved.data.rules.ids, ['scope-only', 'integration-rule'])
   assert.equal((await getState()).active, false)
   const config = JSON.parse(readFileSync(join(CWD, '.dsh-flowgate', 'config.json'), 'utf8'))
-  assert.deepEqual(Object.keys(config).sort(), ['stages', 'updatedAt', 'version'])
+  // gateWaitMinutes 是工作区级的门禁等待上限：保存规则时一并写回，不额外建文件。
+  assert.deepEqual(Object.keys(config).sort(), ['gateWaitMinutes', 'stages', 'updatedAt', 'version'])
+  assert.equal(config.gateWaitMinutes, 10)
   assert.ok(Object.values(saved.data.rules.stages).every((value) => value.configured))
   assert.deepEqual(config.stages, stages)
   assert.equal(existsSync(join(CWD, '.dsh-flowgate', 'scope.json')), false)

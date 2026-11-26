@@ -2780,7 +2780,9 @@ for (const [kind, reason, expected] of [
       assert.deepEqual(saved.body.rules.custom, [custom])
       assert.equal(saved.body.rules.catalog.length, 6)
       const config = JSON.parse(readFileSync(configFile, 'utf8'))
-      assert.deepEqual(Object.keys(config).sort(), ['stages', 'updatedAt', 'version'])
+      assert.deepEqual(Object.keys(config).sort(), ['gateWaitMinutes', 'stages', 'updatedAt', 'version'])
+      // gateWaitMinutes 是工作区级门禁等待上限，保存规则时一并写回。
+      assert.equal(config.gateWaitMinutes, 10)
       assert.deepEqual(config.stages.S2.custom, [custom])
     })
     const invalid = [
@@ -3008,7 +3010,7 @@ for (const [kind, reason, expected] of [
       const disk = JSON.parse(readFileSync(configFile, 'utf8'))
       assert.equal(disk.version, 2)
       assert.deepEqual(disk.stages, stages)
-      assert.deepEqual(Object.keys(disk).sort(), ['stages', 'updatedAt', 'version'])
+      assert.deepEqual(Object.keys(disk).sort(), ['gateWaitMinutes', 'stages', 'updatedAt', 'version'])
       // 写权限概念已删除：客户端多传的字段不会被写进工作区配置。
       assert.equal(JSON.stringify(disk).includes('needsWrite'), false)
     })
@@ -5166,17 +5168,29 @@ for (const listedCommands of [[], ['node --check lib/index.js']]) {
     writeFileSync(preload, 'require("node:fs").writeFileSync(' + JSON.stringify(marker) + ', "preload")\n')
     writeFileSync(source, 'require("node:fs").writeFileSync(' + JSON.stringify(bodyMarker) + ', "body")\n')
     const options = { cwd: ws, env: { ...process.env, NODE_OPTIONS: '' }, stdio: 'pipe' }
-    execFileSync(process.execPath, ['--check', source], options)
-    check('真实 Node --check 单文件只解析，不执行正文', () => {
-      assert.equal(existsSync(bodyMarker), false)
-      assert.equal(existsSync(marker), false)
-    })
-    execFileSync(process.execPath, ['--check', '--require', preload, source], options)
-    check('真实 Node --check --require 仍执行 preload 并写盘', () => {
-      assert.equal(readFileSync(marker, 'utf8'), 'preload')
-      assert.equal(existsSync(bodyMarker), false)
-    })
-    rmSync(marker)
+    // 沙箱里禁止 spawn 子进程时这里会抛 EPERM。那是环境限制，不是 --check 的语义变了：
+    // 真进程验证只在具备该能力的环境跑，跳过时留痕，免得整套测试在中途被环境问题吞掉，
+    // 连后面真正的用例一起跑不到。
+    let spawnable = true
+    try {
+      execFileSync(process.execPath, ['--check', source], options)
+    } catch (error) {
+      if (error?.code !== 'EPERM') throw error
+      spawnable = false
+      console.log('  跳过 真实 Node --check 真进程验证：当前环境禁止 spawn 子进程（EPERM）')
+    }
+    if (spawnable) {
+      check('真实 Node --check 单文件只解析，不执行正文', () => {
+        assert.equal(existsSync(bodyMarker), false)
+        assert.equal(existsSync(marker), false)
+      })
+      execFileSync(process.execPath, ['--check', '--require', preload, source], options)
+      check('真实 Node --check --require 仍执行 preload 并写盘', () => {
+        assert.equal(readFileSync(marker, 'utf8'), 'preload')
+        assert.equal(existsSync(bodyMarker), false)
+      })
+    }
+    rmSync(marker, { force: true })
     const cx = makeHost(ws, 'node-check-probe')
     await cx.tool('flowgate_start', { title: 'Node parse preload 边界' })
     const flow = currentService().get('node-check-probe')
@@ -5253,6 +5267,312 @@ for (const listedCommands of [[], ['node --check lib/index.js']]) {
       })
     }
     await cx.tool('flowgate_cancel', {})
+  } finally { rmSync(ws, { recursive: true, force: true }) }
+}
+
+// ---------------------------------------------------------------------------
+// G40：门禁等待器只活在进程内存里，而且不设超时。
+// 上限在 GateHub 一个入口解析，用例用测试注入压到毫秒级，不用真等十分钟。
+// ---------------------------------------------------------------------------
+function g40Workspace(label) {
+  const ws = mkdtempSync(join(tmpdir(), 'flowgate-g40-' + label + '-'))
+  mkdirSync(join(ws, 'src'), { recursive: true })
+  writeFileSync(join(ws, 'src', 'session.mjs'), 'export const response = (expired) => (expired ? 401 : 200)\n')
+  writeFileSync(join(ws, 'package.json'), JSON.stringify({ name: 'g40-fixture', scripts: { test: 'node --test test/session.test.mjs' } }, null, 2) + '\n')
+  return ws
+}
+
+// AC 可执行、命令带来源：S1 体检不留缺口，用例只关心等待语义。
+const G40_SCOPE = {
+  files_expected_to_change: ['src/session.mjs'],
+  commands: ['npm test'],
+  command_sources: [{ command: 'npm test', from: 'package.json scripts.test', acs: ['AC-1'] }],
+  capabilities: [],
+  out_of_scope_explicitly: [],
+  acceptance_criteria: [{
+    id: 'AC-1',
+    when: '会话过期后发请求',
+    then: '返回 401',
+    verification: { method: 'unit', procedure: '调用 response(true) 并断言状态码 401' },
+  }],
+}
+
+function g40Events(ws) {
+  const file = join(ws, '.dsh-flowgate', 'flows.jsonl')
+  if (!existsSync(file)) return []
+  return readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line))
+}
+
+/**
+ * 等待器给自己的定时器调了 unref：它是为了让等待器不拖住宿主退出，代价是
+ * 「只剩这个定时器」时事件循环判定为空、顶层 await 直接悬空（进程以 13 退出）。
+ * 用例里等超时必须自己挂一个被引用的句柄，否则测的根本不是超时。
+ */
+async function keepAlive(promise) {
+  const timer = setInterval(() => {}, 50)
+  try {
+    return await promise
+  } finally {
+    clearInterval(timer)
+  }
+}
+
+// 用例 A：上限在等待入口生效，超时只给请求收尾、不清空记录。
+{
+  const ws = g40Workspace('timeout')
+  const sid = 'g40-timeout'
+  try {
+    const cx = makeHost(ws, sid)
+    const service = currentService()
+    // 生产路径是分钟粒度（默认 10 分钟）；注入毫秒级才能让用例跑得动。
+    service.gateWaitOverrideMs = 60
+    await cx.tool('flowgate_start', { title: '门禁等待上限', preset: 'fast' })
+    const pendingDoc = cx.tool('flowgate_doc', { html: '<p>等待上限</p>', scope: G40_SCOPE })
+    await tick()
+    const flow = service.get(sid)
+    const during = flow.stages.S1.gateRequested
+    const snapshotDuring = readFileSync(join(ws, '.dsh-flowgate', 'flows', flow.id + '.json'), 'utf8')
+    const statusDuring = await cx.tool('flowgate_status', {})
+    check('G40-1 挂起时请求记录带 id，status.waiting 报得出同一个 id', () => {
+      assert.ok(during && typeof during === 'object', '请求记录必须是对象，不能还是布尔值')
+      assert.match(during.id, /^gate_[0-9a-f]{8}$/)
+      assert.equal(during.kind, 'doc')
+      assert.equal(during.endedAt, null)
+      assert.deepEqual(statusDuring.waiting, { gateId: during.id, kind: 'doc', since: during.at })
+      assert.ok(statusDuring.summary.includes('门禁等待：id ' + during.id), statusDuring.summary)
+    })
+    const outcome = await keepAlive(pendingDoc)
+    check('G40-2 等满上限返回等待态而不是报错，并说清点按钮不会唤醒 Agent', () => {
+      assert.equal(outcome.decision, 'pending')
+      assert.equal(outcome.waitReason, 'timeout')
+      assert.equal(outcome.willWake, false)
+      assert.equal(outcome.gateId, during.id)
+      assert.equal(outcome.frozen, false)
+      assert.match(outcome.message, /等待超时/)
+      assert.match(outcome.message, /不会叫醒你/)
+      assert.ok(outcome.message.includes('门禁 id 是 ' + during.id), outcome.message)
+    })
+    check('G40-3 超时只给请求收尾，不清空记录，门禁仍然 pending', () => {
+      const record = flow.stages.S1.gateRequested
+      assert.equal(record.id, during.id)
+      assert.ok(record.endedAt, '必须写下收尾时间')
+      assert.equal(record.endKind, 'timeout')
+      assert.equal(flow.stages.S1.gate, 'pending')
+      assert.equal(flow.scope.frozen, false)
+      assert.equal(flow.gateWaitReason, 'timeout')
+    })
+    check('G40-4 追加一条 gate.timeout 事件', () => {
+      const timeouts = g40Events(ws).filter((event) => event.type === 'gate.timeout')
+      assert.equal(timeouts.length, 1)
+      assert.equal(timeouts[0].detail.gateId, during.id)
+      assert.equal(timeouts[0].detail.endKind, 'timeout')
+      assert.equal(timeouts[0].detail.stage, 'S1')
+    })
+    const statusAfter = await cx.tool('flowgate_status', {})
+    const viewAfter = (await cx.request('/api/flowgate/state?sessionId=' + sid)).body
+    check('G40-5 收尾之后 status.waiting 清空，但界面仍说门禁开着', () => {
+      assert.deepEqual(statusAfter.waiting, {})
+      assert.ok(statusAfter.summary.includes('这次等待已经结束'), statusAfter.summary)
+      // S1 的门禁产物是需求文档：可确认状态在 doc 段，gate.pending 恒为 false。
+      assert.equal(viewAfter.doc.pending, true)
+      assert.equal(viewAfter.doc.interrupted, true)
+      assert.equal(viewAfter.doc.waitReason, 'timeout')
+      assert.equal(viewAfter.doc.request.id, during.id)
+      assert.equal(viewAfter.waiting, false)
+    })
+    // 冷恢复：把快照退回「请求还没收尾」的样子，模拟重启前正挂着的那一刻。
+    writeFileSync(join(ws, '.dsh-flowgate', 'flows', flow.id + '.json'), snapshotDuring)
+    const revived = makeHost(ws, sid)
+    const statusRevived = await revived.tool('flowgate_status', {})
+    check('G40-6 冷恢复补写「门禁仍在等待，但宿主重启过」', () => {
+      assert.deepEqual(statusRevived.waiting, { gateId: during.id, kind: 'doc', since: during.at })
+      assert.ok(statusRevived.summary.includes('宿主重启过'), statusRevived.summary)
+      const recovered = g40Events(ws).filter((event) => event.type === 'flow.gate.recovered')
+      assert.equal(recovered.length, 1)
+      assert.equal(recovered[0].detail.gateId, during.id)
+    })
+    const viewRevived = (await revived.request('/api/flowgate/state?sessionId=' + sid)).body
+    check('G40-7 同一工作区再查一次不重复写恢复事件，界面读得到 recovered', () => {
+      assert.equal(g40Events(ws).filter((event) => event.type === 'flow.gate.recovered').length, 1)
+      // S1 的门禁产物是需求文档，可确认状态在 doc 段；gate.pending 这个阶段恒为 false。
+      assert.equal(viewRevived.doc.recovered.gateId, during.id)
+      assert.equal(viewRevived.doc.interrupted, true)
+    })
+  } finally { rmSync(ws, { recursive: true, force: true }) }
+}
+
+// 用例 B：追问等待也吃同一个上限，超时不清卡片，用户点选仍然算数。
+{
+  const ws = g40Workspace('ask')
+  const sid = 'g40-ask'
+  try {
+    const cx = makeHost(ws, sid)
+    const service = currentService()
+    service.gateWaitOverrideMs = 60
+    await cx.tool('flowgate_start', { title: '追问等待上限', preset: 'fast' })
+    const flow = service.get(sid)
+    const pendingAsk = cx.tool('flowgate_ask', {
+      question: '门禁等待上限放在哪里配？',
+      options: [
+        { label: '工作区配置', tradeoff: '一处生效，所有流程共用', recommended: true },
+        { label: '每条流程各自配', tradeoff: '灵活，但多一层覆盖规则' },
+      ],
+    })
+    await tick()
+    const questionId = flow.grill.pending?.id
+    const askOutcome = await keepAlive(pendingAsk)
+    check('G40-8 追问等满上限返回 answered=false，并说清卡片仍然有效', () => {
+      assert.equal(askOutcome.answered, false)
+      assert.equal(askOutcome.waitReason, 'timeout')
+      assert.match(askOutcome.reason, /等待超时/)
+      assert.match(askOutcome.reason, /追问卡片仍留在工作台/)
+      assert.match(String(questionId), /^q_[0-9a-f]{8}$/)
+    })
+    const viewAfterTimeout = (await cx.request('/api/flowgate/state?sessionId=' + sid)).body
+    check('G40-9 超时不清 grill.pending：卡片还在，只是没有等待器接着', () => {
+      assert.equal(flow.grill.pending.id, questionId)
+      assert.equal(viewAfterTimeout.grill.pending.id, questionId)
+      assert.equal(viewAfterTimeout.grill.awaiting, false)
+    })
+    const late = await cx.request('/api/flowgate/action', { sessionId: sid, action: 'answer', payload: { choiceIndex: 1 } })
+    check('G40-10 超时之后点选照样落盘：答案进 grill.answered，卡片收起', () => {
+      assert.equal(late.status, 200, JSON.stringify(late.body))
+      assert.equal(flow.grill.answered.length, 1)
+      assert.equal(flow.grill.answered[0].questionId, questionId)
+      assert.equal(flow.grill.answered[0].choice, '每条流程各自配')
+      assert.equal(flow.grill.pending, null)
+      assert.equal(late.body.grill.pending, null)
+      assert.equal(late.body.grill.answeredCount, 1)
+    })
+    check('G40-11 补一条唤醒消息，事件标成 late，答案不会丢', () => {
+      const wake = cx.delivered.filter((item) => String(item.message?.content?.[0]?.text ?? '').includes('用户回答了你的追问'))
+      assert.equal(wake.length, 1)
+      assert.match(String(wake[0].message.content[0].text), /每条流程各自配/)
+      const events = g40Events(ws).filter((event) => event.type === 'grill.answered')
+      assert.equal(events.length, 1)
+      assert.equal(events[0].detail.late, true)
+      assert.equal(events[0].detail.questionId, questionId)
+    })
+    const again = await cx.request('/api/flowgate/action', { sessionId: sid, action: 'answer', payload: { choiceIndex: 0 } })
+    check('G40-12 同一条追问重复点击被拒，不重复写记录也不重复唤醒', () => {
+      assert.equal(again.status, 409)
+      assert.match(again.body.error, /已经处理过/)
+      assert.equal(flow.grill.answered.length, 1)
+      assert.equal(cx.delivered.filter((item) => String(item.message?.content?.[0]?.text ?? '').includes('用户回答了你的追问')).length, 1)
+    })
+  } finally { rmSync(ws, { recursive: true, force: true }) }
+}
+
+// 用例 C：上限的真源是工作区配置（不是测试注入），越界与脏类型一律回落默认。
+// 没有这组，把 gateWaitMs 里读配置那行改成固定 60000，上面两组用例仍然全绿。
+{
+  const ws = g40Workspace('config')
+  const sid = 'g40-config'
+  try {
+    const cx = makeHost(ws, sid)
+    await cx.tool('flowgate_start', { title: '等待上限来源', preset: 'fast' })
+    const service = currentService()
+    const flow = service.get(sid)
+    const configFile = join(ws, '.dsh-flowgate', 'config.json')
+    const readConfigMinutes = () => JSON.parse(readFileSync(configFile, 'utf8')).gateWaitMinutes
+    check('G40-13 没有配置时等待上限是默认 10 分钟，且不靠测试注入', () => {
+      assert.equal(service.gateWaitOverrideMs, null, '生产路径不该预设注入值')
+      assert.equal(service.gateWaitMs(flow), 10 * 60000)
+    })
+    check('G40-14 工作区配置的分钟数被真实读到，改了对下一次等待立即生效', () => {
+      assert.deepEqual(service.setWorkspaceGateWaitMinutes(ws, 25), { minutes: 25, rejected: false })
+      assert.equal(readConfigMinutes(), 25)
+      assert.equal(service.gateWaitMs(flow), 25 * 60000)
+      service.setWorkspaceGateWaitMinutes(ws, 60)
+      assert.equal(service.gateWaitMs(flow), 60 * 60000)
+      service.setWorkspaceGateWaitMinutes(ws, 1)
+      assert.equal(service.gateWaitMs(flow), 1 * 60000)
+    })
+    check('G40-15 0 与越界值不会被当成「不超时」，一律回落默认并标 rejected', () => {
+      for (const bad of [0, -5, 61, 120]) {
+        const result = service.setWorkspaceGateWaitMinutes(ws, bad)
+        assert.equal(result.minutes, 10, '配置 ' + bad + ' 必须回落默认')
+        assert.equal(result.rejected, true, '配置 ' + bad + ' 必须标成被拒')
+        assert.equal(service.gateWaitMs(flow), 10 * 60000)
+      }
+    })
+    check('G40-16 脏类型（布尔 / 空串 / 非数字）回落默认，不把 true 解释成 1 分钟', () => {
+      for (const dirty of [true, false, '', 'abc', null]) {
+        const result = service.setWorkspaceGateWaitMinutes(ws, dirty)
+        assert.equal(result.minutes, 10, '配置 ' + String(dirty) + ' 必须回落默认')
+        assert.equal(result.rejected, true, '脏类型 ' + String(dirty) + ' 必须标 rejected：写错了要让用户看见，不能静默当成默认值')
+        assert.equal(service.gateWaitMs(flow), 10 * 60000)
+      }
+    })
+    const viewConfig = (await cx.request('/api/flowgate/state?sessionId=' + sid)).body
+    check('G40-17 界面读得到上限与边界，供设置面板挡住 0', () => {
+      assert.equal(viewConfig.gateWait.minutes, 10)
+      assert.equal(viewConfig.gateWait.min, 1)
+      assert.equal(viewConfig.gateWait.max, 60)
+      assert.equal(viewConfig.gateWait.fallback, 10)
+    })
+  } finally { rmSync(ws, { recursive: true, force: true }) }
+}
+
+// 用例 D：同一会话挂起新等待会取代旧的。被取代的旧调用必须知道「自己被换掉了」，
+// 而等待器归新调用所有——这是 gateWaitPayload 里 outcome.self 修复的底层语义。
+{
+  const ws = g40Workspace('superseded')
+  const sid = 'g40-superseded'
+  try {
+    const cx = makeHost(ws, sid)
+    const service = currentService()
+    await cx.tool('flowgate_start', { title: '被取代的等待', preset: 'fast' })
+    const first = service.gates.wait(sid, 'answer', 60000)
+    await tick()
+    const second = service.gates.wait(sid, 'answer', 60000)
+    await tick()
+    const firstOutcome = await keepAlive(first)
+    check('G40-18 新等待取代旧等待：旧调用收到 superseded，等待器归新调用', () => {
+      assert.equal(firstOutcome.kind, 'superseded')
+      assert.equal(service.gates.has(sid), true)
+      assert.equal(service.gates.kindOf(sid), 'answer')
+    })
+    // 用户点选路径：notify 必须叫醒「现在挂着的那次等待」（second），而不是别的。
+    await tick()
+    const notified = service.gates.notify(sid, { kind: 'answer', choiceIndex: 0 }, 'answer')
+    const delivered = await keepAlive(second)
+    check('G40-19 用户回答只唤醒当前那次等待，被取代的旧调用不会被误唤醒', () => {
+      assert.equal(notified, true, 'notify 必须命中还挂着的等待器')
+      assert.equal(delivered.kind, 'answer')
+      assert.equal(firstOutcome !== delivered, true, '两次等待必须解析成不同的结果对象')
+      assert.equal(service.gates.has(sid), false)
+    })
+  } finally { rmSync(ws, { recursive: true, force: true }) }
+}
+
+// 用例 E：走宿主 flowgate_doc 完整路径验证被取代语义——不再直接调 gates.wait，
+// 而是让两个真实的 flowgate_doc 调用撞在一起：旧调用必须报「自己」的 gateId，
+// 且 willWake 为 false（等待器即使挂着也属于取代者，文案不能说「你会被唤醒」）。
+{
+  const ws = g40Workspace('host-superseded')
+  const sid = 'g40-hostsup'
+  try {
+    const cx = makeHost(ws, sid)
+    const service = currentService()
+    await cx.tool('flowgate_start', { title: '宿主路径被取代', preset: 'fast' })
+    const first = cx.tool('flowgate_doc', { html: '<p>第一次等待</p>', scope: G40_SCOPE })
+    await tick()
+    const second = cx.tool('flowgate_doc', { html: '<p>第二次等待</p>', scope: G40_SCOPE })
+    await tick()
+    const firstResult = await keepAlive(first)
+    check('G40-20 宿主路径被取代：旧调用报自己的 gateId，不是盘上取代者的', () => {
+      assert.equal(firstResult.decision, 'pending')
+      assert.equal(firstResult.waitReason, 'superseded')
+      assert.equal(firstResult.willWake, false, '这次等待已收尾：等待器即使挂着也属于取代者')
+      assert.match(firstResult.gateId, /^gate_[0-9a-f]{8}$/)
+      assert.match(firstResult.message, /被新的等待取代/)
+      assert.match(firstResult.message, /不会叫醒你/)
+      // 盘上的请求已经是取代者的：id 必须与旧调用报出的不同。
+      const onDisk = service.get(sid).stages.S1.gateRequested
+      assert.notEqual(onDisk.id, firstResult.gateId)
+    })
+    await keepAlive(second).catch(() => {})
   } finally { rmSync(ws, { recursive: true, force: true }) }
 }
 
