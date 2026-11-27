@@ -850,7 +850,7 @@ await check('阶段提示：放弃要两次确认，S4 带缺口时不提供一�
   assert.ok(hintLabels.includes('结束流程（需确认）'), '有缺口时先摊开缺口，再点第二次确认')
   assert.ok(buttonByText(hintTree, '退回开发修复'), '带缺口时仍能退回修复')
   // 两本账并排写在一行：只报测试要点会让人把「0 失败」读成验收通过。
-  assert.match(flat(hintTree), /验收标准：通过 0 · 未通过 1 · 未覆盖 0 · 待验证 0（共 1 条）/, '快捷入口要说清 AC 账本')
+  assert.match(flat(hintTree), /验收标准：通过 0 · 未通过 1 · 未覆盖 0 · 环境受限 0 · 待验证 0（共 1 条）/, '快捷入口要说清 AC 账本')
   assert.match(flat(hintTree), /测试要点：通过 0 · 失败 0 · 未覆盖 0 · 环境受限 0（共 0 个）/, '快捷入口要并排报测试要点')
   assert.match(flat(hintTree), /带缺口结束要先看清缺口，再点「结束流程（需确认）」/)
   assert.equal(posted.length, 0, '摆说明本身不投递任何请求')
@@ -4542,7 +4542,7 @@ await check('测试要点 failed: 0 但 AC 一条没过时，两套账分别显�
   posted = []
   const renderer = await render(FlowDetail, {})
   const tree = renderer.toJSON()
-  assert.match(flat(tree), /验收标准：通过 0 · 未通过 0 · 未覆盖 3 · 待验证 0（共 3 条）/)
+  assert.match(flat(tree), /验收标准：通过 0 · 未通过 0 · 未覆盖 3 · 环境受限 0 · 待验证 0（共 3 条）/)
   assert.match(flat(tree), /测试要点：通过 0 · 失败 0 · 未覆盖 1 · 环境受限 0（共 1 个）/)
   // 结束方式必须自成一档，不能读成「全部验收通过」。
   assert.equal(buttons(tree).some((node) => flat(node) === '结束流程'), false)

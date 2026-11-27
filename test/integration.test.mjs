@@ -833,7 +833,7 @@ await check('当前版本的逐 AC 实际执行证据才可正常验收通过', 
     scope: { files_expected_to_change: ['proof.txt', 'test/integration.test.mjs'],
       commands: ['node test/integration.test.mjs'], capabilities: [], out_of_scope_explicitly: [],
       acceptance_criteria: [{ id: 'AC-1', when: '读取本轮样例文件', then: '得到本轮写入的精确文本',
-        verification: { method: 'integration', procedure: '在集成测试中读取 proof.txt 并断言精确文本' } }] },
+        verification: { method: 'integration', procedure: '在集成测试中读取 proof.txt 并断言精确文本', commands: ['node test/integration.test.mjs'] } }] },
   }, S), '证据文档')
   await tick()
   // 本例要验证「证据能对上版本」。scope 必须自带集成测试要动的文件与命令：

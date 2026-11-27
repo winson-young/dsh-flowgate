@@ -4158,7 +4158,7 @@ for (const [kind, reason, expected] of [
         id: 'AC-1',
         when: '跨模块联动',
         then: '夹具一起跑通',
-        verification: { method: 'integration', procedure: '先改 test/fixtures/session.ts，再运行集成用例' },
+        verification: { method: 'integration', procedure: '先改 test/fixtures/session.ts，再运行集成用例', commands: ['node test/host.test.mjs'] },
       }],
     })
     // 带缺口的提交一定会抛错：把错误文案当返回值取出来，用例才好断言它说了什么。
@@ -4244,7 +4244,7 @@ for (const [kind, reason, expected] of [
         id: 'AC-1',
         when: '跨模块联动',
         then: '夹具一起跑通',
-        verification: { method: 'integration', procedure: '先改 test/fixtures/session.ts，再运行集成用例' },
+        verification: { method: 'integration', procedure: '先改 test/fixtures/session.ts，再运行集成用例', commands: ['node test/host.test.mjs'] },
       }],
     }
     const messages = []
@@ -4484,7 +4484,7 @@ async function provenanceFixture(label) {
       // 所以补一条真实可用的测试命令，而不是每次批准都接受缺口。
       commands: ['npm test'], files_expected_to_change: ['src/session.mjs', 'src/helper.mjs'],
       capabilities: ['过期请求拒绝'], out_of_scope_explicitly: [],
-      acceptance_criteria: [{ id: 'AC-1', when: '会话过期后发请求', then: '返回 401', verification: { method: 'unit', procedure: '调用 response(true) 并断言状态码' } }],
+      acceptance_criteria: [{ id: 'AC-1', when: '会话过期后发请求', then: '返回 401', verification: { method: 'unit', procedure: '调用 response(true) 并断言状态码', commands: ['npm test'] } }],
     },
   })
   await tick()
@@ -5309,14 +5309,14 @@ function g40Workspace(label) {
 const G40_SCOPE = {
   files_expected_to_change: ['src/session.mjs'],
   commands: ['npm test'],
-  command_sources: [{ command: 'npm test', from: 'package.json scripts.test', acs: ['AC-1'] }],
+  command_sources: [{ command: 'npm test', from: 'package.json scripts.test' }],
   capabilities: [],
   out_of_scope_explicitly: [],
   acceptance_criteria: [{
     id: 'AC-1',
     when: '会话过期后发请求',
     then: '返回 401',
-    verification: { method: 'unit', procedure: '调用 response(true) 并断言状态码 401' },
+    verification: { method: 'unit', procedure: '调用 response(true) 并断言状态码 401', commands: ['npm test'] },
   }],
 }
 

@@ -33,22 +33,32 @@ test('规范化兼容旧 scope，保留声明内容且默认明显布局要求�
   assert.equal(normalizeCriteria([{ ...layout, verification: { method: 'visual', tolerancePx: 0 } }])[0].verification.tolerancePx, 0)
 })
 
-test('冻结前的验收方案体检：集成验收缺测试文件与命令时给出缺口，不拦截', () => {
+test('冻结前的验收方案体检：没写 verification.commands 是硬阻塞，不是风险', () => {
   const criteria = [
     { id: 'AC-1', when: '跨模块调用', then: '夹具联动成功', verification: { method: 'integration', procedure: '运行集成用例' } },
   ]
   const readiness = scopeReadiness(criteria, [], ['src/auth/session.ts'])
+  assert.deepEqual(readiness.blockers.map((item) => item.code), ['ac-without-command'])
+  assert.deepEqual(readiness.blockers[0].acs, ['AC-1'])
+  assert.match(readiness.blockers[0].message, /没写 verification\.commands/)
+})
+
+test('写了命令但清单里没有测试命令、也没有测试文件时给出缺口，不拦截', () => {
+  const criteria = [
+    { id: 'AC-1', when: '跨模块调用', then: '夹具联动成功', verification: { method: 'integration', procedure: '运行集成用例', commands: ['node scripts/build.mjs'] } },
+  ]
+  const readiness = scopeReadiness(criteria, ['node scripts/build.mjs'], ['src/auth/session.ts'])
   assert.deepEqual(readiness.blockers, [])
   assert.deepEqual(readiness.risks.map((item) => item.code), ['no-test-command', 'integration-without-test-file'])
   assert.deepEqual(readiness.risks[0].acs, ['AC-1'])
   assert.match(readiness.risks[0].message, /声明了可执行验证（集成测试）/)
-  assert.match(readiness.risks[0].message, /清单为空/)
+  assert.match(readiness.risks[0].message, /现有 1 条都不是测试命令/)
   assert.match(readiness.risks[1].message, /没有任何测试文件/)
   assert.match(readiness.risks[1].message, /S3 评审会要求回 S1 调 scope/)
 })
 
 test('清单写对了但机器上没有这个可执行体时给出缺口，仓库没声明该生态就不误报', () => {
-  const criteria = [{ id: 'AC-1', when: '跑测试', then: '全部通过', verification: { method: 'unit', procedure: '运行用例' } }]
+  const criteria = [{ id: 'AC-1', when: '跑测试', then: '全部通过', verification: { method: 'unit', procedure: '运行用例', commands: ['node test/host.test.mjs'] } }]
   const project = (ecosystems, found) => ({
     ecosystems,
     resolveExecutable: (token) => ({ found: found.includes(token), path: found.includes(token) ? '/usr/bin/' + token : null, source: 'path' }),
@@ -187,7 +197,7 @@ test('严格执行规则不收紧体检的测试、宽泛命令和生态依赖�
   ]) assert.deepEqual(ecosystemsFor(token), ids, token)
   assert.deepEqual(needsOf('"C:/工具/NPM.CMD"'), ['node'])
   assert.deepEqual(needsOf('C:\\tools\\pip3.exe'), ['python', 'python3', 'py'])
-  const readiness = scopeReadiness([unit], ['python -E -m pytest -q', 'deno test --allow-all'], ['test/example.test.js'])
+  const readiness = scopeReadiness([{ ...unit, verification: { ...unit.verification, commands: ['python -E -m pytest -q'] } }], ['python -E -m pytest -q', 'deno test --allow-all'], ['test/example.test.js'])
   assert.ok(!readiness.risks.some((risk) => risk.code === 'no-test-command'))
 })
 
@@ -209,7 +219,7 @@ test('带目录的写法相对仓库根解析：宿主进程 cwd 不是仓库根
 })
 
 test('工具在、它依赖的解释器不在时照样报缺口，并点名缺的是哪一层', () => {
-  const criteria = [{ id: 'AC-1', when: '跑测试', then: '全部通过', verification: { method: 'unit', procedure: '运行用例' } }]
+  const criteria = [{ id: 'AC-1', when: '跑测试', then: '全部通过', verification: { method: 'unit', procedure: '运行用例', commands: ['npm test'] } }]
   const project = (ecosystems, found) => ({
     ecosystems,
     resolveExecutable: (token) => ({ found: found.includes(token), path: found.includes(token) ? '/usr/bin/' + token : null, source: 'path' }),
@@ -245,7 +255,7 @@ test('验证步骤点名 scope 外的文件时给出缺口，点名的文件已�
     id: 'AC-1',
     when: '跨模块联动',
     then: '夹具一起跑通',
-    verification: { method: 'integration', procedure: '先改 test/fixtures/session.ts，再运行 test/integration.test.mjs' },
+    verification: { method: 'integration', procedure: '先改 test/fixtures/session.ts，再运行 test/integration.test.mjs', commands: ['npm test'] },
   }]
   const outside = scopeReadiness(criteria, ['npm test'], ['test/integration.test.mjs'])
   const risk = outside.risks.find((item) => item.code === 'procedure-file-outside-scope')
@@ -262,15 +272,15 @@ test('验证步骤点名 scope 外的文件时给出缺口，点名的文件已�
 })
 
 test('清单里已经有测试文件时不再报「没有测试文件」', () => {
-  const criteria = [{ id: 'AC-1', when: '跨模块调用', then: '夹具联动成功', verification: { method: 'integration', procedure: '运行集成用例' } }]
+  const criteria = [{ id: 'AC-1', when: '跨模块调用', then: '夹具联动成功', verification: { method: 'integration', procedure: '运行集成用例', commands: ['npm test'] } }]
   const readiness = scopeReadiness(criteria, ['npm test'], ['test/host.test.mjs'])
   assert.deepEqual(readiness.risks, [])
 })
 
 test('补全命令与测试文件后体检无缺口', () => {
   const criteria = [
-    { id: 'AC-1', when: '跨模块调用', then: '夹具联动成功', verification: { method: 'integration', procedure: '运行集成用例' } },
-    { id: 'AC-2', when: '提交请求', then: '返回成功', verification: { method: 'unit', procedure: '跑单测' } },
+    { id: 'AC-1', when: '跨模块调用', then: '夹具联动成功', verification: { method: 'integration', procedure: '运行集成用例', commands: ['npm test'] } },
+    { id: 'AC-2', when: '提交请求', then: '返回成功', verification: { method: 'unit', procedure: '跑单测', commands: ['npm test'] } },
   ]
   const readiness = scopeReadiness(criteria, ['npm test'], ['test/integration.test.mjs'])
   assert.deepEqual(readiness.blockers, [])
@@ -314,9 +324,9 @@ test('追问体检：未决问题没问完、决策缺半边、什么都没澄�
 
 test('id 缺失或重复是硬阻塞，不是风险', () => {
   const readiness = scopeReadiness([
-    { when: '没有 id', then: '无法关联证据', verification: { method: 'unit', procedure: '跑单测' } },
-    { id: 'AC-1', when: 'a', then: 'b', verification: { method: 'unit', procedure: '跑单测' } },
-    { id: 'AC-1', when: 'c', then: 'd', verification: { method: 'unit', procedure: '跑单测' } },
+    { when: '没有 id', then: '无法关联证据', verification: { method: 'unit', procedure: '跑单测', commands: ['npm test'] } },
+    { id: 'AC-1', when: 'a', then: 'b', verification: { method: 'unit', procedure: '跑单测', commands: ['npm test'] } },
+    { id: 'AC-1', when: 'c', then: 'd', verification: { method: 'unit', procedure: '跑单测', commands: ['npm test'] } },
   ], ['npm test'], ['test/a.test.mjs'])
   assert.deepEqual(readiness.blockers.map((item) => item.code), ['missing-id', 'duplicate-id'])
   assert.match(readiness.blockers[0].message, /没有 id/)
@@ -561,9 +571,9 @@ test('重做清单保留 AC 缺口及 scope 内归属发现，scope 外与未知
   const flow = flowOf([unit, layout, { ...unit, id: 'AC-4' }])
   flow.test = report([evidence('AC-1', { status: 'fail' })])
   flow.review = { angles: [{ findings: [
-    { ac: 'AC-1', file: 'D:/Projects/demo/src/ui.js', severity: 'MAJOR', summary: '必须修复' },
-    { ac: 'AC-1', file: 'src/else.js', severity: 'CRITICAL', summary: '范围外建议' },
-    { ac: 'UNKNOWN', file: 'src/ui.js', severity: 'MAJOR', summary: '未知归属建议' },
+    { ac: 'AC-1', resolvedFile: 'D:/Projects/demo/src/ui.js', file: 'D:/Projects/demo/src/ui.js', severity: 'MAJOR', summary: '必须修复' },
+    { ac: 'AC-1', resolvedFile: 'D:/Projects/demo/src/else.js', file: 'src/else.js', severity: 'CRITICAL', summary: '范围外建议' },
+    { ac: 'UNKNOWN', resolvedFile: 'D:/Projects/demo/src/ui.js', file: 'src/ui.js', severity: 'MAJOR', summary: '未知归属建议' },
   ] }] }
   const ledger = acceptanceLedger(flow, snapshot)
   const frozenBefore = structuredClone(flow)
@@ -581,8 +591,8 @@ test('重做清单保留 AC 缺口及 scope 内归属发现，scope 外与未知
 test('Windows 路径按大小写和分隔符规范匹配，不接受目录相似前缀', () => {
   const flow = flowOf()
   flow.review = { angles: [{ findings: [
-    { ac: 'AC-1', file: 'd:/projects/DEMO/src/UI.js', severity: 'MAJOR', summary: '相同文件' },
-    { ac: 'AC-1', file: 'src/ui.js/../outside.js', severity: 'MAJOR', summary: '不同文件' },
+    { ac: 'AC-1', resolvedFile: 'd:/projects/DEMO/src/UI.js', file: 'd:/projects/DEMO/src/UI.js', severity: 'MAJOR', summary: '相同文件' },
+    { ac: 'AC-1', resolvedFile: 'D:/Projects/demo/outside.js', file: 'src/ui.js/../outside.js', severity: 'MAJOR', summary: '不同文件' },
   ] }] }
   const result = remediationList(flow, acceptanceLedger(flow, snapshot))
   assert.equal(result.items.filter((item) => item.source === 'review').length, 1)
@@ -592,8 +602,8 @@ test('Windows 路径按大小写和分隔符规范匹配，不接受目录相似
 test('未核实的 MAJOR 保留原严重度但只能进入重做建议', () => {
   const flow = flowOf()
   flow.review = { angles: [{ findings: [
-    { ac: 'AC-1', file: 'src/ui.js', severity: 'MAJOR', summary: '真实阻塞项' },
-    { ac: 'AC-1', file: 'src/ui.js', severity: 'MAJOR', summary: '位置与描述对不上', unverified: true },
+    { ac: 'AC-1', resolvedFile: 'D:/Projects/demo/src/ui.js', file: 'src/ui.js', severity: 'MAJOR', summary: '真实阻塞项' },
+    { ac: 'AC-1', resolvedFile: 'D:/Projects/demo/src/ui.js', file: 'src/ui.js', severity: 'MAJOR', summary: '位置与描述对不上', unverified: true },
   ] }] }
   const result = remediationList(flow, acceptanceLedger(flow, snapshot))
   assert.equal(result.items.filter((item) => item.source === 'review').length, 1)
@@ -645,6 +655,44 @@ test('执行摘要保留具体阶段文案，流程或执行取消时固定取�
   assert.equal(stageSummary(flow, ledger).execution.text, '执行或流程已取消')
 })
 
+const excludedFlow = (overrides = {}) => {
+  const flow = flowOf()
+  flow.scope.data.in_scope.commands = ['npx playwright test']
+  flow.test = report([{
+    ac: 'AC-1', status: 'excluded', method: 'unit',
+    excludeReason: '本机没有 Playwright 浏览器',
+    evidence: '探测 npx playwright test 失败：Executable doesn\'t exist',
+    probe: { command: 'npx playwright test', exitCode: 1, failure: 'Error: browserType.launch: Executable doesn\'t exist at ...' },
+    version: snapshot.id, ...overrides,
+  }])
+  return flow
+}
+
+test('环境受限不是写句理由就免检：探测命令、退出码、失败原文、阶段、方法与证据一项不能少', () => {
+  const good = excludedFlow()
+  assert.equal(statusOf(good), 'excluded')
+  assert.equal(acceptanceLedger(good, snapshot).counts.excluded, 1)
+  const cases = [
+    [{ probe: undefined }, /必须附探测记录/],
+    [{ probe: { command: '', exitCode: 1, failure: 'x' } }, /探测记录缺少命令/],
+    [{ probe: { command: 'npm test', exitCode: 1, failure: 'x' } }, /不在授权命令清单内/],
+    [{ probe: { command: 'npx playwright test', exitCode: 0, failure: 'x' } }, /退出码无效/],
+    [{ probe: { command: 'npx playwright test', exitCode: 1, failure: '' } }, /缺少失败原文/],
+    [{ method: 'manual' }, /方法与验收标准声明不匹配/],
+    [{ evidence: '' }, /缺少非空说明/],
+    [{ excludeReason: '' }, /没写明原因/],
+  ]
+  for (const [override, pattern] of cases) {
+    const flow = excludedFlow(override)
+    assert.equal(statusOf(flow), 'uncovered', JSON.stringify(override))
+    assert.match(acceptanceLedger(flow, snapshot).items[0].reason, pattern)
+  }
+  // 评审阶段不能替测试阶段宣布「环境测不了」：那等于用一句理由把 S4 的门槛挪走。
+  const reviewOnly = flowOf()
+  reviewOnly.scope.data.in_scope.commands = ['npx playwright test']
+  reviewOnly.review = report([{ ac: 'AC-1', status: 'excluded', method: 'unit', excludeReason: '没有浏览器', evidence: '探测失败', probe: { command: 'npx playwright test', exitCode: 1, failure: 'ENOENT' }, version: snapshot.id }])
+  assert.match(acceptanceLedger(reviewOnly, snapshot).items[0].reason, /评审阶段不能把验收标准标记为环境受限/)
+})
 test('任务 ID 不代表完成，开发提交与流程取消也不能变成执行成功', () => {
   const flow = flowOf()
   flow.devChanges = { files: [] }

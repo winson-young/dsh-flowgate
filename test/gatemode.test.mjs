@@ -152,7 +152,7 @@ const tick = () => new Promise((resolve) => setTimeout(resolve, 5))
 const cleanScope = (over = {}) => ({
   files_expected_to_change: ['src/app.js', 'test/app.test.mjs'],
   commands: ['node --test test/app.test.mjs'],
-  command_sources: [{ command: 'node --test test/app.test.mjs', from: 'package.json scripts.test', acs: ['AC-1'] }],
+  command_sources: [{ command: 'node --test test/app.test.mjs', from: 'package.json scripts.test' }],
   capabilities: [],
   out_of_scope_explicitly: [],
   acceptance_criteria: [
@@ -160,7 +160,7 @@ const cleanScope = (over = {}) => ({
       id: 'AC-1',
       when: '改完 src/app.js',
       then: 'node --test 通过',
-      verification: { method: 'unit', procedure: '跑 node --test test/app.test.mjs' },
+      verification: { method: 'unit', procedure: '跑 node --test test/app.test.mjs', commands: ['node --test test/app.test.mjs'] },
     },
   ],
   ...over,
@@ -195,10 +195,20 @@ await check('自动通过模式下 S1 体检干净就直接冻结，不等用户
 await check('自动通过模式下 S1 有缺口就直接退回，不摆到批准按钮前', async () => {
   const host = makeHost(freshCwd(), 'sess-auto-s1-gap')
   await host.tool('flowgate_start', { brief: '加一个功能', preset: 'fast' })
-  // 缺口在提交这一步就退回给 Agent：自动模式只是少了「等人点确认」，
-  // 不会把一份体检不过的 scope 端到批准按钮前。
+  // 缺口在提交这一步就退回给 Agent：AC 声明了可执行验证，但清单里只有构建命令、没有测试命令。
+  // 自动模式只是少了「等人点确认」，不会把一份体检不过的 scope 端到批准按钮前。
+  const buildOnly = cleanScope({
+    commands: ['node scripts/build.mjs'],
+    command_sources: [],
+    acceptance_criteria: [{
+      id: 'AC-1',
+      when: '改完 src/app.js',
+      then: '构建产出版本号',
+      verification: { method: 'unit', procedure: '跑 node scripts/build.mjs', commands: ['node scripts/build.mjs'] },
+    }],
+  })
   await assert.rejects(
-    () => host.tool('flowgate_doc', { html: '<p>需求</p>', scope: cleanScope({ commands: [] }) }),
+    () => host.tool('flowgate_doc', { html: '<p>需求</p>', scope: buildOnly }),
     /提交被退回（第 1\/3 次）/,
   )
   const state = await host.state()
@@ -211,6 +221,20 @@ await check('自动通过模式下 S1 有缺口就直接退回，不摆到批准
   const doc = await host.tool('flowgate_doc', { html: '<p>需求</p>', scope: cleanScope() })
   assert.equal(doc.frozen, true)
   assert.equal((await host.state()).stage, 'S2')
+})
+
+await check('硬阻塞项当场拒绝提交，不占缺口退回次数', async () => {
+  const host = makeHost(freshCwd(), 'sess-auto-s1-blocker')
+  await host.tool('flowgate_start', { brief: '加一个功能', preset: 'fast' })
+  // AC 引用了清单里没有的命令：这是硬阻塞，不是可累积的缺口——当场拒绝，不写缺口台账。
+  await assert.rejects(
+    () => host.tool('flowgate_doc', { html: '<p>需求</p>', scope: cleanScope({ commands: [] }) }),
+    /scope 的验收标准无法核验/,
+  )
+  const state = await host.state()
+  assert.equal(state.stage, 'S1')
+  assert.equal(state.doc.pending, false, '被拒绝的草稿不进待批准状态')
+  assert.equal(state.doc.scopeRiskStrikes?.count ?? 0, 0, '硬阻塞不占缺口退回次数')
 })
 
 await check('全部 AC 声明人工核验时自动通过会停下', async () => {
