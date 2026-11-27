@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 import { clientFactoryRevision, runtimeState, moduleSourceRevision, HOST_MODULES, hostState, clientState, describeRuntime, runtimeFields, packageVersion, CLIENT_REPORT_TTL } from '../lib/runtime.js'
 import { mkdtempSync, mkdirSync, copyFileSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
 import { execFileSync, spawnSync } from 'node:child_process'
+import { captureSync } from '../scripts/capture-child.mjs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -237,7 +238,10 @@ check('--check只读且修改源码后返回非零', () => {
   const root = fixture()
   try {
     const script = join(root, 'scripts', 'stamp-revisions.mjs')
-    const command = (args) => spawnSync(process.execPath, [script, ...args], { stdio: 'inherit' })
+    // 这条用例故意制造「陈旧」和「参数错误」，两条路径都会往 stderr 打报错文案。
+    // 用捕获而不是 inherit：断言只看退出码与文件字节，而发布脚本会把自测输出原样透传，
+    // 让「Stale module revisions」「Usage:」落进真实发布日志，看着像发布失败。
+    const command = (args) => captureSync(process.execPath, [script, ...args], { cwd: root })
     assert.equal(command(['--check']).status, 0)
     const target = join(root, 'lib', 'acceptance.js')
     const stale = readFileSync(target, 'utf8') + '\n// check must not mutate\n'
@@ -260,10 +264,10 @@ check('stamp只更新字面量并保留CRLF与LF原始字节', () => {
     for (const newline of ['\r\n', '\n']) {
       const stale = (original + '\n// preserve exact source bytes\n').replaceAll('\n', newline)
       writeFileSync(target, stale)
-      execFileSync(process.execPath, [script], { stdio: 'inherit' })
+      assert.equal(captureSync(process.execPath, [script], { cwd: root }).status, 0)
       const stamped = readFileSync(target, 'utf8')
       assert.equal(masked(stamped), masked(stale))
-      assert.equal(spawnSync(process.execPath, [script, '--check'], { stdio: 'inherit' }).status, 0)
+      assert.equal(captureSync(process.execPath, [script, '--check'], { cwd: root }).status, 0)
     }
   } finally { rmSync(root, { recursive: true, force: true }) }
 })

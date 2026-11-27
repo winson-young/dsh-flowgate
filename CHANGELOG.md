@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **发布日志里出现「Stale module revisions」「Usage:」像是在报错，其实是测试夹具**：`test/runtime.test.mjs` 有一条用例故意把模块改陈旧、再故意传错参数，验证 `scripts/stamp-revisions.mjs` 的退出码 1 / 2（`test/runtime.test.mjs:236-252`）；它用 `stdio: 'inherit'` 派生子进程，而 `scripts/publish.mjs:123` 的自测又是 `stdio: 'inherit'`，于是这两行「故意失败」的 stderr 直接进了发布终端，前后没有任何标记。功能一直是对的（发布退出码 0、十四套 PASS、包也打对了），但发布是用户要看懂结果的动作，长得像失败的字样会直接误导。改法：把这类只验退出码的派生改成 `captureSync`（`--check` 与 `--unknown` 两处），并在 `[2/4] 自测` 前打印一句「Stale / Usage 属预期，结论看汇总与退出码」。验证：`node test/runtime.test.mjs` 的 stdout / stderr 不再出现这两行、25 项全过；`node scripts/run-tests.mjs` 十四套全 PASS。
+
 - **G06 stale 分支问的是「有没有 scope」，不是「冻没冻」**：`docTool` 在阶段被并发推进后走 stale 分支，返回 `frozen: Boolean(flow.scope)`——只要方案对象还在就答「已冻结」，与同一文件 `scopeStatus`（lib/index.js:2193）和正常返回（lib/index.js:2263）里的 `flow.scope?.frozen === true` 不一致。本轮复核未能复现误报：入口 lib/index.js:4453 要求阶段必须是 S1，而 `rollbackTo` 退回 S1 时会清空阶段（lib/index.js:2025-2029，门禁回到 `pending`）并解冻 scope（lib/index.js:2040-2042），两者互斥；唯一可达的 stale 来自 `mode-changed` / `commands-decided` 触发的重判竞态（lib/index.js:1570），那时 `decideDoc` 已在 lib/index.js:2357-2362 冻结过 scope。所以这次修的是「同一判定两种写法」的隐患，不是已发生的误报。
 
   顺手把同一返回里的 `decision` 默认值从 `'approve'` 改成 `'pending'`（lib/index.js:4561）：`docTool` 在 lib/index.js:4529 刚把 `flow.doc.decision` 置空，真走进 stale 时旧写法会把「没读到决策」报成「用户批准」，而用户点的可能是「跳过」。验证：`node scripts/run-tests.mjs` 十四套全 PASS、退出码 0（改 lib/index.js 后先跑 `node scripts/stamp-revisions.mjs`，输出 `Updated module revisions: 1/7.`）；stale 分支本身仍没有夹具覆盖，这里如实记下，不假装有回归测试——不过写回会被源码扫描兜住：`scripts/verify-checks.mjs` 对 `lib/*.js` 逐行匹配行首的 `frozen: Boolean(...)`，命中即 FAIL 并给出文件行号（实测把 `lib/index.js:4563` 改回该写法，退出码 1、报 `lib/index.js:4563`；恢复后输出 `frozen invariants verified (8 files)`、退出码 0）。这条规则只认行首属性写法，内联对象里的同形表达式不在覆盖范围，如实记下。

@@ -119,6 +119,8 @@ if (skipTest) {
   console.log('\n[2/4] 跳过自测（--skip-test）')
 } else {
   console.log('\n[2/4] 自测 npm test')
+  console.log('  说明：自测会运行故意制造失败的元测试，输出里的 Stale / Usage 字样属预期；')
+  console.log('        本次自测的结论只看下面的「=== 测试汇总 ===」与退出码。')
   try {
     run('npm', ['test'], { stdio: 'inherit' })
   } catch {
