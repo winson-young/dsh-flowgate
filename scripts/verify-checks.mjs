@@ -231,8 +231,71 @@ export function scanSource(source, label = '<source>') {
   return { calls, violations }
 }
 
-const SELF_TESTS = [
-  ['空回调被判为违规', "check('x', () => {})", ['empty']],
+// —— 源码不变量：frozen 字段必须来自真正的冻结标志 ——
+// 同一个判定在 lib/index.js 里曾并存三种写法，其中 Boolean(flow.scope) 只要方案对象还在
+// 就答「已冻结」。它在正常路径上碰巧不出错（退回 S1 会同时清空阶段并解冻 scope），所以
+// 行为测试很难钉住；这里用逐行扫描保证这个表达式不会再被写回来。
+// 不用 codeMask：它在 7000+ 行的 lib/index.js 上会把整段代码误判成非代码态（实测
+// 含 4563 的零段是 4556–4590），守卫会静默失效。lib/ 的字段一律独占一行，窄规则就够。
+function scanFrozenBoolean(source, label = '<source>') {
+  const violations = []
+  source.split(/\r?\n/).forEach((line, index) => {
+    if (/^\s*frozen\s*:\s*Boolean\s*\(/.test(line)) {
+      violations.push({
+        file: label,
+        line: index + 1,
+        reason: 'frozen 字段用 Boolean(...) 判定：只要方案对象存在就会答「已冻结」，应写 flow.scope?.frozen === true',
+      })
+    }
+  })
+  return violations
+}
+
+const INVARIANT_SELF_TESTS = [
+  ['行首属性用 Boolean 被判违规', 'frozen: Boolean(flow.scope)', 1],
+  ['带缩进同样违规', '          frozen: Boolean(flow.scope),', 1],
+  ['冒号后不留空格也违规', 'frozen:Boolean(scope)', 1],
+  ['正确写法放行', 'frozen: flow.scope?.frozen === true,', 0],
+  ['行尾注释里的旧写法不误伤', 'frozen: flow.scope?.frozen === true, // frozen: Boolean(x)', 0],
+  ['整行注释不算', '// frozen: Boolean(flow.scope)', 0],
+  ['块注释行不算', ' * frozen: Boolean(flow.scope)', 0],
+  ['字符串里的旧写法不算', "const s = 'frozen: Boolean(flow.scope)'", 0],
+  ['内联对象写法不在本规则覆盖范围（如实记录）', 'const x = { frozen: Boolean(flow.scope) }', 0],
+]
+
+function invariantSelfTest() {
+  const failures = []
+  for (const [name, source, expected] of INVARIANT_SELF_TESTS) {
+    const found = scanFrozenBoolean(source).length
+    if (found !== expected) failures.push(name + '：期望 ' + expected + ' 处，实际 ' + found + ' 处')
+  }
+  if (failures.length) {
+    for (const failure of failures) console.error('  FAIL ' + failure)
+    console.error('frozen 不变量自检失败：' + failures.length + ' / ' + INVARIANT_SELF_TESTS.length)
+    return 1
+  }
+  console.log('frozen 不变量自检通过：' + INVARIANT_SELF_TESTS.length + ' 个用例')
+  return 0
+}
+
+const INVARIANT_DIR = 'lib'
+
+function collectJs(dir, out = []) {
+  let entries
+  try {
+    entries = readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return out
+  }
+  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+    const full = resolve(dir, entry.name)
+    if (entry.isDirectory()) collectJs(full, out)
+    else if (entry.isFile() && entry.name.endsWith('.js')) out.push(full)
+  }
+  return out
+}
+
+const SELF_TESTS = [  ['空回调被判为违规', "check('x', () => {})", ['empty']],
   ['带空格的空回调', "check('x', () => { })", ['empty']],
   ['async 空回调', "check('x', async () => {})", ['empty']],
   ['只有注释的回调', "check('x', () => { /* 待补 */ })", ['empty']],
@@ -304,11 +367,13 @@ function main(argv) {
       return 2
     }
   }
-  if (runSelfTest) return selfTest()
+  if (runSelfTest) return selfTest() || invariantSelfTest()
   // 默认先自检再扫描：一条命令同时证明「判定本身在判定」与「仓库没有违约」，
   // 聚合器和 npm run check 才能共用同一个入口。
   const selfStatus = selfTest()
   if (selfStatus) return selfStatus
+  const invariantStatus = invariantSelfTest()
+  if (invariantStatus) return invariantStatus
 
   const files = targetFiles(root)
   if (!files.length) {
@@ -334,7 +399,19 @@ function main(argv) {
     console.error('扫描了 ' + files.length + ' 个文件却没有找到任何 check 调用，判定不可信')
     return 1
   }
+  const invariantFiles = collectJs(resolve(root, INVARIANT_DIR))
+  const invariantViolations = []
+  for (const file of invariantFiles) invariantViolations.push(...scanFrozenBoolean(readFileSync(file, 'utf8'), file))
+  if (invariantViolations.length) {
+    for (const violation of invariantViolations) {
+      console.error('  FAIL ' + violation.file + ':' + violation.line + ' ' + violation.reason)
+    }
+    console.error('frozen 不变量被破坏：' + invariantViolations.length + ' 处（扫描 ' + invariantFiles.length + ' 个文件）')
+    return 1
+  }
   console.log('check contracts verified (' + calls + ' calls in ' + files.length + ' files).')
+  if (invariantFiles.length) console.log('frozen invariants verified (' + invariantFiles.length + ' files).')
+  else console.log('没有 ' + INVARIANT_DIR + '/ 目录，跳过 frozen 不变量扫描')
   return 0
 }
 

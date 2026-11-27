@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **G06 stale 分支问的是「有没有 scope」，不是「冻没冻」**：`docTool` 在阶段被并发推进后走 stale 分支，返回 `frozen: Boolean(flow.scope)`——只要方案对象还在就答「已冻结」，与同一文件 `scopeStatus`（lib/index.js:2193）和正常返回（lib/index.js:2263）里的 `flow.scope?.frozen === true` 不一致。本轮复核未能复现误报：入口 lib/index.js:4453 要求阶段必须是 S1，而 `rollbackTo` 退回 S1 时会清空阶段（lib/index.js:2025-2029，门禁回到 `pending`）并解冻 scope（lib/index.js:2040-2042），两者互斥；唯一可达的 stale 来自 `mode-changed` / `commands-decided` 触发的重判竞态（lib/index.js:1570），那时 `decideDoc` 已在 lib/index.js:2357-2362 冻结过 scope。所以这次修的是「同一判定两种写法」的隐患，不是已发生的误报。
+
+  顺手把同一返回里的 `decision` 默认值从 `'approve'` 改成 `'pending'`（lib/index.js:4561）：`docTool` 在 lib/index.js:4529 刚把 `flow.doc.decision` 置空，真走进 stale 时旧写法会把「没读到决策」报成「用户批准」，而用户点的可能是「跳过」。验证：`node scripts/run-tests.mjs` 十四套全 PASS、退出码 0（改 lib/index.js 后先跑 `node scripts/stamp-revisions.mjs`，输出 `Updated module revisions: 1/7.`）；stale 分支本身仍没有夹具覆盖，这里如实记下，不假装有回归测试——不过写回会被源码扫描兜住：`scripts/verify-checks.mjs` 对 `lib/*.js` 逐行匹配行首的 `frozen: Boolean(...)`，命中即 FAIL 并给出文件行号（实测把 `lib/index.js:4563` 改回该写法，退出码 1、报 `lib/index.js:4563`；恢复后输出 `frozen invariants verified (8 files)`、退出码 0）。这条规则只认行首属性写法，内联对象里的同形表达式不在覆盖范围，如实记下。
+
 - **受限沙箱里「一条命令跑全量」是假的：十四套全部 NOT_RUN，退出码 1**：`npm test` 在本机会话里长期只打印十四行 `xxx=NOT_RUN (EPERM)`。看起来像测试坏了，实际是沙箱拒绝**用管道 stdio 派生进程**——`spawn` 本身没问题。同一个子进程换 `stdio: 'pipe'` 直接 `EPERM`，把 stdout/stderr 指向真实文件描述符（`fs.openSync`）却能正常退出并写满输出。`node --test` 恰恰为每个测试文件派生子进程并用管道收输出，于是整套测试在沙箱里集体消失。
 
   新增 `scripts/capture-child.mjs`：`captureSync(command, args, options)` 与异步版 `capture(...)` 都先开临时文件、把子进程输出指过去、读回、再删（Windows 上删不掉开着的文件，所以先 `closeSync` 后 `rmSync`）；临时文件打不开才回落管道，普通宿主行为不变。返回值与 `spawnSync` 同形，`stdout`/`stderr` 一律是字符串。
