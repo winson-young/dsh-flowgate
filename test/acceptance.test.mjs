@@ -9,7 +9,7 @@ const sourceLines = Array.from({ length: 40 }, (_, index) => `// line ${index + 
 sourceLines[11] = 'export function render() { return ui }'
 const runtime = { status: 'verified', hostRevision: 'host-v1', clientRevision: 'client-v1', pageId: 'page-1', viewport: { width: 1440, height: 900 }, cwd: 'D:/Projects/demo', scopeFiles: ['src/ui.js'], evidenceSources: [{ file: 'src/ui.js', lineCount: sourceLines.length, lines: sourceLines }] }
 const unit = { id: 'AC-1', when: '提交有效请求', then: '返回成功结果', verification: { method: 'unit', procedure: '运行请求断言' } }
-const layout = { id: 'AC-2', when: '打开桌面界面', then: '输入框与表格左右对齐，宽度相同' }
+const layout = { id: 'AC-2', when: '打开桌面界面', then: '输入框与表格左右对齐，宽度相同', verification: { method: 'visual', procedure: '用 inspectLayout 实测输入框与表格的左右边界' } }
 const visual = { id: 'AC-3', when: '打开界面', then: '按钮颜色符合设计', verification: { method: 'visual', procedure: '核对截图' } }
 const flowOf = (criteria = [unit]) => ({ cwd: 'D:/Projects/demo', scope: { data: { acceptance_criteria: criteria, in_scope: { files_expected_to_change: ['src/ui.js'], commands: ['node test/ui.test.mjs'] } } } })
 const evidence = (ac = 'AC-1', overrides = {}) => ({ ac, status: 'pass', method: 'unit', summary: '实际运行断言：1 项通过', citations: [{ file: 'src/ui.js', line: 12, anchor: 'export function render() {' }], command: 'node test/ui.test.mjs', exitCode: 0, version: snapshot.id, ...overrides })
@@ -21,17 +21,19 @@ const receiptFor = (entry, overrides = {}) => ({ id: entry.evidenceId, version: 
 runtime.layoutEvidence = [receiptFor(measured())]
 const statusOf = (flow, current = snapshot, live = runtime) => acceptanceLedger(flow, current, live).items[0].status
 
-test('规范化兼容旧 scope，保留声明内容且默认明显布局要求为 visual', () => {
+test('规范化只认声明：正文含 width / align 也不改方法，缺声明才降级 manual', () => {
   const normalized = normalizeCriteria([layout, { id: '旧验收', when: '出现错误', then: '显示提示' }, unit])
   assert.equal(normalized[0].verification.method, 'visual')
   assert.equal(normalized[0].verification.tolerancePx, 1)
+  // 声明优先：正文写着「宽度相同」也不许替人改方法，unit 就是 unit。
+  assert.equal(normalizeCriteria([{ ...layout, verification: { method: 'unit', procedure: '跑断言' } }])[0].verification.method, 'unit')
   assert.equal(normalized[0].when, layout.when)
   assert.equal(normalized[0].then, layout.then)
   assert.ok(normalized[0].verification.procedure)
   assert.equal(normalized[1].verification.method, 'manual')
   assert.deepEqual(normalized[2], unit)
   assert.deepEqual(normalizeCriteria(null), [])
-  assert.equal(normalizeCriteria([{ ...layout, verification: { tolerancePx: -1 } }])[0].verification.tolerancePx, 1)
+  assert.equal(normalizeCriteria([{ ...layout, verification: { method: 'visual', tolerancePx: -1 } }])[0].verification.tolerancePx, 1)
   assert.equal(normalizeCriteria([{ ...layout, verification: { method: 'visual', tolerancePx: 0 } }])[0].verification.tolerancePx, 0)
 })
 
@@ -434,18 +436,29 @@ test('有效当前 test pass 关闭 review uncovered，review fail 仍优先', (
   assert.equal(statusOf(flow), 'pass')
 })
 
-test('布局 AC 误标 unit、integration 或 manual 也不能用 CSS 断言绕过视觉实测', () => {
+test('布局 AC 声明 unit 时只提示不改判；声明 visual 就必须交真实测量', () => {
+  // 前半段：声明优先。系统不再替人改方法，只把「正文像视觉、却声明 unit」当提示说出来。
+  const declared = { ...layout, verification: { method: 'unit', procedure: '断言 CSS width:100%', commands: ['node test/ui.test.mjs'] } }
+  assert.equal(normalizeCriteria([declared])[0].verification.method, 'unit')
+  const readiness = scopeReadiness([declared], ['node test/ui.test.mjs'], ['src/ui.js', 'test/ui.test.mjs'])
+  assert.deepEqual(readiness.blockers, [])
+  assert.deepEqual(readiness.risks.map((item) => item.code), ['layout-method-suspicion'])
+  assert.match(readiness.risks[0].message, /读起来像视觉结果/)
+  // 声明 unit 就走 unit 的账：方法一致时证据照常结算，不再被视觉门槛拦下。
+  const unitFlow = flowOf([declared])
+  unitFlow.test = report([evidence('AC-2', { method: 'unit', summary: 'CSS width:100% 断言通过' })])
+  assert.equal(statusOf(unitFlow), 'pass')
+  // 后半段：真正该守的防线。声明 visual 却没有实测测量，仍然未覆盖。
   for (const method of ['unit', 'integration', 'manual']) {
-    const criterion = { ...layout, verification: { method, procedure: '断言 CSS width:100%' } }
-    assert.equal(normalizeCriteria([criterion])[0].verification.method, 'visual')
-    const flow = flowOf([criterion])
-    flow.test = report([evidence('AC-2', { method, summary: 'CSS width:100% 断言通过' })])
-    assert.equal(statusOf(flow), 'uncovered')
-    flow.test = report([measured({ measurements: undefined })])
-    assert.equal(statusOf(flow), 'uncovered')
-    flow.test = report([measured()])
-    assert.equal(statusOf(flow), 'pass')
+    const flow = flowOf([layout])
+    flow.test = report([measured({ method })])
+    assert.equal(statusOf(flow), 'uncovered', method)
   }
+  const visualFlow = flowOf([layout])
+  visualFlow.test = report([measured({ measurements: undefined })])
+  assert.equal(statusOf(visualFlow), 'uncovered')
+  visualFlow.test = report([measured()])
+  assert.equal(statusOf(visualFlow), 'pass')
 })
 
 test('CSS 字符串或截图不能证明对齐，必须包含实际几何测量', () => {
@@ -693,7 +706,7 @@ test('环境受限不是写句理由就免检：探测命令、退出码、失�
     [{ probe: { command: 'npm test', exitCode: 1, failure: 'x' } }, /不在授权命令清单内/],
     [{ probe: { command: 'npx playwright test', exitCode: 0, failure: 'x' } }, /退出码无效/],
     [{ probe: { command: 'npx playwright test', exitCode: 1, failure: '' } }, /缺少失败原文/],
-    [{ method: 'manual' }, /方法与验收标准声明不匹配/],
+    [{ method: 'manual' }, /证据方法 manual 与 AC 声明的方法 unit 不一致/],
     [{ summary: '' }, /缺少非空说明/],
     [{ excludeReason: '' }, /没写明原因/],
   ]

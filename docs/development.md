@@ -188,7 +188,7 @@ S3 与 S4 的「更多操作」里都有「回到需求分析调整 scope」，�
 - **标注来源与对应 AC**：`command_sources: [{ command, from, acs }]`。它不进冻结的 `scope.json`，只用于界面标注和体检依据。
 - **不要过少也不要过多**：过少 → 执行时被拒、门禁上多一道待补决定；过多 → 批准了一堆用不上的权限。
 
-`scopeReadiness` 现在同时检查过少与过多，风险码如下：
+`scopeReadiness` 现在同时检查过少与过多，风险码如下（另有三条硬阻塞：`missing-id`、`duplicate-id`、`ac-without-method`——验收标准必须显式声明 `verification.method`，系统不会按正文措辞替它猜）：
 
 | 风险码 | 含义 | 后果 |
 | :--- | :--- | :--- |
@@ -196,7 +196,8 @@ S3 与 S4 的「更多操作」里都有「回到需求分析调整 scope」，�
 | `ac-without-command` | 某条可执行 AC 没有任何命令对应（需 `command_sources` 才逐条判） | 缺口，需显式接受 |
 | `integration-without-test-file` | 声明集成验证但没有测试文件 | 缺口，需显式接受 |
 | `procedure-file-outside-scope` | 验证步骤点名了 scope 之外的文件 | 缺口，需显式接受 |
-| `visual-without-measurement` | 视觉验收没写明怎么测 | 缺口，需显式接受 |
+| `visual-without-measurement` | 声明 `visual` 却没在 procedure 里写怎么量（自动采集只支持左右边界） | 缺口，需显式接受 |
+| `layout-method-suspicion` | 正文读起来像视觉结果（出现 width / 对齐等），却声明为 `unit` / `integration` | 只提示，不阻塞；方法仍由声明决定 |
 | `over-broad-command` | 出现 `npm *`、`node *`、`*` 这类通配（带 `[目录]` 后缀的同样算：`BROAD_COMMAND` 先剥后缀再判，加个目录洗不成合规条目），或条目数超过 `max(8, 可执行 AC 数 × 2)` | 缺口，需显式接受 |
 | `command-not-applicable` | `npm run <script>` 的脚本在 `package.json` 里不存在 | 缺口，需显式接受 |
 | `command-runtime-missing` | 命令用到的可执行体在当前 PATH 上找不到（`node`、`php`、`cargo`…），或者它本身在、它依赖的解释器不在（`npm` 在而 `node` 不在） | 缺口，需显式接受 |
