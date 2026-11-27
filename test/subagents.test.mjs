@@ -1409,7 +1409,7 @@ for (const kind of ['review', 'test']) for (const stale of [false, true]) {
         if (host.activations.length === 1) {
           submitted = {
             ac: 'AC-1', status: 'uncovered', method: 'visual',
-            evidence: '模拟宿主没有已认证的真实 DOM；未执行视觉测量。',
+            summary: '模拟宿主没有已认证的真实 DOM；未执行视觉测量。',
             version: stale ? '0'.repeat(64) : state.snapshot.id,
           }
           activation.acceptance = [submitted]
@@ -1434,7 +1434,7 @@ for (const kind of ['review', 'test']) for (const stale of [false, true]) {
       assert.equal(before.acceptance.items[0].status, 'uncovered')
       assert.equal(before.acceptance.counts.pass, 0)
       if (stale) assert.match(before.acceptance.items[0].reason, /版本/)
-      else assert.match(before.acceptance.items[0].evidence, /未执行视觉测量/)
+      else assert.match(before.acceptance.items[0].summary, /未执行视觉测量/)
     })
   })
 }
@@ -1486,7 +1486,7 @@ for (const kind of ['review', 'test']) for (const stale of [false, true]) {
       const state = await host.state()
       const submitted = {
         ac: 'AC-1', status: 'uncovered', method: 'manual',
-        evidence: '来源：人工顶层报告；当前模拟宿主未进行实际执行，保持未覆盖。',
+        summary: '来源：人工顶层报告；当前模拟宿主未进行实际执行，保持未覆盖。',
         version: stale ? '0'.repeat(64) : state.snapshot.id,
       }
       const entries = kind === 'review'
@@ -1521,7 +1521,7 @@ for (const kind of ['review', 'test']) for (const stale of [false, true]) {
       assert.equal(before.acceptance.items[0].status, 'uncovered')
       assert.equal(before.acceptance.counts.pass, 0)
       if (stale) assert.match(before.acceptance.items[0].reason, /版本/)
-      else assert.match(before.acceptance.items[0].evidence, /来源：人工顶层报告/)
+      else assert.match(before.acceptance.items[0].summary, /来源：人工顶层报告/)
     })
   })
 }

@@ -853,7 +853,9 @@ await check('当前版本的逐 AC 实际执行证据才可正常验收通过', 
   const verified = within(call('flowgate_test', {
     directions: [{ id: 'smoke', name: '读取集成验证', points: [{ point: '读取样例并断言精确文本', result: 'pass' }] }],
     acceptance: [{ ac: 'AC-1', status: 'pass', method: 'integration', version,
-      evidence: 'test/integration.test.mjs 已实际 readFileSync(proof.txt) 并 strictEqual 精确文本，通过。' }],
+      summary: 'test/integration.test.mjs 已实际 readFileSync(proof.txt) 并 strictEqual 精确文本，通过。',
+      citations: [{ file: 'proof.txt', line: 1, anchor: '本轮已读取的样例' }],
+      command: 'node test/integration.test.mjs', exitCode: 0 }],
   }, S), '证据验收')
   await tick()
   const mid = await getState(S)

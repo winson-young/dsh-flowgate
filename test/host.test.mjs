@@ -4904,13 +4904,13 @@ for (const stage of ['S3', 'S4']) {
   }
 }
 
-for (const evidenceCase of ['missing', 'empty', 'valid', 'nonpass-point']) {
+for (const evidenceCase of ['missing', 'uncited', 'valid', 'nonpass-point']) {
   const { ws, px, act, state, round, angles, directions } = await provenanceFixture('evidence-' + evidenceCase)
   try {
     const reviewedVersion = (await state()).snapshot.id
     await round('flowgate_review', {
       angles,
-      acceptance: [{ ac: 'AC-1', status: 'pass', method: 'unit', evidence: '静态检查声称通过，不能替代执行', version: reviewedVersion }],
+      acceptance: [{ ac: 'AC-1', status: 'pass', method: 'unit', summary: '静态检查声称通过，不能替代执行', version: reviewedVersion }],
     }, { decision: 'pass' })
     const reviewed = await state()
     assert.equal(reviewed.acceptance.counts.pass, 0)
@@ -4920,7 +4920,11 @@ for (const evidenceCase of ['missing', 'empty', 'valid', 'nonpass-point']) {
     const actualStatus = executed.response(true)
     assert.equal(actualStatus, 401)
     const evidence = '实际调用当前 src/session.mjs response(true) 得到 ' + actualStatus + '，assert.equal(actualStatus, 401) 通过'
-    const acceptance = evidenceCase === 'missing' ? [] : [{ ac: 'AC-1', status: 'pass', method: 'unit', evidence: evidenceCase === 'empty' ? '' : evidence, version }]
+    const acceptance = evidenceCase === 'missing' ? [] : [{
+      ac: 'AC-1', status: 'pass', method: 'unit', summary: evidence,
+      citations: evidenceCase === 'uncited' ? [] : [{ file: 'src/session.mjs', line: 1, anchor: 'expired ? 401 : 200' }],
+      command: 'npm test', exitCode: 0, version,
+    }]
     const reportedDirections = evidenceCase === 'nonpass-point'
       ? [{ ...directions[0], points: [{ point: '未验证的额外边界', result: 'uncovered' }] }]
       : directions
@@ -4936,7 +4940,8 @@ for (const evidenceCase of ['missing', 'empty', 'valid', 'nonpass-point']) {
         assert.equal(result.decision, 'pass')
         assert.equal(finished.acceptanceDecision.status, 'passed')
         assert.equal(finished.acceptance.counts.pass, 1)
-        assert.equal(finished.acceptance.items[0].evidence, evidence)
+        assert.equal(finished.acceptance.items[0].summary, evidence)
+        assert.equal(finished.acceptance.items[0].citations[0].anchor, 'expired ? 401 : 200')
         assert.equal(finished.acceptance.items[0].version, version)
         assert.equal(finished.finished, true)
       })

@@ -5,15 +5,17 @@ import { BROAD_COMMAND, INLINE_EXEC, PARSE_ONLY, READONLY_VERSION, TEST_COMMAND,
 import { join } from 'node:path'
 
 const snapshot = { id: 'a'.repeat(64), complete: true }
-const runtime = { status: 'verified', hostRevision: 'host-v1', clientRevision: 'client-v1', pageId: 'page-1', viewport: { width: 1440, height: 900 } }
+const sourceLines = Array.from({ length: 40 }, (_, index) => `// line ${index + 1}`)
+sourceLines[11] = 'export function render() { return ui }'
+const runtime = { status: 'verified', hostRevision: 'host-v1', clientRevision: 'client-v1', pageId: 'page-1', viewport: { width: 1440, height: 900 }, cwd: 'D:/Projects/demo', scopeFiles: ['src/ui.js'], evidenceSources: [{ file: 'src/ui.js', lineCount: sourceLines.length, lines: sourceLines }] }
 const unit = { id: 'AC-1', when: '提交有效请求', then: '返回成功结果', verification: { method: 'unit', procedure: '运行请求断言' } }
 const layout = { id: 'AC-2', when: '打开桌面界面', then: '输入框与表格左右对齐，宽度相同' }
 const visual = { id: 'AC-3', when: '打开界面', then: '按钮颜色符合设计', verification: { method: 'visual', procedure: '核对截图' } }
-const flowOf = (criteria = [unit]) => ({ cwd: 'D:/Projects/demo', scope: { data: { acceptance_criteria: criteria, in_scope: { files_expected_to_change: ['src/ui.js'] } } } })
-const evidence = (ac = 'AC-1', overrides = {}) => ({ ac, status: 'pass', method: 'unit', evidence: '实际运行断言：1 项通过', version: snapshot.id, ...overrides })
+const flowOf = (criteria = [unit]) => ({ cwd: 'D:/Projects/demo', scope: { data: { acceptance_criteria: criteria, in_scope: { files_expected_to_change: ['src/ui.js'], commands: ['node test/ui.test.mjs'] } } } })
+const evidence = (ac = 'AC-1', overrides = {}) => ({ ac, status: 'pass', method: 'unit', summary: '实际运行断言：1 项通过', citations: [{ file: 'src/ui.js', line: 12, anchor: 'export function render() {' }], command: 'node test/ui.test.mjs', exitCode: 0, version: snapshot.id, ...overrides })
 const report = (acceptance, overrides = {}) => ({ snapshot: { ...snapshot }, acceptance, ...overrides })
 const layoutEvidenceId = 'a0a0a0a0-1111-4111-8111-a0a0a0a0a0a0'
-const measured = (overrides = {}) => evidence('AC-2', { evidenceId: layoutEvidenceId, method: 'visual', evidence: '浏览器 getBoundingClientRect 实际测量', runtime: { hostRevision: runtime.hostRevision, clientRevision: runtime.clientRevision, pageId: runtime.pageId, viewport: { ...runtime.viewport } }, measurements: [{ element: 'input', reference: 'table', left: 24, right: 800, referenceLeft: 24, referenceRight: 800 }], ...overrides })
+const measured = (overrides = {}) => evidence('AC-2', { evidenceId: layoutEvidenceId, method: 'visual', summary: '浏览器 getBoundingClientRect 实际测量', runtime: { hostRevision: runtime.hostRevision, clientRevision: runtime.clientRevision, pageId: runtime.pageId, viewport: { ...runtime.viewport } }, measurements: [{ element: 'input', reference: 'table', left: 24, right: 800, referenceLeft: 24, referenceRight: 800 }], ...overrides })
 const receiptFor = (entry, overrides = {}) => ({ id: entry.evidenceId, version: entry.version, ...entry.runtime, measurements: structuredClone(entry.measurements), at: '2026-11-19T15:00:00.000Z', ...overrides })
 // 模拟宿主采集回执；每次修改几何数据的试验都显式提供对应回执。
 runtime.layoutEvidence = [receiptFor(measured())]
@@ -374,8 +376,21 @@ test('报告和当前快照必须都有同 ID 且明确完整', () => {
   }
 })
 
-test('证据必须包含匹配的方法、非空文字和当前版本', () => {
-  for (const override of [{ evidence: '' }, { evidence: '  ' }, { evidence: 42 }, { method: 'manual' }, { version: 'old' }, { version: undefined }, { status: 'completed' }]) {
+test('证据必须包含可核对的引用、授权命令、匹配方法与当前版本', () => {
+  const bad = [
+    { citations: [] },
+    { citations: [{ file: 'src/ui.js', line: 12, anchor: '' }] },
+    { citations: [{ file: 'src/ui.js', line: 12, anchor: '不存在的断言文本' }] },
+    { citations: [{ file: 'src/ui.js', line: 999, anchor: 'export function' }] },
+    { citations: [{ file: 'src/absent.js', line: 1, anchor: 'x' }] },
+    { citations: [{ file: 'src/other.js', line: 1, anchor: 'x' }] },
+    { command: '' },
+    { command: 'node run-everything.mjs' },
+    { exitCode: 1 },
+    { method: 'manual' },
+    { version: 'old' }, { version: undefined }, { status: 'completed' },
+  ]
+  for (const override of bad) {
     const flow = flowOf()
     flow.test = report([evidence('AC-1', override)])
     assert.equal(statusOf(flow), 'uncovered')
@@ -397,7 +412,7 @@ test('无效 ID、重复 scope ID、未知 AC、重复或冲突证据均不能�
   assert.equal(statusOf(flow), 'uncovered')
   flow.test = report([evidence(), evidence()])
   assert.equal(statusOf(flow), 'uncovered')
-  flow.test = report([evidence(), evidence('AC-1', { status: 'fail', evidence: '实际断言失败' })])
+  flow.test = report([evidence(), evidence('AC-1', { status: 'fail', summary: '实际断言失败' })])
   assert.equal(statusOf(flow), 'fail')
   flow.test = report([evidence(), evidence('AC-1', { status: 'uncovered' })])
   assert.equal(statusOf(flow), 'uncovered')
@@ -424,7 +439,7 @@ test('布局 AC 误标 unit、integration 或 manual 也不能用 CSS 断言绕�
     const criterion = { ...layout, verification: { method, procedure: '断言 CSS width:100%' } }
     assert.equal(normalizeCriteria([criterion])[0].verification.method, 'visual')
     const flow = flowOf([criterion])
-    flow.test = report([evidence('AC-2', { method, evidence: 'CSS width:100% 断言通过' })])
+    flow.test = report([evidence('AC-2', { method, summary: 'CSS width:100% 断言通过' })])
     assert.equal(statusOf(flow), 'uncovered')
     flow.test = report([measured({ measurements: undefined })])
     assert.equal(statusOf(flow), 'uncovered')
@@ -435,7 +450,7 @@ test('布局 AC 误标 unit、integration 或 manual 也不能用 CSS 断言绕�
 
 test('CSS 字符串或截图不能证明对齐，必须包含实际几何测量', () => {
   const flow = flowOf([layout])
-  flow.test = report([measured({ measurements: undefined, evidence: 'width:100%; margin-left:0', artifact: 'screenshot.png' })])
+  flow.test = report([measured({ measurements: undefined, summary: 'width:100%; margin-left:0', artifact: 'screenshot.png' })])
   const item = acceptanceLedger(flow, snapshot, runtime).items[0]
   assert.equal(item.status, 'uncovered')
   assert.match(item.reason, /实际边界测量/)
@@ -549,7 +564,7 @@ test('其它视觉尚无真实通用截图采集，任意产物字符串不能�
     entry.artifact = artifact
     assert.equal(statusOf(flow), 'uncovered', '任意产物名称不得充当真实采集和视觉验证')
   }
-  entry.evidence = ''
+  entry.summary = ''
   assert.equal(statusOf(flow), 'uncovered')
 })
 
@@ -661,7 +676,7 @@ const excludedFlow = (overrides = {}) => {
   flow.test = report([{
     ac: 'AC-1', status: 'excluded', method: 'unit',
     excludeReason: '本机没有 Playwright 浏览器',
-    evidence: '探测 npx playwright test 失败：Executable doesn\'t exist',
+    summary: '探测 npx playwright test 失败：Executable doesn\'t exist',
     probe: { command: 'npx playwright test', exitCode: 1, failure: 'Error: browserType.launch: Executable doesn\'t exist at ...' },
     version: snapshot.id, ...overrides,
   }])
@@ -679,7 +694,7 @@ test('环境受限不是写句理由就免检：探测命令、退出码、失�
     [{ probe: { command: 'npx playwright test', exitCode: 0, failure: 'x' } }, /退出码无效/],
     [{ probe: { command: 'npx playwright test', exitCode: 1, failure: '' } }, /缺少失败原文/],
     [{ method: 'manual' }, /方法与验收标准声明不匹配/],
-    [{ evidence: '' }, /缺少非空说明/],
+    [{ summary: '' }, /缺少非空说明/],
     [{ excludeReason: '' }, /没写明原因/],
   ]
   for (const [override, pattern] of cases) {
@@ -690,7 +705,7 @@ test('环境受限不是写句理由就免检：探测命令、退出码、失�
   // 评审阶段不能替测试阶段宣布「环境测不了」：那等于用一句理由把 S4 的门槛挪走。
   const reviewOnly = flowOf()
   reviewOnly.scope.data.in_scope.commands = ['npx playwright test']
-  reviewOnly.review = report([{ ac: 'AC-1', status: 'excluded', method: 'unit', excludeReason: '没有浏览器', evidence: '探测失败', probe: { command: 'npx playwright test', exitCode: 1, failure: 'ENOENT' }, version: snapshot.id }])
+  reviewOnly.review = report([{ ac: 'AC-1', status: 'excluded', method: 'unit', excludeReason: '没有浏览器', summary: '探测失败', probe: { command: 'npx playwright test', exitCode: 1, failure: 'ENOENT' }, version: snapshot.id }])
   assert.match(acceptanceLedger(reviewOnly, snapshot).items[0].reason, /评审阶段不能把验收标准标记为环境受限/)
 })
 test('任务 ID 不代表完成，开发提交与流程取消也不能变成执行成功', () => {

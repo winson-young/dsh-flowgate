@@ -4481,17 +4481,17 @@ await check('延迟保存禁用控件时原生summary仍参与Tab与Shift+Tab首
 
 function acceptanceOf(statuses) {
   const items = statuses.map((status, index) => ({ id: 'AC-' + (index + 1), when: '输入 ' + index, then: '输出 ' + index,
-    method: '独立浏览器测量', procedure: '选择目标并比较边界', status, evidence: '测量记录 ' + index, artifact: 'layout-' + index + '.json', version: 'v1', reason: status === 'uncovered' ? '缺少真实浏览器' : '' }))
+    method: '独立浏览器测量', procedure: '选择目标并比较边界', status, summary: '测量记录 ' + index, citations: [{ file: 'src/ui.js', line: 12 + index, anchor: 'assert.equal(view, ' + index + ')' }], command: 'node test/ui.test.mjs', exitCode: 0, artifact: 'layout-' + index + '.json', version: 'v1', reason: status === 'uncovered' ? '缺少真实浏览器' : '' }))
   const counts = { total: items.length, pending: 0, pass: 0, fail: 0, uncovered: 0 }
   for (const item of items) counts[item.status] += 1
   return { version: 'v1', items, counts }
 }
 
-await check('验收表展示方法步骤、逐项状态、证据与产物', async () => {
+await check('验收表展示方法步骤、逐项状态、引用与产物', async () => {
   currentView = baseView('S4', { acceptance: acceptanceOf(['pass', 'fail', 'uncovered', 'pending']) })
   const tree = (await render(FlowDetail, {})).toJSON()
   assert.equal(findTags(tree, 'table').length, 1)
-  for (const text of ['独立浏览器测量', '选择目标并比较边界', '测量记录 0', 'layout-0.json', '未通过', '未覆盖', '待验证', '缺少真实浏览器']) assert.ok(flat(tree).includes(text), text)
+  for (const text of ['独立浏览器测量', '选择目标并比较边界', '测量记录 0', 'src/ui.js:12', 'assert.equal(view, 0)', '命令：node test/ui.test.mjs · 退出码 0', 'layout-0.json', '未通过', '未覆盖', '待验证', '缺少真实浏览器']) assert.ok(flat(tree).includes(text), text)
 })
 
 await check('scope展示冻结的验证方法和步骤', async () => {
