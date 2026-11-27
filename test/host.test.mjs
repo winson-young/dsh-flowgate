@@ -5611,4 +5611,91 @@ async function keepAlive(promise) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// G19：数据超限时必须整份拒绝或如实记账，不能截断后当成完整数据参与判定。
+// ---------------------------------------------------------------------------
+
+// 情况一：报告条数超限。先截断再统计，会把排在上限之后的 fail 从账本里抹掉——
+// 一次大报告里 3 条 fail 排在 200 条之后，门禁就判「0 失败」直接放行。
+{
+  const fx = await provenanceFixture('g19-report-limits')
+  try {
+    assert.equal((await fx.act('setGateMode', { mode: 'manual' })).status, 200)
+    await fx.round('flowgate_review', { angles: fx.angles }, { decision: 'pass' })
+
+    const manyDirections = Array.from({ length: 41 }, (_, index) => ({
+      id: 'd' + index,
+      name: '方向' + index,
+      points: [{ point: '第 ' + (index + 1) + ' 个方向', result: 'pass' }],
+    }))
+    const manyPoints = [{
+      id: 'd0',
+      name: '宽方向',
+      points: Array.from({ length: 201 }, (_, index) => ({ point: '要点 ' + index, result: index === 200 ? 'fail' : 'pass' })),
+    }]
+    await checkAsync('G19 方向超过 40 条时整份拒绝，不截断后统计', async () => {
+      await assert.rejects(fx.px.tool('flowgate_test', { directions: manyDirections }), /超过条数上限/)
+    })
+    await checkAsync('G19 单方向要点超过 200 条时整份拒绝，不截断后统计', async () => {
+      await assert.rejects(fx.px.tool('flowgate_test', { directions: manyPoints }), /上限 200 条/)
+    })
+
+    // 边界内一条不少：第 40 个方向的失败必须被数进 failed，而不是被 slice 掉。
+    const atLimit = Array.from({ length: 40 }, (_, index) => ({
+      id: 'd' + index,
+      name: '方向' + index,
+      points: [{ point: '第 ' + (index + 1) + ' 个方向', result: index === 39 ? 'fail' : 'pass' }],
+    }))
+    const pending = fx.px.tool('flowgate_test', { directions: atLimit })
+    await tick()
+    const submitted = await fx.state()
+    check('G19 恰好 40 个方向时全部计入，最后一个方向的失败不会被丢掉', () => {
+      assert.equal(submitted.test.directions.length, 40)
+      assert.equal(submitted.test.failed, 1)
+    })
+    assert.equal((await fx.act('gate', { decision: 'back', to: 'S2' })).status, 200)
+    await pending
+    await fx.px.tool('flowgate_cancel', {})
+  } finally {
+    rmSync(fx.ws, { recursive: true, force: true })
+  }
+}
+
+// 情况二：快照超过 8 MiB。写入侧照写，读取侧原先静默跳过——重启后流程凭空消失，
+// 数据其实还在盘上，界面却显示成「没启动过流程」。现在跳过必须记账并念出来。
+{
+  const ws = mkdtempSync(join(tmpdir(), 'flowgate-g19-snapshot-'))
+  const sid = 'g19-snapshot'
+  try {
+    const first = makeHost(ws, sid)
+    const started = await first.tool('flowgate_start', { title: '快照超限' })
+    const file = join(ws, '.dsh-flowgate', 'flows', started.flowId + '.json')
+    const raw = JSON.parse(readFileSync(file, 'utf8'))
+    // 合法快照，只是太大：内容没问题，问题在读取侧会把它当成不存在。
+    raw.padding = 'x'.repeat(9 * 1024 * 1024)
+    writeFileSync(file, JSON.stringify(raw))
+
+    const restored = makeHost(ws, sid)
+    const cold = (await restored.request('/api/flowgate/state?sessionId=' + sid)).body
+    check('G19 超过 8 MiB 的快照没载入时必须明说，不能当成「没启动过流程」', () => {
+      assert.equal(cold.active, false)
+      assert.equal(cold.loadProblems.length, 1)
+      assert.equal(cold.loadProblems[0].file, started.flowId + '.json')
+      assert.equal(cold.loadProblems[0].reason, 'oversize')
+      assert.match(cold.loadProblems[0].message, /超过快照上限/)
+    })
+    const status = await restored.tool('flowgate_status', {})
+    check('G19 flowgate_status 也要念出没载入的快照，并说明数据还在盘上', () => {
+      assert.equal(status.loadProblems.length, 1)
+      assert.match(status.summary, /没有载入/)
+      assert.match(status.summary, /数据还在盘上/)
+    })
+    check('G19 宿主不会因为快照超限就删掉用户数据', () => {
+      assert.equal(existsSync(file), true)
+    })
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+}
+
 console.log('\n全部通过：' + passed.length + ' 项')

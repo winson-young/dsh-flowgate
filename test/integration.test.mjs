@@ -957,6 +957,77 @@ await check('布局采集回执绑定内容、页面实例和视口，视口变�
   assert.equal((await page()).acceptanceDecision.status, 'passed')
 })
 
+// G19 情况三：回执按时间滚动淘汰时，第 21 张采集之后第一张悄悄失效，
+// 下一轮核算把一条已经通过的视觉验收倒退回 uncovered，而且没有任何地方说明原因。
+// 规则改成「引用保护」：还挂在验收记录上的回执一条都不丢，只有没人引用的旧回执才让位。
+await check('视觉回执按引用保护：采集超过上限也不让已通过的验收倒退回未覆盖', async () => {
+  const S = 'sess-layout-retention'
+  await call('flowgate_start', { title: '回执保留策略', preset: 'fast' }, S)
+  const doc = within(call('flowgate_doc', {
+    html: '<html><body>回执保留策略</body></html>',
+    scope: {
+      files_expected_to_change: ['proof.txt'], commands: [], capabilities: [], out_of_scope_explicitly: [],
+      acceptance_criteria: [{ id: 'AC-1', when: '显示样例行', then: '与参照左右对齐',
+        verification: { method: 'visual', procedure: '从已核对页面采集实际左右边界' } }],
+    },
+  }, S), '回执保留文档')
+  await tick()
+  assert.equal((await post({ sessionId: S, action: 'doc', payload: { decision: 'approve' } })).status, 200)
+  await doc
+  const dev = within(call('flowgate_gate', {}, S), '回执保留开发门禁')
+  await tick()
+  assert.equal((await post({ sessionId: S, action: 'gate', payload: { decision: 'pass' } })).status, 200)
+  await dev
+  const review = within(call('flowgate_review', { angles: [{ id: 'correctness', name: '正确性', verdict: 'pass', findings: [] }] }, S), '回执保留评审')
+  await tick()
+  assert.equal((await post({ sessionId: S, action: 'gate', payload: { decision: 'pass' } })).status, 200)
+  await review
+
+  const digest = clientFactoryRevision(readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8'))
+  const pageId = 'c1f0f5e2-6a3d-4a5f-9d0e-2f5a1b7c9d31'
+  const page = async () => (await stateRoute.fetch({ url: 'http://host/api/flowgate/state?sessionId=' + S + '&clientRevision=' + digest + '&pageId=' + pageId + '&viewportWidth=1280&viewportHeight=800' })).json()
+  const view = await page()
+  assert.equal(view.runtime.status, 'verified')
+  const viewport = { width: 1280, height: 800 }
+  const measurements = [{ element: '.fixture-row', reference: 'fixture-reference', left: 10, right: 400, referenceLeft: 10, referenceRight: 400 }]
+  const capture = () => post({ sessionId: S, action: 'layout-evidence', payload: { version: view.snapshot.id, pageId, clientRevision: digest, viewport, measurements } })
+
+  const first = await capture()
+  assert.equal(first.status, 200, JSON.stringify(first.data))
+  const pinned = first.data.layoutEvidence.id
+
+  // 先把第一张回执挂进验收记录，再开始海量采集——这正是滚动淘汰会出事的地方。
+  // 门禁会挂起等用户点按钮，这里不 await（await 会一直等到超时），先拿住 promise。
+  const test = call('flowgate_test', {
+    directions: [{ id: 'smoke', name: '回执保留', points: [{ point: '视觉验收先通过', result: 'pass' }] }],
+    acceptance: [{ ac: 'AC-1', status: 'pass', method: 'visual', version: view.snapshot.id,
+      evidence: '夹具核验了首张回执与当前页面实例一致。', evidenceId: pinned,
+      runtime: { hostRevision: view.runtime.hostRevision, clientRevision: digest, pageId, viewport }, measurements }],
+  }, S)
+  await tick()
+  assert.equal((await page()).acceptance.counts.pass, 1)
+
+  let last = null
+  for (let index = 0; index < 200; index += 1) {
+    last = await capture()
+    assert.equal(last.status, 200, JSON.stringify(last.data))
+  }
+  assert.equal(last.data.layoutEvidenceKept, 200, '保留总数必须停在上限，不能无限增长')
+  assert.equal(last.data.layoutEvidenceLimit, 200)
+  assert.ok(last.data.layoutEvidenceEvicted.length >= 1, '淘汰发生了就必须报出来，不能悄悄少一条')
+  assert.equal(last.data.layoutEvidenceEvicted.includes(pinned), false, '还挂在验收记录上的回执不能被淘汰')
+
+  const after = await page()
+  assert.equal(after.acceptance.counts.pass, 1, '采集更多回执不能让已通过的视觉验收倒退回未覆盖')
+  assert.equal(after.runtime.layoutEvidence.some((item) => item.id === pinned), true)
+  assert.ok(after.runtime.layoutEvidence.length <= 200)
+
+  // 证据还在，S4 门禁就照常放行；收尾把挂起的调用接回来，别让它悬着。
+  assert.equal((await post({ sessionId: S, action: 'gate', payload: { decision: 'pass' } })).status, 200)
+  await test
+  assert.equal((await page()).acceptanceDecision.status, 'passed')
+})
+
 await check('flowgate_review_run 为每个角度 spawn 只读子代理并带上开发规则', async () => {
   const S = 'sess-rev'
   await call('flowgate_start', { title: '子代理评审', preset: 'fast' }, S)

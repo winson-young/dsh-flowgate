@@ -278,6 +278,89 @@ function invariantSelfTest() {
   return 0
 }
 
+// 静默截断规则。
+//
+// 背景（G19）：报告曾经是「先截断再统计」——把方向截到 40 个、要点截到 200 条，
+// 然后用截断后的数组去数 fail。排在后面的失败根本没被数过，门禁于是显示 0 失败并放行。
+// 那条 bug 不会抛错、不会留日志，只会让结论建立在残缺数据上，所以必须由静态规则守着。
+//
+// 这条规则刻意做得窄：只盯「规范化提交」这三个函数体，以及历史滚动淘汰的写法。
+// 全仓扫描 .slice( 会淹死在字符串截断与分页里，那种规则只会被加白名单绕过。
+const NORMALIZER_NAMES = ['normalizeSubmittedDirections', 'normalizeSubmittedAngles', 'normalizeAcceptance']
+
+/** 取一个具名函数的大括号体；注释与字符串里的括号不在这些函数体里出现，按配对切即可。 */
+function functionBody(source, name) {
+  const marker = 'function ' + name + '('
+  const start = source.indexOf(marker)
+  if (start < 0) return null
+  const open = source.indexOf('{', start)
+  if (open < 0) return null
+  let depth = 0
+  for (let index = open; index < source.length; index += 1) {
+    if (source[index] === '{') depth += 1
+    else if (source[index] === '}') {
+      depth -= 1
+      if (depth === 0) return { body: source.slice(open, index + 1), offset: open }
+    }
+  }
+  return null
+}
+
+function scanSilentTruncation(source, file = '') {
+  const violations = []
+  const push = (offset, reason) => {
+    const line = source.slice(0, Math.max(0, offset)).split('\n').length
+    violations.push({ file, line, reason })
+  }
+  // 只有宿主主体才该定义这三个函数；别的模块不该被要求有它们。
+  const ownsNormalizers = !file || /index\.js$/.test(file)
+  if (ownsNormalizers) {
+    for (const name of NORMALIZER_NAMES) {
+      const found = functionBody(source, name)
+      if (!found) {
+        push(0, '找不到 ' + name + '：它守着「规范化提交不许丢数据」，改名时必须同步改这条规则')
+        continue
+      }
+      const index = found.body.indexOf('.slice(')
+      if (index >= 0) {
+        push(found.offset + index, name + ' 里出现 .slice(：规范化阶段替提交方丢数据，判定会建立在残缺输入上；超限应当抛错拒绝')
+      }
+    }
+  }
+  const rolling = source.indexOf('.slice(-19)')
+  if (rolling >= 0) push(rolling, '出现 .slice(-19)：按时间滚动淘汰证据，会让已经通过的验收倒退回「没有证据」')
+  return violations
+}
+
+const TRUNCATION_SELF_TESTS = (() => {
+  const empty = NORMALIZER_NAMES.map((name) => 'function ' + name + '(a, b) {\n  return a\n}\n').join('')
+  const withSlice = empty.replace(
+    'function normalizeAcceptance(a, b) {\n  return a\n}',
+    'function normalizeAcceptance(a, b) {\n  return a.slice(0, 160)\n}',
+  )
+  return [
+    ['规范化函数不截断时放行', empty, 0],
+    ['规范化函数里截断被判违规', withSlice, 1],
+    ['滚动淘汰被判违规', empty + 'flow.layoutEvidence = [...(flow.layoutEvidence ?? []).slice(-19), receipt]', 1],
+    ['三个函数都缺失时逐个报出', 'const a = 1', 3],
+  ]
+})()
+
+function truncationSelfTest() {
+  const failures = []
+  for (const [name, source, expected] of TRUNCATION_SELF_TESTS) {
+    const found = scanSilentTruncation(source, 'index.js').length
+    if (found !== expected) failures.push(name + '：期望 ' + expected + ' 处，实际 ' + found + ' 处')
+  }
+  if (failures.length) {
+    for (const failure of failures) console.error('  FAIL ' + failure)
+    console.error('静默截断自检失败：' + failures.length + ' / ' + TRUNCATION_SELF_TESTS.length)
+    return 1
+  }
+  console.log('静默截断自检通过：' + TRUNCATION_SELF_TESTS.length + ' 个用例')
+  return 0
+}
+
 const INVARIANT_DIR = 'lib'
 
 function collectJs(dir, out = []) {
@@ -367,13 +450,15 @@ function main(argv) {
       return 2
     }
   }
-  if (runSelfTest) return selfTest() || invariantSelfTest()
+  if (runSelfTest) return selfTest() || invariantSelfTest() || truncationSelfTest()
   // 默认先自检再扫描：一条命令同时证明「判定本身在判定」与「仓库没有违约」，
   // 聚合器和 npm run check 才能共用同一个入口。
   const selfStatus = selfTest()
   if (selfStatus) return selfStatus
   const invariantStatus = invariantSelfTest()
   if (invariantStatus) return invariantStatus
+  const truncationStatus = truncationSelfTest()
+  if (truncationStatus) return truncationStatus
 
   const files = targetFiles(root)
   if (!files.length) {
@@ -407,6 +492,15 @@ function main(argv) {
       console.error('  FAIL ' + violation.file + ':' + violation.line + ' ' + violation.reason)
     }
     console.error('frozen 不变量被破坏：' + invariantViolations.length + ' 处（扫描 ' + invariantFiles.length + ' 个文件）')
+    return 1
+  }
+  const truncationViolations = []
+  for (const file of invariantFiles) truncationViolations.push(...scanSilentTruncation(readFileSync(file, 'utf8'), file))
+  if (truncationViolations.length) {
+    for (const violation of truncationViolations) {
+      console.error('  FAIL ' + violation.file + ':' + violation.line + ' ' + violation.reason)
+    }
+    console.error('静默截断被引入：' + truncationViolations.length + ' 处（扫描 ' + invariantFiles.length + ' 个文件）')
     return 1
   }
   console.log('check contracts verified (' + calls + ' calls in ' + files.length + ' files).')
