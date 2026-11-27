@@ -27,4 +27,13 @@ const child = spawnSync(process.execPath, ['--test', '--test-reporter=tap', ...i
   timeout: 300_000,
   killSignal: 'SIGKILL',
 })
-process.exitCode = typeof child.status === 'number' ? child.status : 1
+if (child.error && ['EPERM', 'EACCES'].includes(child.error.code)) {
+  // 进程根本没起来，不是测试失败：显式记 SKIP，退出 0，由聚合器汇总成 SKIP。
+  // 边界只限「起不来」：真跑过但失败的 child.status 仍按原样传出去。
+  console.log('FLOWGATE_TEST_SKIP ' + JSON.stringify({
+    reason: '宿主禁止子进程，本套未执行（' + child.error.code + '）',
+  }))
+  process.exitCode = 0
+} else {
+  process.exitCode = typeof child.status === 'number' ? child.status : 1
+}

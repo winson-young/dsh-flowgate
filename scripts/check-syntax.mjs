@@ -59,8 +59,12 @@ files.sort()
 // 退化为进程内解析：结论弱一些（只解析、不判 ESM 语义），但不静默跳过，并把降级写在输出里。
 // 一旦确认起不了子进程就不再逐文件重试：沙箱是进程级限制，重试只会多出 N 次必然失败的 spawn。
 let degraded = false
+let degradedFiles = 0
 function checkWithChild(file) {
-  if (degraded) return checkInProcess(file)
+  if (degraded) {
+    degradedFiles += 1
+    return checkInProcess(file)
+  }
   // 捕获走 captureSync：受限沙箱拒绝管道 stdio（EPERM），文件描述符不拒绝。
   // 用 execFileSync(..., { stdio: 'pipe' }) 的话，沙箱里每一套都会降级成进程内解析。
   const result = captureSync(process.execPath, ['--check', file], { windowsHide: true, timeout: 60000 })
@@ -68,6 +72,7 @@ function checkWithChild(file) {
     const code = result.error.code
     if (code === 'EPERM' || code === 'EACCES' || code === 'ENOENT') {
       degraded = true
+      degradedFiles += 1
       return checkInProcess(file)
     }
     return String(result.error.message || result.error)
@@ -105,6 +110,6 @@ if (failed) {
   console.error('Syntax check failed in ' + failed + '/' + files.length + ' files.')
   process.exitCode = 1
 } else {
-  const note = degraded ? '（宿主禁止子进程，已退化为进程内解析）' : ''
+  const note = degraded ? '（' + degradedFiles + ' 个文件因宿主禁止子进程改为进程内解析：只解析，不判 ESM 语义）' : ''
   console.log('Syntax verified (' + files.length + ' files)' + note + '.')
 }

@@ -121,6 +121,7 @@ if (skipTest) {
   console.log('\n[2/4] 自测 npm test')
   console.log('  说明：自测会运行故意制造失败的元测试，输出里的 Stale / Usage 字样属预期；')
   console.log('        本次自测的结论只看下面的「=== 测试汇总 ===」与退出码。')
+  console.log('        若汇总里出现 SKIP，表示该方向未在当前环境执行、不计失败；发版前请在可信环境补跑一次。')
   try {
     run('npm', ['test'], { stdio: 'inherit' })
   } catch {

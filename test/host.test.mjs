@@ -5209,47 +5209,12 @@ for (const listedCommands of [[], ['node --check lib/index.js']]) {
   } finally { rmSync(ws, { recursive: true, force: true }) }
 }
 
-// 这组命令确实可以写盘：只用字符串断言不能证明 --check 是纯解析。
+// 真实 --check 会不会写盘，由 test/spawn.test.mjs 起真进程证明：那一套在受限环境里
+// 显式记 SKIP（FLOWGATE_TEST_SKIP），主套件不再依赖能否派生进程。
+// 这里只钉守卫对 parse 尾参与 preload 的字符串判定。
 {
   const ws = mkdtempSync(join(tmpdir(), 'flowgate-node-check-'))
-  const marker = join(ws, 'preload-wrote.txt')
-  const bodyMarker = join(ws, 'body-wrote.txt')
-  const preload = join(ws, 'preload.cjs')
-  const source = join(ws, '语法 检查.cjs')
   try {
-    writeFileSync(preload, 'require("node:fs").writeFileSync(' + JSON.stringify(marker) + ', "preload")\n')
-    writeFileSync(source, 'require("node:fs").writeFileSync(' + JSON.stringify(bodyMarker) + ', "body")\n')
-    // 捕获走 captureSync：受限沙箱拒绝管道 stdio，文件描述符不拒绝。
-    // 真起不来进程时跳过并留痕，免得整套测试被环境问题吞掉、连后面真正的用例一起跑不到。
-    const nodeCheck = (args) => {
-      const result = captureSync(process.execPath, ['--check', ...args], {
-        cwd: ws,
-        env: { ...process.env, NODE_OPTIONS: '' },
-      })
-      if (result.error) throw result.error
-      if (result.status !== 0) throw new Error('node --check 失败：' + result.stderr)
-      return result
-    }
-    let spawnable = true
-    try {
-      nodeCheck([source])
-    } catch (error) {
-      if (error?.code !== 'EPERM') throw error
-      spawnable = false
-      console.log('  跳过 真实 Node --check 真进程验证：当前环境禁止 spawn 子进程（EPERM）')
-    }
-    if (spawnable) {
-      check('真实 Node --check 单文件只解析，不执行正文', () => {
-        assert.equal(existsSync(bodyMarker), false)
-        assert.equal(existsSync(marker), false)
-      })
-      nodeCheck(['--require', preload, source])
-      check('真实 Node --check --require 仍执行 preload 并写盘', () => {
-        assert.equal(readFileSync(marker, 'utf8'), 'preload')
-        assert.equal(existsSync(bodyMarker), false)
-      })
-    }
-    rmSync(marker, { force: true })
     const cx = makeHost(ws, 'node-check-probe')
     await cx.tool('flowgate_start', { title: 'Node parse preload 边界' })
     const flow = currentService().get('node-check-probe')
@@ -5270,7 +5235,6 @@ for (const listedCommands of [[], ['node --check lib/index.js']]) {
       flow.stage = stage
       for (const command of safe) assert.equal((await cx.guard('ops_bash', { command })).kind, 'allow', stage + ': ' + command)
       for (const command of unsafe) assert.equal((await cx.guard('ops_bash', { command })).kind, 'deny', stage + ': ' + command)
-      check(stage + ' 实际宿主守卫拒绝 parse 尾参与 preload，纯解析保持可用', () => assert.equal(existsSync(marker), false))
     }
     await cx.tool('flowgate_cancel', {})
   } finally { rmSync(ws, { recursive: true, force: true }) }

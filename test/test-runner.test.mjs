@@ -265,7 +265,7 @@ test('默认链路把元测试自己接在最后，并复用同一份 TAP 完成
   assert.equal(runner.completion, suiteFor('provenance').completion)
   assert.equal(suites[0].name, 'revisions')
   assert.equal(suites[suites.length - 1].name, 'runner')
-  assert.equal(suites.length, 13 + (existsSync(join(root, 'test/publish.test.mjs')) ? 1 : 0))
+  assert.equal(suites.length, 14 + (existsSync(join(root, 'test/publish.test.mjs')) ? 1 : 0))
 })
 
 test('接上输出通道时子进程输出不进汇总通道', (t) => {

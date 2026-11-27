@@ -8,6 +8,16 @@ const { scripts } = JSON.parse(readFileSync(new URL('../package.json', import.me
 const tap = /^# tests ([1-9]\d*)\s*$/m
 const completed = /^全部通过：([1-9]\d*) 项\s*$/m
 
+// 工作副本里没有的测试文件不接入，但要记账：汇总前单列出来，免得「少跑了一套」
+// 在输出里表现为「那一行根本不存在」。打印位置必须在「=== 测试汇总 ===」之前——
+// test/test-runner.test.mjs 对汇总末尾做逐行比对，追加在汇总之后会打红它。
+const notWired = []
+const conditional = (file, entry) => {
+  if (existsSync(root + file)) return [entry]
+  notWired.push(entry[0])
+  return []
+}
+
 const testSuites = [
   ['provenance', 'test:provenance', tap],
   ['acceptance', 'test:acceptance', tap],
@@ -23,13 +33,15 @@ const testSuites = [
   ['layout', 'test:layout', /"checks": 25\s*}/m],
   // check 契约扫描器：它守的是「用例名后面真的有断言」。同样按存在与否接入——
   // 隔离夹具只复制 scripts/ 与 lib/，没有 test/ 目录，硬接会让夹具汇总多出一套 NOT_RUN。
-  ...(existsSync(root + 'test/host.test.mjs') ? [['checks', 'test:checks', /^check contracts verified \([1-9]\d* calls in [1-9]\d* files\)\.$/m]] : []),
+  ...conditional('test/host.test.mjs', ['checks', 'test:checks', /^check contracts verified \([1-9]\d* calls in [1-9]\d* files\)\.$/m]),
+  // 真实 spawn 探针单独一套：受限环境跑不了时它自己报 SKIP，不会连累 host 整套。
+  ...conditional('test/spawn.test.mjs', ['spawn', 'test:spawn', /^(?:全部通过：[1-9]\d* 项|未执行：宿主禁止 spawn 子进程（[A-Z]+）)\s*$/m]),
   // 发布脚本与聚合器元测试的用例接在这里。但只有工作副本里真有那个测试文件时才接：
   // test/test-runner.test.mjs 的 fixture 只复制 scripts/ 与 lib/，不复制 test/，
   // 按存在与否决定接入，才不会把那个 fixture 的汇总行数与顺序打乱。
   // 元测试自己也在其中：聚合器的判定与清单从此有回归保护，改坏了默认链路直接红。
-  ...(existsSync(root + 'test/publish.test.mjs') ? [['publish', 'test:publish', tap]] : []),
-  ...(existsSync(root + 'test/test-runner.test.mjs') ? [['runner', 'test:runner', tap]] : []),
+  ...conditional('test/publish.test.mjs', ['publish', 'test:publish', tap]),
+  ...conditional('test/test-runner.test.mjs', ['runner', 'test:runner', tap]),
 ].map(([name, script, completion]) => ({ name, script, command: scripts[script], completion }))
 
 export const suites = [
@@ -102,6 +114,7 @@ export function runSuites(entries = suites, options = {}) {
     console.log(`\n=== ${suite.name} ===`)
     results.push({ name: suite.name, ...resultFor(suite, options) })
   }
+  if (notWired.length) console.log('本环境未接入：' + notWired.join('、') + '（对应测试文件不存在）')
   console.log('\n=== 测试汇总 ===')
   for (const { name, status, reason } of results) {
     console.log(`${name}=${status}${reason ? ' (' + reason.replace(/[\r\n]+/g, ' ') + ')' : ''}`)
