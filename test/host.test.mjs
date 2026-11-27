@@ -332,7 +332,9 @@ const askPending = runTool('flowgate_ask', {
   ],
 })
 await tick()
-const answered = await postAction('answer', { choiceIndex: 0 })
+// 答案要带题号：宿主据此确认「这是当前这一问的回答」，而不是屏幕上恰好显示的那张卡。
+const questionId = (await getState()).body.grill.pending.id
+const answered = await postAction('answer', { questionId, choiceIndex: 0 })
 check('AC-5 点选推荐选项即完成回答', () => assert.equal(answered.status, 200))
 const askResult = await askPending
 check('AC-5 追问返回 answered=true 且 choice 为选项文案', () => {
@@ -349,11 +351,90 @@ const askPending2 = runTool('flowgate_ask', {
   ],
 })
 await tick()
-const badCustom = await postAction('answer', { choiceIndex: -1, customText: '   ' })
+const questionId2 = (await getState()).body.grill.pending.id
+const badCustom = await postAction('answer', { questionId: questionId2, choiceIndex: -1, customText: '   ' })
 check('自定义内容为空时被拒', () => assert.equal(badCustom.status, 409))
-const customAnswer = await postAction('answer', { choiceIndex: -1, customText: '带 reauthenticate_url 且附 expires_at' })
+const customAnswer = await postAction('answer', { questionId: questionId2, choiceIndex: -1, customText: '带 reauthenticate_url 且附 expires_at' })
 check('自定义文本可提交', () => assert.equal(customAnswer.status, 200))
 await askPending2
+
+// G08：答案必须自带题号。缺题号、题号对不上、下标越界、选项与自定义并存，四种都拒——
+// 否则旧卡片的答案会落到新问题上，或者记下一条「已答，但答案是空」。
+{
+  const askG08 = runTool('flowgate_ask', {
+    question: '过期之后还允许续期吗？',
+    options: [
+      { label: '允许续期', tradeoff: '体验连贯，需要额外的续期接口' },
+      { label: '不允许', tradeoff: '更安全，用户要重新登录' },
+    ],
+  })
+  await tick()
+  const before = (await getState()).body
+  const currentQuestionId = before.grill.pending.id
+  const answeredBefore = before.grill.answeredCount
+
+  const missing = await postAction('answer', { choiceIndex: 0 })
+  check('G08 缺少 questionId 的答案被拒', () => {
+    assert.equal(missing.status, 409)
+    assert.match(missing.body.error, /questionId/)
+  })
+
+  const stale = await postAction('answer', { questionId: 'q_stale001', choiceIndex: 0 })
+  const afterStale = (await getState()).body
+  check('G08 题号对不上时被拒：旧卡片的答案不会落到新问题上', () => {
+    assert.equal(stale.status, 409)
+    assert.match(stale.body.error, /已经换掉了/)
+    assert.equal(afterStale.grill.pending.id, currentQuestionId, '被拒的答案不能动当前卡片')
+    assert.equal(afterStale.grill.answeredCount, answeredBefore, '被拒的答案不能写进追问记录')
+  })
+
+  const outOfRange = await postAction('answer', { questionId: currentQuestionId, choiceIndex: 5 })
+  check('G08 选项下标越界被拒，不会记成「已答但答案是空」', () => {
+    assert.equal(outOfRange.status, 409)
+    assert.match(outOfRange.body.error, /超出范围/)
+  })
+
+  const both = await postAction('answer', { questionId: currentQuestionId, choiceIndex: 0, customText: '再补一句' })
+  check('G08 选了选项又填自定义内容被拒：记录里不能同时出现两种答案', () => {
+    assert.equal(both.status, 409)
+    assert.match(both.body.error, /不能再填自定义内容/)
+  })
+
+  const ok = await postAction('answer', { questionId: currentQuestionId, choiceIndex: 1 })
+  check('G08 题号匹配时答案正常落盘，choice 取对应选项文案', () => {
+    assert.equal(ok.status, 200, JSON.stringify(ok.body))
+    assert.equal(ok.body.grill.answeredCount, answeredBefore + 1)
+    assert.equal(ok.body.grill.pending, null)
+    const recorded = currentService().get(sessionId).grill.answered.at(-1)
+    assert.equal(recorded.choice, '不允许')
+    assert.equal(recorded.questionId, currentQuestionId)
+  })
+  const outcome = await askG08
+  check('G08 等待器按题号唤醒：工具拿到的是这一问的答案', () => {
+    assert.equal(outcome.answered, true)
+    assert.equal(outcome.choice, '不允许')
+  })
+
+  // allowCustom=false 时 -1 通道必须关上：否则「不接受自定义」只是一句界面约定。
+  const askNoCustom = runTool('flowgate_ask', {
+    question: '要不要补一个迁移脚本？',
+    options: [
+      { label: '要', tradeoff: '数据保持一致' },
+      { label: '不要', tradeoff: '少一步操作' },
+    ],
+    allowCustom: false,
+  })
+  await tick()
+  const noCustomId = (await getState()).body.grill.pending.id
+  const rejectedCustom = await postAction('answer', { questionId: noCustomId, choiceIndex: -1, customText: '我自己写一个' })
+  check('G08 题目声明不接受自定义时，-1 被拒', () => {
+    assert.equal(rejectedCustom.status, 409)
+    assert.match(rejectedCustom.body.error, /不接受自定义/)
+  })
+  const picked = await postAction('answer', { questionId: noCustomId, choiceIndex: 0 })
+  check('G08 同一张卡片改点选项仍然可以答', () => assert.equal(picked.status, 200))
+  await askNoCustom
+}
 
 // 追问内容会随快照全量落盘：空问题与超长问题都要在提交前挡住。
 {
@@ -5462,7 +5543,7 @@ async function keepAlive(promise) {
       assert.equal(viewAfterTimeout.grill.pending.id, questionId)
       assert.equal(viewAfterTimeout.grill.awaiting, false)
     })
-    const late = await cx.request('/api/flowgate/action', { sessionId: sid, action: 'answer', payload: { choiceIndex: 1 } })
+    const late = await cx.request('/api/flowgate/action', { sessionId: sid, action: 'answer', payload: { questionId, choiceIndex: 1 } })
     check('G40-10 超时之后点选照样落盘：答案进 grill.answered，卡片收起', () => {
       assert.equal(late.status, 200, JSON.stringify(late.body))
       assert.equal(flow.grill.answered.length, 1)
@@ -5481,12 +5562,61 @@ async function keepAlive(promise) {
       assert.equal(events[0].detail.late, true)
       assert.equal(events[0].detail.questionId, questionId)
     })
-    const again = await cx.request('/api/flowgate/action', { sessionId: sid, action: 'answer', payload: { choiceIndex: 0 } })
+    const again = await cx.request('/api/flowgate/action', { sessionId: sid, action: 'answer', payload: { questionId, choiceIndex: 0 } })
     check('G40-12 同一条追问重复点击被拒，不重复写记录也不重复唤醒', () => {
       assert.equal(again.status, 409)
       assert.match(again.body.error, /已经处理过/)
       assert.equal(flow.grill.answered.length, 1)
       assert.equal(cx.delivered.filter((item) => String(item.message?.content?.[0]?.text ?? '').includes('用户回答了你的追问')).length, 1)
+    })
+  } finally { rmSync(ws, { recursive: true, force: true }) }
+}
+
+// 用例 B2：两问同时挂着时，先结束的调用只能收自己那一份 pending。
+// 没有这条，把收尾改回「无条件 pending = null」，上面的用例仍然全绿，
+// 而用户会看到后发起的那张卡片凭空消失。
+{
+  const ws = g40Workspace('ask-race')
+  const sid = 'g40-ask-race'
+  try {
+    const cx = makeHost(ws, sid)
+    const service = currentService()
+    await cx.tool('flowgate_start', { title: '并发追问', preset: 'fast' })
+    const first = cx.tool('flowgate_ask', {
+      question: '第一问：过期后要不要续期？',
+      options: [{ label: '续期', tradeoff: '体验连贯' }, { label: '不续期', tradeoff: '更安全' }],
+    })
+    await tick()
+    const firstId = service.get(sid).grill.pending.id
+    const second = cx.tool('flowgate_ask', {
+      question: '第二问：续期要不要写审计日志？',
+      options: [{ label: '要写', tradeoff: '可追溯' }, { label: '不写', tradeoff: '少一次写入' }],
+    })
+    await tick()
+    const secondId = service.get(sid).grill.pending.id
+    const firstOutcome = await keepAlive(first)
+    check('G08 并发追问：被取代的旧调用不清掉后发起的新卡片', () => {
+      assert.notEqual(secondId, firstId)
+      assert.equal(firstOutcome.answered, false)
+      assert.equal(firstOutcome.waitReason, 'superseded')
+      assert.equal(service.get(sid).grill.pending.id, secondId, '新卡片必须还在')
+    })
+    const stale = await cx.request('/api/flowgate/action', { sessionId: sid, action: 'answer', payload: { questionId: firstId, choiceIndex: 0 } })
+    check('G08 并发追问：拿旧题号回答被拒，新卡片不受影响', () => {
+      assert.equal(stale.status, 409)
+      assert.match(stale.body.error, /已经换掉了/)
+      assert.equal(service.get(sid).grill.pending.id, secondId)
+      assert.equal(service.get(sid).grill.answered.length, 0)
+    })
+    const fresh = await cx.request('/api/flowgate/action', { sessionId: sid, action: 'answer', payload: { questionId: secondId, choiceIndex: 1 } })
+    check('G08 并发追问：新题号正常作答并收起卡片', () => {
+      assert.equal(fresh.status, 200, JSON.stringify(fresh.body))
+      assert.equal(service.get(sid).grill.pending, null)
+    })
+    const secondOutcome = await keepAlive(second)
+    check('G08 并发追问：新调用拿到的是自己那一问的答案', () => {
+      assert.equal(secondOutcome.answered, true)
+      assert.equal(secondOutcome.choice, '不写')
     })
   } finally { rmSync(ws, { recursive: true, force: true }) }
 }
@@ -5571,6 +5701,29 @@ async function keepAlive(promise) {
       assert.equal(firstOutcome !== delivered, true, '两次等待必须解析成不同的结果对象')
       assert.equal(service.gates.has(sid), false)
     })
+  } finally { rmSync(ws, { recursive: true, force: true }) }
+}
+
+// 用例 D2：等待器带题号，别的题目的答案叫不醒它。
+{
+  const ws = g40Workspace('ask-tag')
+  const sid = 'g40-ask-tag'
+  try {
+    const cx = makeHost(ws, sid)
+    const service = currentService()
+    await cx.tool('flowgate_start', { title: '等待器题号', preset: 'fast' })
+    const waiting = service.gates.wait(sid, 'answer', 60000, null, 'q_aaaa1111')
+    await tick()
+    check('G08 notify 带错题号时不唤醒，等待器仍在', () => {
+      assert.equal(service.gates.notify(sid, { kind: 'answer', choiceIndex: 0 }, 'answer', 'q_bbbb2222'), false)
+      assert.equal(service.gates.has(sid), true)
+    })
+    check('G08 notify 题号匹配时正常唤醒', () => {
+      assert.equal(service.gates.notify(sid, { kind: 'answer', choiceIndex: 1 }, 'answer', 'q_aaaa1111'), true)
+      assert.equal(service.gates.has(sid), false)
+    })
+    const outcome = await keepAlive(waiting)
+    check('G08 被唤醒的等待器拿到的是自己那一问的答案', () => assert.equal(outcome.choiceIndex, 1))
   } finally { rmSync(ws, { recursive: true, force: true }) }
 }
 

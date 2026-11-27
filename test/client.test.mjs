@@ -1505,6 +1505,8 @@ const HubPanelIcon = componentOf('sidebar.panellist')
     await click(buttonByText(tree, '滑动窗口'))
     assert.equal(posted.length, 1)
     assert.equal(posted[0].action, 'answer')
+    // 答案必须自带题号：卡片是轮询刷新的，提交时不带题号就无法证明答的是哪一问。
+    assert.equal(posted[0].payload.questionId, 'q_1')
     assert.equal(posted[0].payload.choiceIndex, 0)
     assert.equal(posted[0].payload.customText, '')
   })
@@ -1557,7 +1559,7 @@ const HubPanelIcon = componentOf('sidebar.panellist')
       assert.equal(await pressKey(customArea(), modifiers), 1)
       assert.equal(posted.length, before + 1)
       assert.equal(posted.at(-1).action, 'answer')
-      assert.deepEqual(posted.at(-1).payload, { choiceIndex: -1, customText: '第一行方案\n第二行说明' })
+      assert.deepEqual(posted.at(-1).payload, { questionId: 'q_1', choiceIndex: -1, customText: '第一行方案\n第二行说明' })
     })
   }
   await check('自定义答案按钮也提交完整多行内容', async () => {
@@ -1565,7 +1567,7 @@ const HubPanelIcon = componentOf('sidebar.panellist')
     await changeValue(customArea(), '按钮提交\n保留换行')
     await click(buttonByText(renderer.toJSON(), '提交答案'))
     assert.equal(posted.length, before + 1)
-    assert.deepEqual(posted.at(-1).payload, { choiceIndex: -1, customText: '按钮提交\n保留换行' })
+    assert.deepEqual(posted.at(-1).payload, { questionId: 'q_1', choiceIndex: -1, customText: '按钮提交\n保留换行' })
   })
   await check('提交未完成时拦截同一轮快捷键与选项的重复提交', async () => {
     const originalFetch = globalThis.fetch
@@ -4920,7 +4922,7 @@ await check('阶段提示：点一下快捷答案只投递一次 answer', async 
   await click(answerButtons(renderer.toJSON())[1])
   assert.equal(posted.length, 1, '一次点击只投递一条请求')
   assert.equal(posted[0].action, 'answer')
-  assert.deepEqual(posted[0].payload, { choiceIndex: 1, customText: '' })
+  assert.deepEqual(posted[0].payload, { questionId: 'q_dock_1', choiceIndex: 1, customText: '' })
 })
 
 await check('阶段提示：自定义答案 Ctrl+Enter 与按钮同源，禁用时不出现入口', async () => {
@@ -4934,7 +4936,7 @@ await check('阶段提示：自定义答案 Ctrl+Enter 与按钮同源，禁用�
   assert.equal(buttonByText(renderer.toJSON(), '提交答案').props.disabled, false)
   assert.equal(await pressKey(input, { ctrlKey: true }), 1, 'Ctrl+Enter 要吞掉默认换行')
   assert.equal(posted.length, 1)
-  assert.deepEqual(posted[0].payload, { choiceIndex: -1, customText: '按我的方案来' })
+  assert.deepEqual(posted[0].payload, { questionId: 'q_dock_1', choiceIndex: -1, customText: '按我的方案来' })
   // allowCustom === false：自定义入口完全不出现。
   const base = grillView()
   currentView = grillView({ grill: { ...base.grill, pending: { ...base.grill.pending, allowCustom: false } } })

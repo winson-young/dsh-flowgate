@@ -377,7 +377,7 @@ await check('追问卡片挂起，用户点选项后工具返回答案', async (
   assert.equal(view.grill.pending.question, '过期后是返回 401 还是静默续期？')
   assert.equal(view.waitingKind, 'answer')
   assert.equal(view.waiting, true)
-  const res = await post({ sessionId: SESSION, action: 'answer', payload: { choiceIndex: 0 } })
+  const res = await post({ sessionId: SESSION, action: 'answer', payload: { questionId: view.grill.pending.id, choiceIndex: 0 } })
   assert.equal(res.status, 200)
   const value = await pending
   assert.equal(value.answered, true)
