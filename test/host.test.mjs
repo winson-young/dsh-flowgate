@@ -1408,10 +1408,11 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
   })
   const review4Result = await review4
   check('D4 回退 S1 后评审工具被中断而不是继续等待', () => {
-    assert.equal(review4Result.decision, 'interrupted')
+    // 升档退回与「退回开发修复」是同一件事：评审工具照常返回 reject，不另造 interrupted。
+    assert.equal(review4Result.decision, 'reject')
     assert.equal(review4Result.next, 'S1')
     // 文案必须跟着实际回退目标走：写死 S2 会让 Agent 误以为要去改代码。
-    assert.match(review4Result.message, /回退到 S1 重做/)
+    assert.match(review4Result.message, /退回到 S1 重做/)
   })
   check('D4 回退 S1 后 scope 解冻，必须重新批准（不自动扩充）', () => {
     assert.equal(up4.body.scope.frozen, false)
@@ -4856,7 +4857,9 @@ for (const severity of ['MAJOR', 'CRITICAL']) {
       })
       if (mixed) {
         const result = await pending
-        assert.equal(result.decision, 'interrupted')
+        // 对 Agent 来说升档退回与「退回开发修复」是同一件事：
+        // 不再单独造一个 interrupted 值，评审工具照常返回 reject。
+        assert.equal(result.decision, 'reject')
         assert.equal(result.next, 'S1')
       }
       await fx.px.tool('flowgate_cancel', {})
@@ -5771,11 +5774,13 @@ async function keepAlive(promise) {
     })
     // 用户点选路径：notify 必须叫醒「现在挂着的那次等待」（second），而不是别的。
     await tick()
-    const notified = service.gates.notify(sid, { kind: 'answer', choiceIndex: 0 }, 'answer')
+    const notified = service.gates.notify(sid, { type: 'decision', decision: 'answer', choiceIndex: 0 }, 'answer')
     const delivered = await keepAlive(second)
     check('G40-19 用户回答只唤醒当前那次等待，被取代的旧调用不会被误唤醒', () => {
-      assert.equal(notified, true, 'notify 必须命中还挂着的等待器')
-      assert.equal(delivered.kind, 'answer')
+      assert.equal(notified, 'delivered', 'notify 必须命中还挂着的等待器')
+      // gates.wait 交出的是投递原值（归一化在 awaitGate 里做），这里直接看投递内容。
+      assert.equal(delivered.decision, 'answer')
+      assert.equal(delivered.choiceIndex, 0)
       assert.equal(firstOutcome !== delivered, true, '两次等待必须解析成不同的结果对象')
       assert.equal(service.gates.has(sid), false)
     })
@@ -5793,11 +5798,18 @@ async function keepAlive(promise) {
     const waiting = service.gates.wait(sid, 'answer', 60000, null, 'q_aaaa1111')
     await tick()
     check('G08 notify 带错题号时不唤醒，等待器仍在', () => {
-      assert.equal(service.gates.notify(sid, { kind: 'answer', choiceIndex: 0 }, 'answer', 'q_bbbb2222'), false)
+      assert.equal(
+        service.gates.notify(sid, { type: 'decision', decision: 'answer', choiceIndex: 0 }, 'answer', 'q_bbbb2222'),
+        'kind-mismatch',
+        '有等待器但题号对不上，必须报冲突而不是假装没人等',
+      )
       assert.equal(service.gates.has(sid), true)
     })
     check('G08 notify 题号匹配时正常唤醒', () => {
-      assert.equal(service.gates.notify(sid, { kind: 'answer', choiceIndex: 1 }, 'answer', 'q_aaaa1111'), true)
+      assert.equal(
+        service.gates.notify(sid, { type: 'decision', decision: 'answer', choiceIndex: 1 }, 'answer', 'q_aaaa1111'),
+        'delivered',
+      )
       assert.equal(service.gates.has(sid), false)
     })
     const outcome = await keepAlive(waiting)
@@ -5840,6 +5852,287 @@ async function keepAlive(promise) {
     if (service) service.gateWaitOverrideMs = null
     rmSync(ws, { recursive: true, force: true })
   }
+}
+
+// ---------------------------------------------------------------------------
+// G04：唤醒结果必须一路传回来——发给了谁、送没送到、醒来看到的是什么。
+// 三种后果各一条：叫错人、把「送不出去」当成「没人要」、醒来读到不认识的值。
+// ---------------------------------------------------------------------------
+{
+  const ws = g40Workspace('wake')
+  const sid = 'g04-wake'
+  try {
+    const cx = makeHost(ws, sid)
+    const service = currentService()
+    await cx.tool('flowgate_start', { title: '唤醒结果', preset: 'fast' })
+    check('G04-1 notify 不说明唤醒哪一种等待器就报错，不再默认「谁在等都行」', () => {
+      assert.throws(
+        () => service.gates.notify(sid, { type: 'signal', signal: 'cancelled' }),
+        /notify 必须显式说明唤醒哪一种等待器/,
+      )
+    })
+    const waiting = service.gates.wait(sid, 'doc', 60000)
+    await tick()
+    check('G04-2 唤醒对象说错时报冲突，等待器保持挂着', () => {
+      assert.equal(service.gates.notify(sid, { type: 'signal', signal: 'scope-reopened' }, 'gate'), 'kind-mismatch')
+      assert.equal(service.gates.kindOf(sid), 'doc', '类型不符不能把文档等待唤醒成门禁结果')
+    })
+    check('G04-3 「送不出去」与「没人等」分开报，调用方才知道该不该本地推进', () => {
+      assert.equal(service.gates.notify(sid, { type: 'signal', signal: 'cancelled' }, 'doc'), 'delivered')
+      assert.equal(service.gates.has(sid), false)
+      assert.equal(service.gates.notify(sid, { type: 'signal', signal: 'cancelled' }, 'doc'), 'no-waiter')
+    })
+    await keepAlive(waiting)
+  } finally { rmSync(ws, { recursive: true, force: true }) }
+}
+
+// 醒来读到不认识的值：必须当场报错，不能落进「其余一律当批准」的兜底。
+// 这条正是原报告情况一的后果：一次看不懂的唤醒变成了一次真的冻结。
+{
+  const ws = g40Workspace('shape')
+  const sid = 'g04-shape'
+  try {
+    const cx = makeHost(ws, sid)
+    const service = currentService()
+    await cx.tool('flowgate_start', { title: '非法唤醒值', preset: 'fast' })
+    const docCall = cx.tool('flowgate_doc', { html: '<p>需求</p>', scope: G40_SCOPE })
+    await tick()
+    assert.equal(service.gates.kindOf(sid), 'doc')
+    // 投递层只管送到，形状由消费端拦：这里投一个没有 type 的旧形状。
+    assert.equal(service.gates.notify(sid, { decision: 'approve' }, 'doc'), 'delivered')
+    await checkAsync('G04-4 唤醒值形状不对时报错，而不是被当成批准冻结 scope', async () => {
+      await assert.rejects(() => keepAlive(docCall), /合法形状只有/)
+      const flow = service.get(sid)
+      assert.equal(flow.stage, 'S1')
+      assert.notEqual(flow.scope?.frozen, true, 'scope 不能被一次看不懂的唤醒冻结')
+    })
+  } finally { rmSync(ws, { recursive: true, force: true }) }
+}
+
+// 补命令把 scope 打回 S1：挂在阶段门禁上的工具必须收到明确指令，
+// 而不是把这条广播当成一次「通过」。
+{
+  const ws = g40Workspace('reopened')
+  const sid = 'g04-reopened'
+  try {
+    const cx = makeHost(ws, sid)
+    const service = currentService()
+    await cx.tool('flowgate_start', { title: '补命令后重开', preset: 'fast' })
+    const docCall = cx.tool('flowgate_doc', { html: '<p>需求</p>', scope: G40_SCOPE })
+    await tick()
+    const approved = await cx.request('/api/flowgate/action', {
+      sessionId: sid, action: 'doc', payload: { decision: 'approve' },
+    })
+    assert.equal(approved.status, 200, JSON.stringify(approved.body))
+    assert.equal((await keepAlive(docCall)).decision, 'approve')
+    const gateCall = cx.tool('flowgate_gate', { summary: '改完了' })
+    await tick()
+    assert.equal(service.gates.kindOf(sid), 'gate')
+    // 清单外的命令被拒 → 进待补队列；用户选择「补进清单」。
+    assert.equal((await cx.guard('bash', { command: 'npm run build' })).kind, 'deny')
+    const supplemented = await cx.request('/api/flowgate/action', {
+      sessionId: sid, action: 'reopenScopeForCommands', payload: { commands: ['npm run build'] },
+    })
+    assert.equal(supplemented.status, 200, JSON.stringify(supplemented.body))
+    const gateResult = await keepAlive(gateCall)
+    check('G04-5 补命令唤醒门禁等待器：返回 reopened 与补进来的命令原文', () => {
+      assert.equal(gateResult.decision, 'reopened')
+      assert.equal(gateResult.next, 'S1')
+      assert.match(gateResult.message, /npm run build/)
+      assert.match(gateResult.message, /退回 S1 重新批准/)
+    })
+    check('G04-6 补命令之后 scope 确实没批准，流程停在 S1', () => {
+      const flow = service.get(sid)
+      assert.equal(flow.stage, 'S1')
+      assert.notEqual(flow.scope?.frozen, true)
+    })
+  } finally { rmSync(ws, { recursive: true, force: true }) }
+}
+
+// 不补：文档等待器收到「命令已决定」后继续原地等，不会把这条信号当成批准。
+{
+  const ws = g40Workspace('declined')
+  const sid = 'g04-declined'
+  try {
+    const cx = makeHost(ws, sid)
+    const service = currentService()
+    await cx.tool('flowgate_start', { title: '不补命令', preset: 'fast' })
+    const docCall = cx.tool('flowgate_doc', { html: '<p>需求</p>', scope: G40_SCOPE })
+    await tick()
+    // 队列直接从内存造一条：这条用例验的是唤醒路径，不是拒绝入队的判定。
+    service.get(sid).pendingCommands = [{
+      command: 'npm run build', dir: '.', cwd: ws, reason: '不在 scope 命令清单', stage: 'S1', at: Date.now(),
+    }]
+    const declined = await cx.request('/api/flowgate/action', {
+      sessionId: sid, action: 'declineScopeCommands', payload: { commands: ['npm run build'] },
+    })
+    assert.equal(declined.status, 200, JSON.stringify(declined.body))
+    check('G04-7 不补命令：文档等待器继续原地等，不把信号当成批准', () => {
+      assert.equal(service.gates.kindOf(sid), 'doc')
+      assert.notEqual(service.get(sid).scope?.frozen, true)
+    })
+    // 收尾：放弃流程，让挂着的文档等待醒过来。
+    const cancelled = await cx.request('/api/flowgate/action', { sessionId: sid, action: 'cancel', payload: {} })
+    assert.equal(cancelled.status, 200, JSON.stringify(cancelled.body))
+    const cancelledResult = await keepAlive(docCall)
+    check('G04-8 放弃流程才叫醒文档等待，并如实说是被放弃的', () => {
+      assert.equal(cancelledResult.decision, 'cancelled')
+    })
+  } finally { rmSync(ws, { recursive: true, force: true }) }
+}
+
+// ---------------------------------------------------------------------------
+// G41：补命令退回 S1 之后，Agent 必须为每条补录命令给出举证。
+// 用户点头只说明「这条命令可以进清单」，不说明「它证明哪一条验收标准」；
+// 没人作证的命令进了清单，S4 不会为它产出证据，它只是一份额外授权。
+// ---------------------------------------------------------------------------
+{
+  const ws = g40Workspace('scope-requests')
+  // 夹具默认只有 scripts.test：补录的 build 得真在 package.json 里，
+  // 否则「命令不适用」这条缺口会把用例要验的举证问题盖住。
+  writeFileSync(join(ws, 'package.json'), JSON.stringify({
+    name: 'g41-fixture',
+    scripts: { test: 'node --test test/session.test.mjs', build: 'node scripts/build.mjs' },
+  }, null, 2) + '\n')
+  const sid = 'g41-requests'
+  try {
+    const cx = makeHost(ws, sid)
+    const service = currentService()
+    await cx.tool('flowgate_start', { title: '补录举证', preset: 'fast' })
+    // 先交一份草稿：补录要从草稿里抄清单，S1 上空着草稿就无处可补。
+    const firstDoc = cx.tool('flowgate_doc', { html: '<p>需求</p>', scope: G40_SCOPE })
+    await tick()
+    // S1 上被拒的命令不进待补队列（那属于阶段违规），这里直接造一条：
+    // 本条用例验的是补录之后的举证要求，不是入队判定。
+    service.get(sid).pendingCommands = [{
+      command: 'npm run build', dir: '.', cwd: ws, reason: '不在 scope 命令清单', stage: 'S2', at: Date.now(), context: 'S2 开发',
+    }]
+    const reopened = await cx.request('/api/flowgate/action', {
+      sessionId: sid, action: 'reopenScopeForCommands', payload: { commands: ['npm run build'] },
+    })
+    assert.equal(reopened.status, 200, JSON.stringify(reopened.body))
+    check('G41-1 补录后申请单留下命令原文与被拒现场', () => {
+      const flow = service.get(sid)
+      assert.equal(flow.stage, 'S1')
+      assert.equal(flow.scopeRequests.length, 1)
+      const entry = flow.scopeRequests[0]
+      assert.equal(entry.entry, 'npm run build')
+      assert.equal(entry.deniedStage, 'S2')
+      assert.equal(entry.context, 'S2 开发')
+      assert.equal(entry.deniedBecause, '不在 scope 命令清单')
+    })
+    await checkAsync('G41-2 重新提交时把补录命令静默删掉会被拒绝', async () => {
+      await assert.rejects(
+        () => cx.tool('flowgate_doc', { html: '<p>需求</p>', scope: G40_SCOPE }),
+        /补进清单的命令在新提交里不见了/,
+      )
+      assert.equal(service.get(sid).scopeRequests.length, 1, '被拒的提交不能把申请单一起清掉')
+    })
+    const withCommand = {
+      ...G40_SCOPE,
+      commands: ['npm test', 'npm run build'],
+      command_sources: [
+        { command: 'npm test', from: 'package.json scripts.test' },
+        { command: 'npm run build', from: 'package.json scripts.build' },
+      ],
+    }
+    await checkAsync('G41-3 补录命令进了清单但没有任何验收标准引用它，同样被拒绝', async () => {
+      await assert.rejects(
+        () => cx.tool('flowgate_doc', { html: '<p>需求</p>', scope: withCommand }),
+        /没有任何 unit \/ integration 验收标准在 verification\.commands 里引用它们/,
+      )
+    })
+    const attested = {
+      ...withCommand,
+      acceptance_criteria: [{
+        ...G40_SCOPE.acceptance_criteria[0],
+        verification: {
+          ...G40_SCOPE.acceptance_criteria[0].verification,
+          commands: ['npm test', 'npm run build'],
+        },
+      }],
+    }
+    const docCall = cx.tool('flowgate_doc', { html: '<p>需求</p>', scope: attested })
+    await tick()
+    const firstResult = await keepAlive(firstDoc)
+    check('G41-4 重新提交取代上一次挂着的等待，旧调用拿到 pending 而不是某个决策', () => {
+      assert.equal(firstResult.decision, 'pending')
+      assert.equal(firstResult.waitReason, 'superseded')
+    })
+    const view = await cx.request('/api/flowgate/state?sessionId=' + sid)
+    check('G41-5 申请单在 S1 上标出为它作证的验收标准', () => {
+      const entry = (view.body.scopeRequests ?? [])[0]
+      assert.ok(entry, 'S1 上要能看到申请单：' + JSON.stringify(view.body.scopeRequests))
+      assert.deepEqual(entry.attestedBy, ['AC-1'])
+    })
+    const approved = await cx.request('/api/flowgate/action', {
+      sessionId: sid, action: 'doc', payload: { decision: 'approve' },
+    })
+    assert.equal(approved.status, 200, JSON.stringify(approved.body))
+    assert.equal((await keepAlive(docCall)).decision, 'approve')
+    check('G41-6 冻结后申请单清空，冻结事件里留下这次补录', () => {
+      const flow = service.get(sid)
+      assert.equal(flow.scope.frozen, true)
+      assert.deepEqual(flow.scopeRequests, [])
+      const frozen = g40Events(ws).filter((event) => event.type === 'scope.frozen').pop()
+      assert.deepEqual(frozen.detail.supplemented, ['npm run build'])
+    })
+  } finally { rmSync(ws, { recursive: true, force: true }) }
+}
+
+// 改需求会把申请单一起作废：用户改的是需求本身，范围要重新谈。
+{
+  const ws = g40Workspace('scope-requests-revise')
+  const sid = 'g41-revise'
+  try {
+    const cx = makeHost(ws, sid)
+    const service = currentService()
+    await cx.tool('flowgate_start', { title: '改需求清申请单', preset: 'fast' })
+    // 申请单直接造：本条验的是 revise 的清空动作，不是补录路径本身。
+    service.get(sid).scopeRequests = [{
+      command: 'npm test', dir: '.', cwd: ws, entry: 'npm test', deniedStage: 'S2', deniedAt: Date.now(),
+      deniedBecause: '不在 scope 命令清单', context: 'S2 开发', addedAt: Date.now(),
+    }]
+    const docCall = cx.tool('flowgate_doc', { html: '<p>需求</p>', scope: G40_SCOPE })
+    await tick()
+    const revised = await cx.request('/api/flowgate/action', {
+      sessionId: sid, action: 'doc', payload: { decision: 'revise', note: '范围要重谈' },
+    })
+    assert.equal(revised.status, 200, JSON.stringify(revised.body))
+    assert.equal((await keepAlive(docCall)).decision, 'revise')
+    check('G41-7 改需求会把申请单一起作废：拿旧申请单核对新 scope 只会报对不上的错', () => {
+      assert.deepEqual(service.get(sid).scopeRequests, [])
+    })
+  } finally { rmSync(ws, { recursive: true, force: true }) }
+}
+
+// 自动模式不是「补录命令免检」：没人作证时照样不能自己放行。
+{
+  const ws = g40Workspace('scope-requests-auto')
+  const sid = 'g41-auto'
+  try {
+    const cx = makeHost(ws, sid)
+    const service = currentService()
+    await cx.tool('flowgate_start', { title: '自动模式补录', preset: 'fast' })
+    assert.equal((await cx.request('/api/flowgate/action', { sessionId: sid, action: 'setGateMode', payload: { mode: 'auto' } })).status, 200)
+    // 自动模式下这份 scope 没有缺口，提交即冻结并进 S2：补录要从冻结 scope 抄回草稿。
+    const autoDoc = await keepAlive(cx.tool('flowgate_doc', { html: '<p>需求</p>', scope: G40_SCOPE }))
+    assert.equal(autoDoc.decision, 'approve', JSON.stringify(autoDoc))
+    assert.equal(service.get(sid).stage, 'S2')
+    service.get(sid).pendingCommands = [{
+      command: 'npm run build', dir: '.', cwd: ws, reason: '不在 scope 命令清单', stage: 'S4', at: Date.now(), context: 'S4 测试',
+    }]
+    const reopened = await cx.request('/api/flowgate/action', {
+      sessionId: sid, action: 'reopenScopeForCommands', payload: { commands: ['npm run build'] },
+    })
+    assert.equal(reopened.status, 200, JSON.stringify(reopened.body))
+    check('G41-8 自动模式不会替没人作证的补录命令放行', () => {
+      const flow = service.get(sid)
+      assert.notEqual(flow.scope?.frozen, true, '补录命令还没有 AC 作证，不能自动冻结')
+      assert.equal(flow.stage, 'S1')
+      assert.equal(flow.scopeRequests.length, 1)
+    })
+  } finally { rmSync(ws, { recursive: true, force: true }) }
 }
 
 // ---------------------------------------------------------------------------

@@ -534,6 +534,15 @@ await check('AC-10 补进清单时自动带上被拒时的目录后缀', async (
   const view = await getState()
   assert.equal(view.stage, 'S1', '补命令要退回需求分析重新批准 scope')
   assert.deepEqual(view.doc.pendingScope.commands, [command + ' [packages/web]'], '补进去的条目必须带目录后缀')
+  // G41：补进来的命令要有人作证。把它的原文（含目录后缀）写进 AC 的 verification.commands，
+  // 说明它证明哪一条；没人作证的补录命令会让这份 scope 拒绝冻结。
+  const pendingScope = mod.currentService().get(SESSION).pendingScope
+  const attested = pendingScope.acceptance_criteria[0]
+  attested.verification = {
+    method: 'integration',
+    procedure: '在集成测试里按清单执行这条命令并断言退出码为 0',
+    commands: [command + ' [packages/web]'],
+  }
   // 重新批准后冻结的 scope 也要是带后缀的那一条：清单与执行目录一起被批准。
   const reapproved = await post({ sessionId: SESSION, action: 'doc', payload: { decision: 'approve', acceptScopeRisks: true } })
   assert.equal(reapproved.status, 200, JSON.stringify(reapproved.data))
