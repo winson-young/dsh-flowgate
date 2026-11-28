@@ -7,6 +7,8 @@ import { apply } from '../lib/index.js'
 
 // 独立假宿主只暴露新版 subagents 契约；不调用或导出生产内部辅助函数。
 const WAIT_MS = 2500
+// 交件工具（立即返回）与等签收工具（挂起）已拆开，夹具按旧语义把它们串起来。
+const SUBMIT_TOOLS = new Set(['flowgate_doc', 'flowgate_gate', 'flowgate_review', 'flowgate_test'])
 const defer = () => {
   let resolve, reject
   const promise = new Promise((yes, no) => { resolve = yes; reject = no })
@@ -235,13 +237,22 @@ function makeHost(options = {}) {
     },
     call(name, args = {}, options = {}) {
       const signal = options.signal ? AbortSignal.any([shutdown.signal, options.signal]) : shutdown.signal
-      const exec = execFor(name, args, options.sessionId ?? sessionId, signal)
-      const promise = (async () => {
+      const run = async (toolName, toolArgs) => {
+        const exec = execFor(toolName, toolArgs, options.sessionId ?? sessionId, signal)
         const verdict = await checkExec(exec)
         if (verdict?.kind === 'deny') throw new Error(verdict.reason)
-        const definition = definitions.get(name)
-        assert.ok(definition, '工具必须注册：' + name)
-        return definition.execute(args, exec)
+        const definition = definitions.get(toolName)
+        assert.ok(definition, '工具必须注册：' + toolName)
+        return { value: await definition.execute(toolArgs, exec) }
+      }
+      const promise = (async () => {
+        const { value } = await run(name, args)
+        // G35 第四层：交件工具立即返回 submitted，等签收由 flowgate_wait 承担。
+        // 本文件的用例验的是「交件之后门禁怎么走」，所以夹具替用例补上等签收这一步；
+        // 拆分本身（交件不等、wait 才中断）在 test/host.test.mjs 的专项用例里单独断言。
+        if (!SUBMIT_TOOLS.has(name) || value?.decision !== 'submitted') return value
+        const waitArgs = value.gateId ? { gateId: value.gateId } : {}
+        return (await run('flowgate_wait', waitArgs)).value
       })()
       pending.push(promise)
       promise.catch(() => {})

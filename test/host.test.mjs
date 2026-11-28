@@ -105,17 +105,19 @@ function makeHost(cwd, sessionId, options = {}) {
     const definition = tools.get(name)
     assert.ok(definition, '工具未注册：' + name)
     const prepared = withGrill(name, args)
-    const value = definition.execute(prepared, {
+    const exec = {
       name,
       arguments: prepared,
       agent: { session: { header: { id: sessionId, cwd } } },
       signal: opts.signal,
-    })
+    }
+    const value = Promise.resolve(definition.execute(prepared, exec))
+      .then((result) => chainWait(tools, name, result, exec))
     // 本文件的用例全部验证「每一步都停下来等确认」的手动门禁语义。
     // 门禁模式默认随档位（fast 档是自动通过），夹具里显式切成每步确认；
     // 自动通过的行为在 test/gatemode.test.mjs 里单独覆盖。
     if (name !== 'flowgate_start') return value
-    return Promise.resolve(value).then(async (result) => {
+    return value.then(async (result) => {
       const switched = await request('/api/flowgate/action', {
         sessionId, action: 'setGateMode', payload: { mode: 'manual' },
       })
@@ -186,11 +188,25 @@ function reviewFinding(overrides = {}) {
   }
 }
 
+// G35 第四层：交件工具现在立即返回 submitted，等签收由 flowgate_wait 承担。
+// 本文件的用例几乎都在验「交件后等门禁」的整段行为，所以夹具替用例补上这一步；
+// 拆分本身（交件不等、wait 才中断）由「交件与等签收拆开」那组用例单独覆盖。
+const SUBMIT_TOOLS = new Set(['flowgate_doc', 'flowgate_gate', 'flowgate_review', 'flowgate_test'])
+function chainWait(tools, name, result, exec) {
+  if (!SUBMIT_TOOLS.has(name) || result?.decision !== 'submitted') return result
+  const waitDef = tools.get('flowgate_wait')
+  assert.ok(waitDef, '工具未注册：flowgate_wait')
+  const waitArgs = result.gateId ? { gateId: result.gateId } : {}
+  // 夹具交回的是「签收」的结果，而不是交件回执：用例关心的一直是「等到了什么决定」。
+  // 交件那一步的返回（decision=submitted、submitted 回执）由下面那组拆分用例单独断言。
+  return Promise.resolve(waitDef.execute(waitArgs, { ...exec, name: 'flowgate_wait', arguments: waitArgs }))
+}
+
 async function runTool(name, args = {}) {
   const definition = host.tools.get(name)
   assert.ok(definition, '工具未注册：' + name)
   const prepared = withGrill(name, args)
-  const value = await definition.execute(prepared, execOf(name, prepared))
+  const value = await chainWait(host.tools, name, await definition.execute(prepared, execOf(name, prepared)), execOf(name, prepared))
   // 本文件的用例全部验证「每一步都停下来等用户确认」的手动门禁语义。
   // 门禁模式默认随档位（fast 档是自动通过），夹具里显式切成每步确认；
   // 自动通过的行为在 test/gatemode.test.mjs 里单独覆盖。
@@ -1950,6 +1966,117 @@ rmSync(cwd, { recursive: true, force: true })
   check('放弃后的视图不再带活动摘要，进度保留实际值', () => {
     assert.equal(ended.body.activity, null)
     assert.ok(ended.body.progress.percent > 0)
+  })
+}
+
+// ---------------------------------------------------------------------------
+// G35 第四层：交件与等签收拆成两步。交件工具（doc/gate/review/test）落盘后
+// 立即返回 decision=submitted 并开闸，等签收由 flowgate_wait 单独挂起。
+// 这样「调用被中断」只可能发生在 wait 上，Agent 没有理由重跑交件。
+// 本文件其余用例仍按旧语义串联两步（见 chainWait），这里专门验拆分本身。
+// ---------------------------------------------------------------------------
+
+{
+  const cwd = join(testRoot, 'sess-split')
+  const cx = makeHost(cwd, 'sess-split')
+  const sid = 'sess-split'
+  // 绕过 chainWait：这一步要的是交件工具自己的返回值，不是签收结果。
+  const submit = (name, args, opts = {}) => {
+    const definition = cx.tools.get(name)
+    assert.ok(definition, '工具未注册：' + name)
+    const prepared = withGrill(name, args)
+    return definition.execute(prepared, {
+      name,
+      arguments: prepared,
+      agent: { session: { header: { id: sid, cwd } } },
+      signal: opts.signal,
+    })
+  }
+
+  await cx.tool('flowgate_start', { title: '交件与等签收拆开', preset: 'fast' })
+  const docArgs = {
+    html: '<html><body><h1>拆分</h1></body></html>',
+    scope: {
+      commands: [], files_expected_to_change: ['src/auth/session.ts'],
+      capabilities: ['会话过期检测'],
+      out_of_scope_explicitly: [],
+      acceptance_criteria: [{ id: 'AC-1', when: '过期时', then: '返回 401' }],
+    },
+  }
+
+  const submitted = await submit('flowgate_doc', docArgs)
+  check('交件立即返回 submitted，不再挂起等用户点按钮', () => {
+    assert.equal(submitted.decision, 'submitted')
+    assert.equal(submitted.frozen, false)
+    assert.equal(submitted.submitted.kind, 'doc')
+    assert.ok(submitted.submitted.id, '交件回执必须带产物 id')
+    assert.ok(submitted.gateId, '交件必须带上这次开的门禁 id')
+    assert.match(submitted.message, /已经提交并保存/)
+    assert.match(submitted.message, /flowgate_wait/)
+  })
+
+  const opened = await cx.request('/api/flowgate/state?sessionId=' + sid)
+  check('交件之后门禁已经开着，但还没有等待器（等签收要单独调 wait）', () => {
+    assert.equal(opened.body.doc.pending, true)
+    assert.equal(opened.body.waiting, false)
+    assert.equal(opened.body.waitingKind, null)
+  })
+
+  // 忘了调 flowgate_wait 也不会把用户卡住：按钮照常生效，流程照常往下走。
+  const approved = await cx.request('/api/flowgate/action', {
+    sessionId: sid, action: 'doc', payload: { decision: 'approve' },
+  })
+  check('交件后忘了调 wait，用户点按钮仍然生效', () => {
+    assert.equal(approved.status, 200)
+  })
+  const advanced = await cx.request('/api/flowgate/state?sessionId=' + sid)
+  check('忘调 wait 时流程照样进入 S2，不会停在 S1', () => {
+    assert.equal(advanced.body.stage, 'S2')
+    assert.equal(advanced.body.scope.frozen, true)
+  })
+
+  const dev = await submit('flowgate_gate', {})
+  check('S2 交件同样立即返回 submitted 并带开发摘要 id', () => {
+    assert.equal(dev.decision, 'submitted')
+    assert.equal(dev.submitted.kind, 'dev-summary')
+    assert.ok(dev.gateId)
+  })
+
+  // 中断只可能落在 wait 上：此时产物早已落盘，回执必须说清「不要重提」。
+  const controller = new AbortController()
+  const waiting = submit('flowgate_wait', { gateId: dev.gateId }, { signal: controller.signal })
+  await tick()
+  controller.abort()
+  const halted = await waiting
+  check('wait 被中断时返回 halt，并带回「开发摘要已提交」的回执', () => {
+    assert.equal(halted.decision, 'halt')
+    assert.equal(halted.waitReason, 'aborted')
+    assert.equal(halted.submitted.kind, 'dev-summary')
+    assert.match(halted.message, /已经提交并保存/)
+    assert.match(halted.message, /不要再调用 flowgate_gate/)
+  })
+
+  // 没有产物就调 wait：当场说清，不许挂起等一个不会出现的按钮。
+  const early = await cx.request('/api/flowgate/state?sessionId=' + sid)
+  assert.equal(early.body.stage, 'S2')
+  await cx.request('/api/flowgate/action', { sessionId: sid, action: 'gate', payload: { decision: 'pass' } })
+  const reviewGate = await submit('flowgate_review', {
+    angles: [{ id: 'correctness', name: '正确性', verdict: 'pass', findings: [] }],
+  })
+  check('S3 交件返回 submitted 并带阻塞条数', () => {
+    assert.equal(reviewGate.decision, 'submitted')
+    assert.equal(reviewGate.blocking, 0)
+    assert.equal(reviewGate.submitted.kind, 'review')
+  })
+
+  // 同一份报告再交一次：不覆盖、不重跑，直接说「已经交过了」。
+  const again = await submit('flowgate_review', {
+    angles: [{ id: 'correctness', name: '正确性', verdict: 'pass', findings: [] }],
+  })
+  check('内容相同的评审报告再交一次不覆盖，直接返回已提交', () => {
+    assert.equal(again.decision, 'submitted')
+    assert.equal(again.submitted.id, reviewGate.submitted.id)
+    assert.match(again.message, /已经提交过/)
   })
 }
 

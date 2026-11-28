@@ -114,11 +114,23 @@ function makeHost(cwd, sessionId, reviewFindingsFor) {
     assumptions: [],
     open_questions: [],
   }
+  // G35 第四层：交件工具立即返回 submitted，等签收由 flowgate_wait 承担。
+  // 本文件的用例验的是「门禁模式决定流程走到哪」，所以夹具替用例补上等签收这一步；
+  // 拆分本身（交件不等、wait 才中断）在 test/host.test.mjs 的专项用例里单独断言。
+  const SUBMIT_TOOLS = new Set(['flowgate_doc', 'flowgate_gate', 'flowgate_review', 'flowgate_test'])
+  const chainWait = (name, result) => {
+    if (!SUBMIT_TOOLS.has(name) || result?.decision !== 'submitted') return Promise.resolve(result)
+    const definition = tools.get('flowgate_wait')
+    assert.ok(definition, '工具未注册：flowgate_wait')
+    const waitArgs = result.gateId ? { gateId: result.gateId } : {}
+    return definition.execute(waitArgs, execOf('flowgate_wait', waitArgs))
+  }
   const tool = (name, args, opts = {}) => {
     const definition = tools.get(name)
     assert.ok(definition, '工具未注册：' + name)
     const prepared = name === 'flowgate_doc' ? { ...GRILL, ...args } : args
-    return definition.execute(prepared, execOf(name, prepared, opts.signal))
+    return Promise.resolve(definition.execute(prepared, execOf(name, prepared, opts.signal)))
+      .then((result) => chainWait(name, result))
   }
 
   const request = async (path, body) => {

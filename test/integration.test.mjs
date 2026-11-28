@@ -138,9 +138,21 @@ const DEFAULT_GRILL = {
 }
 const withGrill = (name, args) => (name === 'flowgate_doc' ? { ...DEFAULT_GRILL, ...args } : args)
 
+// G35 第四层：交件工具立即返回 submitted，等签收由 flowgate_wait 承担。
+// 本文件的用例几乎都在验「交件后等门禁」的整段行为，夹具替它们补上这一步；
+// 拆分本身（交件不等、wait 才中断）在 test/host.test.mjs 的专项用例里单独断言。
+const SUBMIT_TOOLS = new Set(['flowgate_doc', 'flowgate_gate', 'flowgate_review', 'flowgate_test'])
+const chainWait = (name, result, sessionId) => {
+  if (!SUBMIT_TOOLS.has(name) || result?.decision !== 'submitted') return Promise.resolve(result)
+  const definition = host.tools.get('flowgate_wait')
+  assert.ok(definition, '工具未注册：flowgate_wait')
+  const waitArgs = result.gateId ? { gateId: result.gateId } : {}
+  return definition.execute(waitArgs, execFor(sessionId, 'flowgate_wait', waitArgs))
+}
+
 const call = async (name, args, sessionId = SESSION) => {
   const prepared = withGrill(name, args)
-  const value = await host.tools.get(name).execute(prepared, execFor(sessionId, name, prepared))
+  const value = await chainWait(name, await host.tools.get(name).execute(prepared, execFor(sessionId, name, prepared)), sessionId)
   if (name === 'flowgate_start') {
     const res = await actionRouteRef().fetch(new Request('http://host/api/flowgate/action', {
       method: 'POST', body: JSON.stringify({ sessionId, action: 'setGateMode', payload: { mode: 'manual' } }),
@@ -189,10 +201,11 @@ const check = async (name, fn) => {
   console.log('ok   ' + name)
 }
 
-await check('apply 注册 10 个工具与 9 条路由', () => {
+await check('apply 注册 11 个工具与 9 条路由', () => {
   assert.deepEqual([...host.tools.keys()].sort(), [
     'flowgate_ask', 'flowgate_cancel', 'flowgate_doc', 'flowgate_gate', 'flowgate_review',
     'flowgate_review_run', 'flowgate_start', 'flowgate_status', 'flowgate_test', 'flowgate_test_run',
+    'flowgate_wait',
   ])
   assert.ok(host.routes.has('/api/flowgate/state'))
   assert.ok(host.routes.has('/api/flowgate/action'))

@@ -183,12 +183,14 @@ S3 与 S4 的「更多操作」里都有「回到需求分析调整 scope」，�
 
 **按钮可点 ≠ Agent 还在等。** 门禁等待挂在工具调用上，工具超时、宿主重启或被新的等待取代时等待器就没了（`GateHub.wait` 收到 abort 会 `finish({ kind: 'aborted' })`），但产物已经落地，所以按钮继续可点、`gate.interrupted` 为真——这是为了不剥夺用户的批准权，不是允许 Agent 自己往下做。两边必须同时成立：
 
-- **Agent 侧**：中断时工具返回 `decision: 'halt'`，并带一份 `submitted` 回执（`{ kind, label, id, detail }`），提示里写清「本阶段的X已经提交并保存（id …）、这次不需要重新提交，也不要再调用 flowgate_xxx」——中断只中断「等签收」，不中断「交件」，重跑一遍评审只会覆盖上一份结论、白烧一轮 token。同一个 `halt` 明确要求不要继续做后续阶段的工作、也不要假设已经通过；用户点按钮后宿主补一条唤醒消息，Agent 从 `flowgate_status` 接着走。`flowgate_status` 的摘要里也有一行「本阶段产物」，不看门禁卡也能确认东西已经交上来了。
+- **Agent 侧**：中断只可能发生在 `flowgate_wait` 上——交件工具早已把产物写完并返回了。`flowgate_wait` 中断时返回 `decision: 'halt'`，并带一份 `submitted` 回执（`{ kind, label, id, detail }`），提示里写清「本阶段的X已经提交并保存（id …）、这次不需要重新提交，也不要再调用 flowgate_xxx」——重跑一遍评审只会覆盖上一份结论、白烧一轮 token。同一个 `halt` 明确要求不要继续做后续阶段的工作、也不要假设已经通过；用户点按钮后宿主补一条唤醒消息，Agent 从 `flowgate_status` 接着走。`flowgate_status` 的摘要里也有一行「本阶段产物」，不看门禁卡也能确认东西已经交上来了。
 - **提交幂等**：`flowgate_review` / `flowgate_test` 在写盘前比对上一份产物（`sameSubmission`），内容完全相同就返回「已经提交过、本次没有重复提交也没有覆盖」，不再整体覆盖——重复提交在协议上是允许的（只查阶段），所以幂等要由工具自己兜。
 - **点完要有回音**：门禁卡与快捷入口在提交成功后给出「决定已生效」的一句，并按当时有没有等待器分成「已经直接收到」与「排在这一轮结束后送到」两种说法。旧文案「点按钮叫不醒 Agent」与事实相反：`applyAction` 在 `delivered` 为假时本来就会补发一条消息。
-- **宿主侧**：`awaitGate` 在挂起前核对阶段与门禁状态（`expectedStage` 与 `record.gate !== 'pending'`），发现用户已经在窗口里确认过就直接返回 `stale`，不再挂到一个按钮永远不会再出现的阶段上；S2 采集变更摘要最长有 10 秒窗口，返回后若阶段已经变了就丢弃这次摘要，不往新阶段里写上一阶段的事实。门禁工具在挂起前还会看本阶段有没有产物：S3 要评审报告、S4 要测试报告才会亮按钮，没有就当场返回 `stale` 并说清该先交什么，而不是挂到一个不会来的按钮上。
+- **宿主侧**：`awaitGate` 在挂起前核对阶段与门禁状态（`expectedStage` 与 `record.gate !== 'pending'`），发现用户已经在窗口里确认过就直接返回 `stale`，不再挂到一个按钮永远不会再出现的阶段上；S2 采集变更摘要最长有 10 秒窗口，返回后若阶段已经变了就丢弃这次摘要，不往新阶段里写上一阶段的事实。`flowgate_wait` 在挂起前还会看本阶段有没有产物：S3 要评审报告、S4 要测试报告才会亮按钮，没有就当场返回 `stale` 并说清该先交什么，而不是挂到一个不会来的按钮上。
 
 少了任何一边都会变成「用户自顾自批准、Agent 自顾自干活」。
+
+**交件与等签收是两个工具。** `flowgate_doc` / `flowgate_gate` / `flowgate_review` / `flowgate_test` 写完盘就返回（`decision: 'submitted'`、`submitted` 回执、`gateId`），门禁随之打开；`flowgate_wait` 才挂起。这样中断只可能落在「等签收」上，Agent 没有「这次没交上」的解释空间。代价是多出一个失败模式：交完忘了调 `flowgate_wait`，门禁开着却没有等待器——用户这时点按钮仍然生效（`applyAction` 会本地推进并补发消息），只是 Agent 要等到下一轮才知道，所以交件工具的提示与 `description` 都点名「接下来调用 `flowgate_wait`」。
 
 **唤醒值只有两种形状。** 门禁的唤醒不再是「一个随手可变的 `kind` 字段」，而是协议：`{ type: 'decision', decision }` 与 `{ type: 'signal', signal }`，消费端穷尽分支，遇到不认识的值直接抛错——安全方向是「看不懂就报错」，不是「看不懂就当通过」。
 
@@ -348,15 +350,16 @@ S4 退回只有 S2 一个目标，所以「AC 本身测不了」的缺口回 S2 
 | `flowgate_start` | 启动流程；`brief` 是分析依据，`title` 可省略且只用于界面显示，`preset` 选择档位 |
 | `flowgate_status` | 读取阶段、范围、规则、等待状态和运行版本（`version` / `moduleRevision` / `diskModuleRevision` / `runtimeStatus` / `clientRevision` / `clientStatus` / `staleModules`） |
 | `flowgate_ask` | S1 提出决策问题，等待用户点选 |
-| `flowgate_doc` | 提交需求 HTML、scope 和档位建议，等待批准；`commands` 要从项目里读出来并配 `command_sources` |
-| `flowgate_gate` | 请求当前阶段出口门禁 |
+| `flowgate_doc` | 提交需求 HTML、scope 和档位建议，交件立即返回；`commands` 要从项目里读出来并配 `command_sources` |
+| `flowgate_gate` | 提交 S2 开发摘要，交件立即返回；S3 / S4 的产物分别由 `flowgate_review` / `flowgate_test` 交件 |
+| `flowgate_wait` | 等签收：挂起直到用户确认、退回、跳过或放弃，中断时返回 `halt` 与提交回执 |
 | `flowgate_review_run` | 宿主按评审角度启动只读子代理并汇总报告 |
-| `flowgate_review` | 当前 Agent 提交结构化评审报告 |
+| `flowgate_review` | 当前 Agent 提交结构化评审报告，交件立即返回 |
 | `flowgate_test_run` | 宿主按测试方向启动子代理并汇总结果 |
-| `flowgate_test` | 当前 Agent 提交结构化测试报告 |
+| `flowgate_test` | 当前 Agent 提交结构化测试报告，交件立即返回 |
 | `flowgate_cancel` | 放弃流程、解冻 scope、记录事件并通知当前等待门禁 |
 
-`*_run` 入口要求宿主具备下述协议与守卫能力；条件不满足时返回带原因的降级结果，也可由当前 Agent 使用直接提交报告的工具。等待门禁的调用会挂起，直到用户在工作台确认、退回、跳过或放弃。
+`*_run` 入口要求宿主具备下述协议与守卫能力；条件不满足时返回带原因的降级结果，也可由当前 Agent 使用直接提交报告的工具。交件工具（`flowgate_doc` / `flowgate_gate` / `flowgate_review` / `flowgate_test` / `*_run`）落盘后立即返回 `decision: 'submitted'` 与 `gateId`；真正挂起的是 `flowgate_wait`，它等到用户在工作台确认、退回、跳过或放弃才返回。
 
 ### 宿主子代理协议
 
