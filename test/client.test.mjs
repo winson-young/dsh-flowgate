@@ -1827,6 +1827,73 @@ const HubPanelIcon = componentOf('sidebar.panellist')
   })
 }
 
+// G21：退回 S1 之后流程停在那儿等人选路，界面必须念「停住」，不能继续念「会被自动结束」——
+// 那会让用户以为什么都不用做，实际既不会结束、也不会自动重试。
+// 文案与宿主 statusTool 对齐：stalled 前说「再出现一次会停」，stalled 后说「已经停了」。
+{
+  const riskLast = [{
+    code: 'procedure-file-outside-scope',
+    acs: ['AC-1'],
+    message: '这些验收标准的验证步骤点名了 scope 之外的文件：AC-1 → test/fixtures/session.ts。',
+  }]
+  posted = []
+  currentView = baseView('S1', {
+    doc: {
+      html: null, recommendedPreset: 'fast', reason: null, at: null, pending: false,
+      droppedScopeEntries: [],
+      pendingScopeRisks: [],
+      scopeRiskStrikes: { count: 2, stalled: false, signature: 'AC-1:procedure-file-outside-scope', at: '2026-11-28T00:00:00Z' },
+      scopeRiskLast: riskLast,
+    },
+    pendingCommands: [{
+      command: 'npm run build', dir: '.', entry: 'npm run build',
+      selectionKey: 'npm run build', deniedAt: '2026-11-28T00:00:00Z',
+    }],
+    waiting: false,
+    waitingKind: null,
+  })
+  const renderer = await render(FlowDetail, {})
+  await check('退回 S1 后不再念「会被自动结束」，改说停在 S1 等人决定', () => {
+    const text = flat(renderer.toJSON())
+    assert.ok(text.includes('已被退回（第 2/3 次）'), text)
+    assert.ok(text.includes('这条流程会停在 S1 等你决定，不会自动结束'), text)
+    assert.ok(!text.includes('会被自动结束'), text)
+    assert.ok(!text.includes('请选一条路'), '还没到上限，不该让人以为现在就停住了')
+    assert.ok(text.includes('test/fixtures/session.ts'), text)
+  })
+}
+
+{
+  posted = []
+  currentView = baseView('S1', {
+    doc: {
+      html: null, recommendedPreset: 'fast', reason: null, at: null, pending: false,
+      droppedScopeEntries: [],
+      pendingScopeRisks: [],
+      scopeRiskStrikes: { count: 3, stalled: true, signature: 'AC-1:procedure-file-outside-scope', at: '2026-11-28T00:00:00Z' },
+      scopeRiskLast: [{
+        code: 'procedure-file-outside-scope',
+        acs: ['AC-1'],
+        message: '这些验收标准的验证步骤点名了 scope 之外的文件：AC-1 → test/fixtures/session.ts。',
+      }],
+    },
+    // 队列为空：界面不该提「补一条被拒的命令」这条无处可点的路。
+    pendingCommands: [],
+    waiting: false,
+    waitingKind: null,
+  })
+  const renderer = await render(FlowDetail, {})
+  await check('连续三次后退回：界面列出可选的两条路，编号随实际条数走', () => {
+    const text = flat(renderer.toJSON())
+    assert.ok(text.includes('同一批 scope 缺口连续 3 次没能补齐'), text)
+    assert.ok(text.includes('这条流程停在 S1：不会自动结束，也不会再自动重试'), text)
+    assert.ok(text.includes('请选一条路'), text)
+    assert.ok(text.includes('① 让 Agent 按下面的缺口改 scope'), text)
+    assert.ok(!text.includes('补一条被拒的命令'), '没有待补命令时不该提这条')
+    assert.ok(text.includes('② 放弃这条流程'), text)
+  })
+}
+
 // 宿主拒绝批准时会把重算出的缺口写回状态：界面必须补拉一次，
 // 否则用户反复点「批准」只看到红字，那个确认按钮永远不出现。
 {

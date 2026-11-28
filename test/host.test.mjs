@@ -2519,6 +2519,11 @@ rmSync(cwd, { recursive: true, force: true })
   }
   const liveCall = cx.tool('flowgate_doc', { html: '<html><body><p>待改</p></body></html>', scope })
   await tick()
+  // G21：点「修改需求」是最明确的「scope 内容要变」——上一轮的退回计数不能跟着走进新一轮。
+  // 先注入一轮旧账：不清的话 Agent 改完重交、缺口签名碰巧一样，计数会从 2 直接跳到 3。
+  const liveFlow = currentService().get(sid)
+  liveFlow.scopeCycle.strikes = { signature: 'AC-1:procedure-file-outside-scope', count: 2, at: '2026-11-28T00:00:00Z' }
+  liveFlow.scopeCycle.riskLast = [{ code: 'procedure-file-outside-scope', acs: ['AC-1'], message: '验证步骤点名了 scope 之外的文件' }]
   const liveNote = '  把 AC-1 的失败分支补上，并写明退出码  '
   await cx.request('/api/flowgate/action', { sessionId: sid, action: 'doc', payload: { decision: 'revise', revisionNote: liveNote } })
   const liveResult = await liveCall
@@ -2527,6 +2532,11 @@ rmSync(cwd, { recursive: true, force: true })
     assert.match(liveResult.message, /把 AC-1 的失败分支补上，并写明退出码/)
     assert.match(liveResult.message, /进入 S1/)
     assert.doesNotMatch(liveResult.message, /补齐未决项/)
+  })
+  const liveState = await cx.request('/api/flowgate/state?sessionId=' + sid)
+  check('AC-11 点修改需求把缺口计数清零：改完重交从第 1 次重新数', () => {
+    assert.equal(liveState.body.doc.scopeRiskStrikes, null, '用户主动改需求，旧计数不能跟着走')
+    assert.deepEqual(liveState.body.doc.scopeRiskLast, [])
   })
   await cx.tool('flowgate_cancel', {})
 }

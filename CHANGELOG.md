@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.34
+
+- **G21 收尾三处：界面还在念「会被自动结束」、文档还写着旧判死、改需求不清计数**。① `lib/client.js` 的 S1 退回说明不读 `strikes.stalled`，第三次退回后仍说「同一批缺口再出现一次，这条流程会被自动结束」——宿主早就改成停在 S1 了，这句是假消息，而且流程停住时界面不给任何「请选一条路」的提示。现在分两支：未到上限说「下一次会停在 S1 等你决定，不会自动结束」，到上限说「已经停在 S1：不会自动结束，也不会再自动重试」，并按实际可用的出路编号列出（没有待补命令时不提那条无处可点的路）。② `docs/development.md` 仍写「缺口签名 = code 拼串、三次就 `cancelFlow`、字段在 `flow.scopeRiskStrikes`」，三处都与现状不符；改为带 AC 身份的签名、停在 S1 三选一、`flow.scopeCycle.strikes` / `.riskLast`，并补上 `scopeCycle` 的结构与换轮语义（`docs/` 里此前一个字都没有）。③ 点「修改需求」只清 `draft` / `dropped` / `risks` / `requests`，没清 `strikes` / `riskLast`——用户主动改需求是最明确的「scope 内容要变」，Agent 改完重交时只要签名碰巧一样，计数就从 2 跳到 3，刚改完就被判卡住；现在一起清零。
+- **S1 门禁不再把上一轮的命令摆在工作最前面**：`gateBlockers` 对所有阶段都把待补命令加在阻塞项首位，回 S1 重写方案时用户第一眼看到的是上一轮被拒的命令，容易以为不处理它交不了件。S1 这一关改为把命令提示挪到末尾并注明「上一轮遗留、与这份 scope 无关，可以先不管；进 S2 前会再问一次」；其他阶段照旧先问。两个队列本身仍然跨轮保留（它们是用户诉求，不是方案作业状态）。
+
+  验证：`test/client.test.mjs` 新增两条界面用例（退回 S1 不再出现「会被自动结束」；连续三次后退回列出可选的两条路、编号随实际条数走）；`test/host.test.mjs` 的「文档在途时点修改需求」用例注入上一轮缺口计数，断言 `revise` 后 `scopeRiskStrikes === null`、`scopeRiskLast` 为空；`npm test` 十五套全 PASS。版本 0.1.34。
+
 ## 0.1.33
 
 - **G21 退回 S1 不清 scope 作业状态：新方案背着旧账，还可能一上来就被判「AI 卡死」**：`rollbackTo(flow,'S1')` 只清 `scope` / `doc` / 草稿 / 丢弃清单，另外六个字段原样留着——`pendingCommands`（门禁追问上一轮待补的命令，点「补」还会撞上「这条命令已经在清单里了」）、`declinedCommands`、`scopeRiskStrikes`（连续退回计数，到 3 次直接 `cancelFlow`，新一轮只剩 1–2 次机会）、`scopeRiskLast`（Agent 摘要读到的是上一轮的缺口）、`pendingScopeRisks`（草稿已清空、门禁却说「待批准的方案有 N 条缺口」）、`scopeRequests`（报告没提；S1 反向核对会拿它判「申请单被丢弃」，Agent 在新一轮合理删命令时被拒）。
