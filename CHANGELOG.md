@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.32
+
+- **改道 S1 之后「同一批」只认 AC id，用户改完验收办法再退一次又被扔回 S1**：`testStall` 比对的是未通过 AC 的 id 集合，而改道 S1 的用意正是换一种能量测的验收办法——用户改的往往就是 `procedure`（甚至 `method`），id 一个字没变。于是回 S1 改完、重新交件、S4 再退一次，判据照样判成「同一批」，`streak` 从 3 累到 4 立刻又改道，补救路径等于只给一次机会；同时 `flow.testStall` 原样保留 streak=3，改道这个动作本身也没在任何地方留下痕迹。
+
+  改法两条并做：① 判据升级成 **AC 身份**：新增私有 `gapKey(gap)`（`lib/acceptance.js`），把 `id` / `method` / `procedure` 三段各自折叠换行、`trim()` 后用 `\u0000` 拼成键；`stallGaps` 返回 `{ id, status, method, procedure }`，`testStall` 比对 `previous.keys` 而不是 `previous.gaps`。换了验证方法或验收步骤就是新的一批，从头数起——这才是「改道」应有的效果。② 改道当场重置计数：`flow.testStall` 置为 `{ ...stall, streak: 1, redirects: 前值 + 1, redirectedAt: nowIso() }` 再进 S1，`repairFlow` 对 `keys` / `redirects` 的坏形状按空数组与 0 兜底。两条缺一不可：只改判据不重置，用户什么都没改就重交一次仍会立刻再改道；只重置不改判据，改完 procedure 也白改。
+
+  回到 S1 要说明白为什么回来：新增 `redirectNotice(view)`（`lib/client.js`），条件 `stage === 'S1' && redirects > 0 && gaps.length`，文案写「这条流程已从测试阶段改道回需求分析 N 次：AC-1（未覆盖）连续没通过，改代码修不好。换一种能量测的验收办法会重新计轮次；照原样重交，退回几次就又会改道。」接入主门禁卡与工作台门禁卡两处——不然用户只看到阶段突然变成 S1，不知道自己是被请回来的。
+
+  验证：`test/acceptance.test.mjs` 新增「改了验收办法就是新的一批：procedure 变了不再算原地打转」（同 procedure 累加 1→2、换 procedure 重置 1、换 method 也重置 1），47 项全过；`test/host.test.mjs` 的 G20 第三条断言改为 `streak === 1` / `redirects === 1` / `redirectedAt` 是字符串，472 项全过；`npm run check` 全绿，`npm test` 十五套全 PASS。`docs/development.md` 的「打回预算」段同步补上身份判据、改道重置与 S1 的说明。版本 0.1.32。
+
+- **「还剩 N 轮」倒计时少算一轮**：`stallNotice`（`lib/client.js`）算的是 `TEST_STALL_MAX - streak - 1`，而改道条件是 `streak >= TEST_STALL_LIMIT`（3）。`streak` 为 1 时明明还能再退 2 次才改道，界面却说「还剩 1 轮」——把最后一个安全轮次说没了，用户会以为下一轮就改道，而实际上再退一次仍然留在 S2。改成 `TEST_STALL_MAX - streak`。
+
+  验证：随上一条的 host 断言一并覆盖（第三轮才改道、第二轮之后 streak 为 2 且仍在 S2），472 项全过；`npm test` 十五套全 PASS。版本 0.1.32。
+
 ## 0.1.31
 
 - **G20 判死判据取错字段：签名用 `item.ac`，账本条目字段却是 `id`**：`lib/index.js` 的 `gapSignature` 拼的是 `.map((item) => item.ac + ':' + item.status)`，而账本条目身份是 `id`（`lib/acceptance.js` 的 `evaluate()` 返回体只有 summary/citations/command/exitCode/artifact/version/status/reason，根本没有 `ac`）。签名于是恒为 `undefined:状态`，不含任何 AC 身份，两头都判不准：换一批完全不同的问题只要数量与状态组合相同就算「同一批」（误改道 S1），真在原地打转时状态抖一下签名就变、计数归零（判死永远不到）。

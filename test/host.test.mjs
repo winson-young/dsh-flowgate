@@ -6397,8 +6397,12 @@ async function keepAlive(promise) {
     })
     check('G20 第三轮仍是同一批就改道 S1，而不是让人在同一个循环里烧 token', () => {
       assert.equal(seen[2].stage, 'S1')
-      assert.equal(seen[2].stall.streak, 3)
       assert.deepEqual(seen[2].stall.gaps, ['AC-1'])
+      // 改道后从第一轮重新数起。不重置的话，用户回 S1 改完 scope 再退一次就是 streak = 4，
+      // 立刻又被扔回 S1——补救路径等于只给一次机会。
+      assert.equal(seen[2].stall.streak, 1)
+      assert.equal(seen[2].stall.redirects, 1)
+      assert.equal(typeof seen[2].stall.redirectedAt, 'string')
       // 改道要解冻 scope：否则用户改了文档、S2 仍按旧白名单放行。
       assert.notEqual(seen[2].scope?.frozen, true)
     })

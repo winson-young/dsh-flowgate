@@ -771,6 +771,21 @@ test('换一批缺口、多一条或少一条都重置为第一轮', () => {
   assert.equal(testStall(ledgerOf([['AC-1', 'fail'], ['AC-2', 'fail'], ['AC-3', 'fail']]), second).streak, 1)
 })
 
+test('改了验收办法就是新的一批：procedure 变了不再算原地打转', () => {
+  // 改道 S1 的用意就是「换一种验收办法」，而用户改的往往正是 procedure——id 一个字没变。
+  // 只认 id 的话，改完再退一次又被扔回 S1，补救路径等于没生效。
+  const of = (status, procedure, method = 'integration') => ({ items: [{ id: 'AC-1', status, method, procedure }] })
+  const first = testStall(of('uncovered', '手工在设置页点一遍'), null)
+  assert.equal(first.streak, 1)
+  // 原样重交：还是同一批，继续累加。
+  assert.equal(testStall(of('uncovered', '手工在设置页点一遍'), first).streak, 2)
+  // 换成能量测的办法：新办法值得从头数起。
+  const changed = testStall(of('uncovered', '运行 node scripts/check-settings.mjs 并断言退出码 0'), first)
+  assert.equal(changed.streak, 1)
+  // 方法本身换了也算新的一批：manual 改 integration 是换了验证方式，不是原地不动。
+  assert.equal(testStall(of('uncovered', '运行 node scripts/check-settings.mjs 并断言退出码 0', 'manual'), changed).streak, 1)
+})
+
 test('顺序不参与判定，全部通过时清空记录', () => {
   const first = testStall(ledgerOf([['AC-2', 'fail'], ['AC-1', 'fail']]), null)
   assert.deepEqual(first.gaps, ['AC-1', 'AC-2'])
