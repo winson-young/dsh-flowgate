@@ -1,6 +1,20 @@
 # Changelog
 
-## Unreleased
+## 0.1.31
+
+- **G20 判死判据取错字段：签名用 `item.ac`，账本条目字段却是 `id`**：`lib/index.js` 的 `gapSignature` 拼的是 `.map((item) => item.ac + ':' + item.status)`，而账本条目身份是 `id`（`lib/acceptance.js` 的 `evaluate()` 返回体只有 summary/citations/command/exitCode/artifact/version/status/reason，根本没有 `ac`）。签名于是恒为 `undefined:状态`，不含任何 AC 身份，两头都判不准：换一批完全不同的问题只要数量与状态组合相同就算「同一批」（误改道 S1），真在原地打转时状态抖一下签名就变、计数归零（判死永远不到）。
+
+  改法：删掉 `gapSignature`，新增 `testStall(ledger, previous)`（`lib/acceptance.js`）直接比对**未通过的 AC id 集合**——集合相同才 `streak + 1`，换一批（多/少/换一条）重置为 1，状态抖动不算新缺口，顺序不参与比对，全部通过则清空。阈值 `TEST_STALL_LIMIT = 3`。`rollbackTo` 记 `flow.testStall = { gaps, statuses, streak, at }`，第三次仍是同一批就改道 S1 并解冻 scope。
+
+  顺带修掉两个报告里没提到的真实缺陷：① `view.testStall` 最初落在 `view.doc` 段，界面读不到（`undefined`）——已移到 view 顶层；② 点击侧退回走的是 `rollbackTo(..., 'user', ...)`，reason 是 `'user'` 而不是 `'test-rejected'`，`stage === 'S2' && reason === 'test-rejected'` 的判定永不成立、`testStall` 恒为 null——已按实际阶段推断 reason（`const reason = stage === 'S4' && to !== 'S1' ? 'test-rejected' : 'user'`），并加 `flow.stage === 'S4'` 兜底，调用方少给一次 reason 也不让整条判定失效。
+
+  改道必须可解释可见：退回文案从「用户退回到 S2 修复。」改成「已改道 S1：这些验收标准已连续 3 轮退回仍没通过：AC-1（未覆盖）。改代码这条路走不通，请改验收方案或接受缺口。」，状态码翻成中文（`stallStatusText`）；工作台 S4 门禁卡加 `stallNotice`，给出「还剩 N 轮」的倒计时，最后一轮明说「下一轮退回还是同一批，就会改道 S1 重新调 scope」。
+
+  验证：`test/acceptance.test.mjs` 新增 4 个纯函数用例覆盖判据本身（同一批累加 1→2→3、状态抖动不算新缺口、换一批/多一条/少一条重置为 1、全部通过清空且空账本返回 null），46 项全过；`test/host.test.mjs` 新增 G20 端到端一组 6 条，真实跑三轮退回，断言前两轮留在 S2 且 streak 1→2、第三轮改道 S1 且 scope 未冻结、审计流恰好 1 条 `flow.rollback.redirected`；host 472 项全过；`npm run check` 全绿，`npm test` 十五套全 PASS。版本 0.1.31。
+
+- **退回累计账：`rollbacks` 只增不减，且三处可见**：此前退回次数只留在 `lastRollback` 里（只记最后一次）与审计流里，工作台与 `flowgate_status` 都看不到「这条流程已经退了几次」。现在 `flow.rollbacks = { total, byReason, skipped, last }`：`byReason` 按 `user` / `test-rejected` / `review-rejected` / `scope-commands-missing` 分档，`skipped` 记被幂等拦下的重复退回（不计入 `total`——状态没动，算进去会虚增）。与 `testStall` 分工不同：后者判「是不是在原地打转」、会重置；前者跨回退累积，回 S1 清 scope、清产物也不清零。三处可见：`flowgate_status` 的 `rollbacks` 字段与 summary 一行「本流程已退回 N 次（测试未通过 2 · 评审未通过 1）」、工作台门禁卡的退回说明、全局清单行尾的「退回 N 次」。`repairFlow` 对坏形状按「还没退过」处理。
+
+  验证：`test/acceptance.test.mjs` 新增 4 个纯函数用例（46 项全过）；`test/host.test.mjs` 新增 G20 端到端一组 6 条（真实跑三轮退回，断言 streak 1→2→3、第三轮改道 S1 且 scope 未冻结、审计流恰好 1 条 `flow.rollback.redirected`、`rollbacks.total` 3 且改道不清零、summary 念出「本流程已退回 3 次（测试未通过 3）」、退回文案含「AC-1（未覆盖）」），host 472 项全过；`npm run check` 全绿，`npm test` 十五套全 PASS。版本 0.1.31。
 
 - **G35 回执补齐：`*_run` 与 `flowgate_wait` 的中断分支真正带上 `submitted`**：0.1.29 给 `flowgate_review_run` / `flowgate_test_run` 的 output schema 声明了 `submitted`，描述也写着「等待被中断时返回 `halt` 与 `submitted` 回执」；但四个 `halt` 分支里只有 `waitDocGate`（`lib/index.js:5335`）与 `waitDevGate`（`lib/index.js:5514`）把回执 spread 出去，`waitReviewGate`（`lib/index.js:6341` 起）与 `waitTestGate`（`lib/index.js:6650` 起）的同一分支没有这一行——S3/S4 两个入口中断时永远拿不到回执，schema 里那个字段是空的。`flowgate_wait` 的 output schema 也漏了 `submitted`，而它在 S1/S2 的中断分支同样会返回这个字段，`additionalProperties: false` 会把它挡在输出校验处。改法：两处 `halt` 分支各补 `...(wait.submitted ? { submitted: wait.submitted } : {})`，`flowgate_wait` 的 schema 补 `submitted: SUBMITTED_SCHEMA`。测试：`test/host.test.mjs` 的 S3 专项补「等签收被中断仍带回评审报告回执」，`test/integration.test.mjs` 的被取代用例补回执断言，`test/subagents.test.mjs` 新增「`review_run` 等签收被中断时返回 `submitted`」。
 

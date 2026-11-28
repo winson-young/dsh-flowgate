@@ -6365,4 +6365,78 @@ async function keepAlive(promise) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// G20：判死看的是「这一轮没通过的 AC 集合」，不是 id+状态拼出来的签名。
+// 签名取错字段时两头都判不准：换一批缺口被当成原地打转，同一批状态一抖又数不出来。
+// ---------------------------------------------------------------------------
+{
+  const fx = await provenanceFixture('g20-stall')
+  try {
+    assert.equal((await fx.act('setGateMode', { mode: 'manual' })).status, 200)
+    // 夹具已经走完 S2 门禁，起点就是 S3：每一轮 = 交评审 → 进 S4 → 交测试 → 退回开发。
+    assert.equal((await fx.state()).stage, 'S3')
+    const seen = []
+    for (let round = 1; round <= 3; round += 1) {
+      // 退回 S2 会清掉评审与测试产物，每轮都要重新走一遍 S2 门禁再交报告。
+      if ((await fx.state()).stage === 'S2') await fx.round('flowgate_gate', {}, { decision: 'pass' })
+      await fx.round('flowgate_review', { angles: fx.angles }, { decision: 'pass' })
+      // 点击侧只回执「已落盘」，说明文字在工具侧的返回体里：两处都要看，用户看到的是后者。
+      const pending = fx.px.tool('flowgate_test', { directions: fx.directions })
+      await tick()
+      await fx.act('gate', { decision: 'back', to: 'S2' })
+      const outcome = await pending
+      const view = await fx.state()
+      seen.push({ round, stage: view.stage, stall: view.testStall, scope: view.scope, rollbacks: view.rollbacks, message: String(outcome?.message ?? '') })
+    }
+    check('G20 同一批 AC 连续退回：前两轮留在 S2 并逐轮记账', () => {
+      assert.equal(seen[0].stage, 'S2')
+      assert.deepEqual(seen[0].stall.gaps, ['AC-1'])
+      assert.equal(seen[0].stall.streak, 1)
+      assert.equal(seen[1].stage, 'S2')
+      assert.equal(seen[1].stall.streak, 2)
+    })
+    check('G20 第三轮仍是同一批就改道 S1，而不是让人在同一个循环里烧 token', () => {
+      assert.equal(seen[2].stage, 'S1')
+      assert.equal(seen[2].stall.streak, 3)
+      assert.deepEqual(seen[2].stall.gaps, ['AC-1'])
+      // 改道要解冻 scope：否则用户改了文档、S2 仍按旧白名单放行。
+      assert.notEqual(seen[2].scope?.frozen, true)
+    })
+    check('G20 改道留下了可核对的事件，不是悄悄换阶段', () => {
+      const lines = readFileSync(join(fx.ws, '.dsh-flowgate', 'flows.jsonl'), 'utf8').trim().split('\n')
+      const redirected = lines.map((line) => JSON.parse(line)).filter((entry) => entry.type === 'flow.rollback.redirected')
+      assert.equal(redirected.length, 1)
+      assert.deepEqual(redirected[0].detail.gaps, ['AC-1'])
+      assert.equal(redirected[0].detail.repeats, 3)
+      assert.equal(redirected[0].detail.from, 'S2')
+      assert.equal(redirected[0].detail.to, 'S1')
+    })
+    const stallStatus = await fx.px.tool('flowgate_status', {})
+    check('G20 退回累计账只增不减，改道也不清零', () => {
+      assert.equal(seen[0].rollbacks.total, 1)
+      assert.equal(seen[2].rollbacks.total, 3)
+      assert.equal(seen[2].rollbacks.byReason['test-rejected'], 3)
+      // 第三轮改道 S1：to 记最终落点，reason 仍是被退回的真实原因。
+      assert.equal(seen[2].rollbacks.last.to, 'S1')
+      assert.equal(seen[2].rollbacks.last.reason, 'test-rejected')
+      // 幂等拦下的重复退回不计入 total：状态没动，算进去会虚增次数。
+      assert.equal(seen[2].rollbacks.skipped, 0)
+    })
+    check('G20 状态摘要念出退回次数，接手的人不用翻审计才知道这条流程耗了多少轮', () => {
+      assert.match(stallStatus.summary, /本流程已退回 3 次/)
+      assert.match(stallStatus.summary, /测试未通过 3/)
+      assert.equal(stallStatus.rollbacks.total, 3)
+    })
+    check('G20 改道后的退回说明念清卡在哪几条 AC，而不是只说「已退回」', () => {
+      const last = seen[2].message
+      assert.match(last, /已改道 S1/)
+      assert.match(last, /AC-1/)
+      // 状态要给用户看得懂的字，不是把 uncovered 原样丢出来。
+      assert.match(last, /AC-1（未覆盖）/)
+      // 第二轮的说明还在「退回 S2 修复」阶段，也要说清卡的是哪条。
+      assert.match(seen[1].message, /AC-1（未覆盖）/)
+    })
+  } finally { rmSync(fx.ws, { recursive: true, force: true }) }
+}
+
 console.log('\n全部通过：' + passed.length + ' 项')

@@ -255,9 +255,19 @@ S3 与 S4 的「更多操作」里都有「回到需求分析调整 scope」，�
 
 ## 打回预算
 
-S4 退回只有 S2 一个目标，所以「AC 本身测不了」的缺口回 S2 改代码永远修不好。同一批 AC 以同样状态连续退回超过 2 次时，`rollbackTo` 把目标改成 S1（写 `flow.rollback.redirected` 事件）：要么改 scope 换验证方式，要么显式接受缺口。
+S4 退回只有 S2 一个目标，所以「AC 本身测不了」的缺口回 S2 改代码永远修不好。同一批 AC 连续退回 3 次（`TEST_STALL_LIMIT`）时，`rollbackTo` 把目标改成 S1（写 `flow.rollback.redirected` 事件）：要么改 scope 换验证方式，要么显式接受缺口。
 
-缺口指纹是「未通过且未标 excluded 的 AC + 状态」排序后拼接，所以真改了代码、状态变了，指纹就变，预算重新计数。
+判据是**未通过的 AC id 集合**，不是「id + 状态」拼出来的签名（`lib/acceptance.js` 的 `testStall`）。id 集合相同才累加，换一批（多一条、少一条、换一条）就重置为 1；状态抖动（`fail` → `uncovered`）不算新缺口；顺序不参与比对。写成「id + 状态」两头都判不准：换一批不同的问题只要数量与状态组合相同就被当成原地打转，真在原地打转时状态一变又数不出来。
+
+改道必须可见：退回文案念出「卡在哪几条 AC、各是什么状态、连续几轮」，工作台门禁卡给出「还剩 N 轮」的倒计时，最后一轮明说「下一轮退回还是同一批就会改道 S1」。
+
+## 退回累计账
+
+`flow.rollbacks` 记「这条流程一共被退回几次」：`{ total, byReason, skipped, last }`。与 `testStall` 分工不同——`testStall` 判「是不是在原地打转」，会重置也会清零；`rollbacks` 只增不减，跨回退累积，回到 S1 清 scope、清产物也不清零，因为「被退回几次」是流程级事实。
+
+`byReason` 按 `user` / `test-rejected` / `review-rejected` / `scope-commands-missing` 分档；被幂等拦下的重复退回（10 秒内同目标同原因）不计入 `total`，只累加 `skipped`——状态没动，算进去会虚增次数。
+
+三处可见：`flowgate_status` 的 `rollbacks` 字段与 summary 一行「本流程已退回 N 次（测试未通过 2 · 评审未通过 1）」、工作台门禁卡的退回说明、全局清单行尾的「退回 N 次」。流程结束后仍保留，复盘时比只看当前阶段有用。
 
 ## 左侧栏面板（先选工作区）
 

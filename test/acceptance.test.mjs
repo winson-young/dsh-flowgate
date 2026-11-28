@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { normalizeCriteria, acceptanceLedger, grillReadiness, remediationList, scopeReadiness, stageSummary } from '../lib/acceptance.js'
+import { normalizeCriteria, acceptanceLedger, grillReadiness, remediationList, scopeReadiness, stageSummary, testStall, TEST_STALL_LIMIT } from '../lib/acceptance.js'
 import { BROAD_COMMAND, INLINE_EXEC, PARSE_ONLY, READONLY_VERSION, TEST_COMMAND, ecosystemsFor, needsOf, resolveExecutable } from '../lib/ecosystems.js'
 import { join } from 'node:path'
 
@@ -736,3 +736,48 @@ test('任务 ID 不代表完成，开发提交与流程取消也不能变成执�
     assert.equal(stageSummary(flow, acceptanceLedger(flow, snapshot)).execution.status, status)
   }
 })
+
+// G20：判据是「这一轮没通过的 AC 集合」，不是「AC + 状态」拼出来的签名。
+// 签名取错字段的后果是两头都判不准：换一批缺口被当成原地打转，同一批状态一抖又数不出来。
+const ledgerOf = (pairs) => ({ items: pairs.map(([id, status]) => ({ id, status })) })
+
+test('同一批缺口连续退回才累加，换一批就重数', () => {
+  const first = testStall(ledgerOf([['AC-1', 'fail'], ['AC-2', 'uncovered']]), null)
+  assert.deepEqual(first.gaps, ['AC-1', 'AC-2'])
+  assert.deepEqual(first.statuses, { 'AC-1': 'fail', 'AC-2': 'uncovered' })
+  assert.equal(first.streak, 1)
+  const second = testStall(ledgerOf([['AC-1', 'fail'], ['AC-2', 'uncovered']]), first)
+  assert.equal(second.streak, 2)
+  const third = testStall(ledgerOf([['AC-1', 'fail'], ['AC-2', 'uncovered']]), second)
+  assert.equal(third.streak, 3)
+  assert.equal(third.streak >= TEST_STALL_LIMIT, true)
+})
+
+test('状态抖一下不算新缺口：同一批 AC 仍继续累加', () => {
+  // 早先按「id + 状态」拼签名，fail 变 uncovered 就整批换新，计数被洗回 1，判死永远到不了。
+  const first = testStall(ledgerOf([['AC-1', 'fail'], ['AC-2', 'fail']]), null)
+  const second = testStall(ledgerOf([['AC-1', 'uncovered'], ['AC-2', 'fail']]), first)
+  assert.equal(second.streak, 2)
+  assert.deepEqual(second.statuses, { 'AC-1': 'uncovered', 'AC-2': 'fail' })
+})
+
+test('换一批缺口、多一条或少一条都重置为第一轮', () => {
+  const first = testStall(ledgerOf([['AC-1', 'fail'], ['AC-2', 'fail']]), null)
+  const second = testStall(ledgerOf([['AC-1', 'fail'], ['AC-2', 'fail']]), first)
+  assert.equal(second.streak, 2)
+  // 修好一条、换出另一条：这是进展，不是原地打转。
+  assert.equal(testStall(ledgerOf([['AC-1', 'fail'], ['AC-3', 'fail']]), second).streak, 1)
+  assert.equal(testStall(ledgerOf([['AC-1', 'fail']]), second).streak, 1)
+  assert.equal(testStall(ledgerOf([['AC-1', 'fail'], ['AC-2', 'fail'], ['AC-3', 'fail']]), second).streak, 1)
+})
+
+test('顺序不参与判定，全部通过时清空记录', () => {
+  const first = testStall(ledgerOf([['AC-2', 'fail'], ['AC-1', 'fail']]), null)
+  assert.deepEqual(first.gaps, ['AC-1', 'AC-2'])
+  assert.equal(testStall(ledgerOf([['AC-1', 'fail'], ['AC-2', 'fail']]), first).streak, 2)
+  assert.equal(testStall(ledgerOf([['AC-1', 'pass'], ['AC-2', 'pass']]), first), null)
+  // 缺口条目的 id 缺失时不该造出一个空身份：它既不能比也不能念。
+  assert.equal(testStall(ledgerOf([['', 'fail']]), null), null)
+  assert.equal(testStall(null, first), null)
+})
+
