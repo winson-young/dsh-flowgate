@@ -2257,12 +2257,45 @@ const HubPanelIcon = componentOf('sidebar.panellist')
     const text = flat(tree)
     assert.ok(text.includes('宿主重启过：门禁仍在等待'), text)
     assert.ok(text.includes('gate_ab12cd34'), '要点名门禁 id：' + text)
-    assert.ok(text.includes('不会叫醒 Agent'), '必须说清点按钮叫不醒 Agent：' + text)
+    // 按钮确实会补发一条消息（applyAction 里 gateOutcome.delivered 为假时 wakeAfterGate），
+    // 所以文案要说清「点了有效、消息会排队」，而不是让人以为必须回对话里再说一句。
+    assert.ok(text.includes('现在点按钮仍然有效'), '要说清点按钮仍然有效：' + text)
+    assert.ok(text.includes('排在这一轮结束后送到'), '要说清消息会排队：' + text)
+    assert.equal(text.includes('不会叫醒 Agent'), false, '不能再声称按钮叫不醒 Agent')
     assert.equal(text.includes('上次的门禁请求被中断'), false, '知道来路时不该退回旧文案')
     await click(buttonByText(tree, '完成开发'))
     assert.equal(posted.at(-1).action, 'gate')
     assert.equal(posted.at(-1).payload.decision, 'pass')
+    assert.ok(flat(renderer.toJSON()).includes('决定已生效'), '中断场景点完同样要给回音')
   })
+}
+
+// 点完按钮必须有回音：等待器还在时说「直接收到」，已经没了时说「消息会排队」。
+// 以前两种情况点完都没有任何反馈，用户只能猜按钮是不是失效了。
+{
+  for (const [waiting, want] of [
+    [true, '已经直接收到'],
+    [false, '排在这一轮结束后送到'],
+  ]) {
+    posted = []
+    currentView = baseView('S2', {
+      devChanges: { files: ['src/auth/session.ts'], added: 42, removed: 7, at: '2026-11-17T09:40:00Z' },
+      gate: { pending: true, interrupted: false, waitReason: null },
+      gateWait: { minutes: 10, min: 1, max: 60, fallback: 10, file: '.dsh-flowgate/config.json' },
+      waiting,
+      waitingKind: waiting ? 'gate' : null,
+    })
+    const renderer = await render(FlowDetail, {})
+    await check('门禁按钮点完给回音：' + (waiting ? '有人等' : '没人在等'), async () => {
+      const tree = renderer.toJSON()
+      assert.equal(flat(tree).includes('决定已生效'), false, '点之前不该有回音')
+      await click(buttonByText(tree, '完成开发'))
+      const after = flat(renderer.toJSON())
+      assert.ok(after.includes('决定已生效'), after)
+      assert.ok(after.includes(want), '要说清消息去哪了：' + after)
+      assert.equal(after.includes('不会叫醒 Agent'), false, after)
+    })
+  }
 }
 
 {

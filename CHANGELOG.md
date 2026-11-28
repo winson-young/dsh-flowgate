@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **G35 门禁被中断后，Agent 分不清「没提交」和「提交了但没人点」**：Agent 交完评审报告就停下等用户点按钮。这次等待被中断（工具调用超时、宿主重启）时，插件返回的那句话只说「门禁请求被中断了，现在停下来等确认」，从不提「报告已经存好了」——Agent 于是以为没交上，重跑一遍评审：新一轮报告是整体赋值，上一轮的结论被覆盖，还白烧一轮 token；而用户此时点按钮，因为 Agent 正忙，消息只能排进队列，界面上表现为「排队发送」，看起来像按钮失效。
+
+  改法是一条原则：**交件与等签收是两件事，中断只中断后者**。① 中断返回值带提交回执：`gateWaitPayload(outcome, submission)` 新增 `submitted`（`{ kind, label, id, detail }`），四个门禁工具（`flowgate_doc` / `flowgate_gate` / `flowgate_review` / `flowgate_test`）各自传入「这份产物是什么、它的 id、以及一句结果摘要」，中断提示由 `submissionSentence` 拼出「本阶段的X已经提交并保存（id …）……这次不需要重新提交，也不要再调用 flowgate_xxx——重跑会覆盖这份产物，并白烧一轮」。② 中断不再复用「等」这个决策：`decision` 从 `'wait'` / `'pending'` 两种说法统一成 `'halt'`（必须停、不要重试），四个 output schema 的 `decision` 补上 description 说明 `'halt'` 的含义与「不要重新提交」，消除 Agent 的「这次没成功」的解释空间。③ 提交幂等：`flowgate_review` / `flowgate_test` 在写盘前比对上一份产物（`sameSubmission`），内容完全相同就直接返回「已经提交过、本次没有重复提交也没有覆盖」，不再整体覆盖。④ 用户侧：门禁卡与快捷入口点完给一句回音——「决定已生效，Agent 正在等这条门禁，已经直接收到」或「决定已生效，Agent 正在运行，消息排在这一轮结束后送到」；中断场景的说明也从「现在点按钮只会记录决定，不会叫醒 Agent」改成「现在点按钮仍然有效」，因为 `applyAction` 在 `delivered` 为假时本来就会补发一条消息，旧文案把一个有效动作说成了无效。⑤ `flowgate_status` 的 summary 补一行「本阶段产物」，让人不看门禁卡也知道东西已经交上来了。
+
+  防线：`test/host.test.mjs` 的 8 处断言从 `'wait'` / `'pending'` 改为 `'halt'`，中断用例新增「文案里有『已经提交并保存』『不要再调用 flowgate_doc』」与 `submitted.kind === 'doc'`；`test/integration.test.mjs` 的取代用例同步；`test/client.test.mjs` 新增「门禁按钮点完给回音」两组（有人等 / 没人在等）与中断场景回音断言，并把 G40 用例里「不会叫醒 Agent」的断言反转为「现在点按钮仍然有效」+「排在这一轮结束后送到」。
+
+  验证：`node scripts/run-tests.mjs` 十五套全 PASS、退出码 0（host 457 项、client 255 项）；`npm run check` 全绿。版本 0.1.26。
+
 - **G41 补命令退回 S1 只说了「补了哪几条」，没说「拿什么证明它该在清单里」**：用户在门禁上点「补进清单」之后，流程退回 S1，Agent 拿到的只是「用户补了这几条命令」。它有两种同样省事的走法：把命令塞进 `scope.commands` 就交回来，或者干脆不交、等用户自己再点一次。前一种让一份没人验证过的授权直接冻结——命令进了清单，却没有任何验收标准说明它证明哪一条，等于用户批准了一条「跑起来也不知道算不算过」的命令；后一种让用户卡在 S1 上反复点。两头都不是「用户做的决定被认真对待」，而是「决定被当成了一个字段」。
 
   改法是一条原则：**补录只给入场券，入场要举证**。① 补录时把这批命令记成申请单 `flow.scopeRequests`（命令原文、被拒阶段、当时的现场、被拒原因、时间），S1 的文档卡之前摆出这张单子，写清「每条都要有验收标准在 `verification.commands` 里引用它——没人作证这份 scope 批不了，悄悄删掉同样批不了」。② 举证要求不另造字段：AC 的 `verification.commands` 本来就是「这条命令证明哪条验收标准」的唯一出处，`scopeReadiness` 新增 `supplementedCommands` 输入，补进来却没有 unit / integration 验收标准引用它，就在提交时直接拒绝（`没有任何 unit / integration 验收标准在 verification.commands 里引用它们`），并逐条列出没人作证的命令。③ 撤销补录只能由用户做：重新提交时把补录命令从清单里静默删掉会被拒（`补进清单的命令在新提交里不见了`）——补录是用户在门禁上做过的决定，Agent 替用户抹掉它，事后从记录里看不出来。④ 申请单有明确的作用期：`revise` 清空（用户改的是需求本身，范围要重新谈）、冻结成功后清空，这次补录以 `supplemented` 记进 `scope.frozen` 事件，事后可查。⑤ 三个门禁工具拿到 `scope-reopened` 时返回同一套说明（`reopenedMessage`）：先讲用户补了哪几条，再讲「本阶段的门禁与产物作废，现在停下来」，最后讲清每条补录命令都要写进对应 AC 的 `verification.commands`、原样删掉同样批不了。⑥ 自动模式不是「补录免检」：没人作证时 `scopeReadiness` 在补录当场就报缺口，scope 不会自动冻结。

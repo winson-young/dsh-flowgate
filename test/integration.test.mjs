@@ -744,7 +744,7 @@ await check('评审阻塞时仅允许当前报告的显式风险接受进入 S4'
   await tick()
   const fresh = await getState()
   assert.notEqual(fresh.review.id, mid.review.id, '重交报告应更新例外绑定目标')
-  assert.equal((await pending).decision, 'wait', '旧评审等待器已被新报告取代')
+  assert.equal((await pending).decision, 'halt', '旧评审等待器已被新报告取代')
   const beforeReplay = eventCount()
   const replay = await post({ sessionId: SESSION, action: 'gate', payload: { decision: 'accept-risk', reviewId: mid.review.id, riskReason: '旧理由' } })
   assert.equal(replay.status, 409, '旧报告 id 不得沿用')

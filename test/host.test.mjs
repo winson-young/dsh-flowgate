@@ -1980,10 +1980,12 @@ rmSync(cwd, { recursive: true, force: true })
   })
   controller.abort()
   const interrupted = await pending
-  check('调用中断后工具返回 pending 而不是 timeout，文档保留', () => {
-    assert.equal(interrupted.decision, 'pending')
+  check('调用中断后工具返回 halt 而不是 timeout，并说清文档已保存、不要重提', () => {
+    assert.equal(interrupted.decision, 'halt')
     assert.equal(interrupted.frozen, false)
-    assert.match(interrupted.message, /已保留/)
+    assert.match(interrupted.message, /已经提交并保存/)
+    assert.match(interrupted.message, /不要再调用 flowgate_doc/)
+    assert.equal(interrupted.submitted.kind, 'doc')
   })
   const after = await cx.request('/api/flowgate/state?sessionId=sess-resume')
   check('中断后仍停在 S1 待批准，并标记确认入口曾中断', () => {
@@ -2070,8 +2072,8 @@ rmSync(cwd, { recursive: true, force: true })
   const fresh = cx.tool('flowgate_doc', { html: '<html><body><p>新</p></body></html>', scope }, { signal: freshSignal.signal })
   await tick()
   const staleResult = await stale
-  check('新门禁取代旧门禁时旧调用返回 pending', () => {
-    assert.equal(staleResult.decision, 'pending')
+  check('新门禁取代旧门禁时旧调用返回 halt', () => {
+    assert.equal(staleResult.decision, 'halt')
   })
   // 修复前：旧 signal 的 abort 回调会删掉「当前」等待器，后一次调用永远不结算。
   staleSignal.abort()
@@ -2113,8 +2115,8 @@ rmSync(cwd, { recursive: true, force: true })
   await tick()
   gateSignal.abort()
   const waited = await gateCall
-  check('门禁调用中断后返回 wait，并且明确要求 Agent 停下来等确认', () => {
-    assert.equal(waited.decision, 'wait')
+  check('门禁调用中断后返回 halt，并且明确要求 Agent 停下来等确认', () => {
+    assert.equal(waited.decision, 'halt')
     // 按钮仍然可点是为了不剥夺用户确认的权利；Agent 不能因此自己往下做。
     assert.match(waited.message, /停下来等确认/)
     assert.match(waited.message, /不要继续做后续阶段的工作/)
@@ -2324,10 +2326,7 @@ rmSync(cwd, { recursive: true, force: true })
   docSignal.abort()
   const waited = await docCall
   check('修改需求前文档工具已中断，停在等待状态', () => {
-    assert.ok(
-      ['wait', 'pending'].includes(waited.decision),
-      '文档工具中断后应返回等待状态，实际：' + waited.decision,
-    )
+    assert.equal(waited.decision, 'halt', '文档工具中断后应返回 halt，实际：' + waited.decision)
   })
   const revised = await cx.request('/api/flowgate/action', {
     sessionId: 'sess-revise',
@@ -5532,8 +5531,8 @@ async function keepAlive(promise) {
       assert.ok(statusDuring.summary.includes('门禁等待：id ' + during.id), statusDuring.summary)
     })
     const outcome = await keepAlive(pendingDoc)
-    check('G40-2 等满上限返回等待态而不是报错，并说清点按钮不会唤醒 Agent', () => {
-      assert.equal(outcome.decision, 'pending')
+    check('G40-2 等满上限返回 halt 而不是报错，并说清点按钮不会唤醒 Agent', () => {
+      assert.equal(outcome.decision, 'halt')
       assert.equal(outcome.waitReason, 'timeout')
       assert.equal(outcome.willWake, false)
       assert.equal(outcome.gateId, during.id)
@@ -5837,7 +5836,7 @@ async function keepAlive(promise) {
     await tick()
     const firstResult = await keepAlive(first)
     check('G40-20 宿主路径被取代：旧调用报自己的 gateId，不是盘上取代者的', () => {
-      assert.equal(firstResult.decision, 'pending')
+      assert.equal(firstResult.decision, 'halt')
       assert.equal(firstResult.waitReason, 'superseded')
       assert.equal(firstResult.willWake, false, '这次等待已收尾：等待器即使挂着也属于取代者')
       assert.match(firstResult.gateId, /^gate_[0-9a-f]{8}$/)
@@ -6055,8 +6054,8 @@ async function keepAlive(promise) {
     const docCall = cx.tool('flowgate_doc', { html: '<p>需求</p>', scope: attested })
     await tick()
     const firstResult = await keepAlive(firstDoc)
-    check('G41-4 重新提交取代上一次挂着的等待，旧调用拿到 pending 而不是某个决策', () => {
-      assert.equal(firstResult.decision, 'pending')
+    check('G41-4 重新提交取代上一次挂着的等待，旧调用拿到 halt 而不是某个决策', () => {
+      assert.equal(firstResult.decision, 'halt')
       assert.equal(firstResult.waitReason, 'superseded')
     })
     const view = await cx.request('/api/flowgate/state?sessionId=' + sid)
