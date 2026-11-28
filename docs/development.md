@@ -353,9 +353,9 @@ S4 退回只有 S2 一个目标，所以「AC 本身测不了」的缺口回 S2 
 | `flowgate_doc` | 提交需求 HTML、scope 和档位建议，交件立即返回；`commands` 要从项目里读出来并配 `command_sources` |
 | `flowgate_gate` | 提交 S2 开发摘要，交件立即返回；S3 / S4 的产物分别由 `flowgate_review` / `flowgate_test` 交件 |
 | `flowgate_wait` | 等签收：挂起直到用户确认、退回、跳过或放弃，中断时返回 `halt` 与提交回执 |
-| `flowgate_review_run` | 宿主按评审角度启动只读子代理并汇总报告 |
+| `flowgate_review_run` | 宿主按评审角度启动只读子代理并汇总报告，交件立即返回 |
 | `flowgate_review` | 当前 Agent 提交结构化评审报告，交件立即返回 |
-| `flowgate_test_run` | 宿主按测试方向启动子代理并汇总结果 |
+| `flowgate_test_run` | 宿主按测试方向启动子代理并汇总结果，交件立即返回 |
 | `flowgate_test` | 当前 Agent 提交结构化测试报告，交件立即返回 |
 | `flowgate_cancel` | 放弃流程、解冻 scope、记录事件并通知当前等待门禁 |
 

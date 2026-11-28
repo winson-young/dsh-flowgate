@@ -1,6 +1,6 @@
 {
   "name": "dsh-flowgate",
-  "version": "0.1.27",
+  "version": "0.1.28",
   "description": "四阶段流程约束开发工作台：需求分析 → 开发 → 评审 → 测试，以代码级门禁控制阶段流转",
   "type": "module",
   "main": "lib/index.js",
