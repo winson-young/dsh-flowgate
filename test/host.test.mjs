@@ -1452,7 +1452,8 @@ check('PRD 4.5 未知规则 id 被拒绝', () => assert.equal(unknownRule.status
   const unchanged = await uiCtx.request('/api/flowgate/state?sessionId=sess-ui')
   check('界面重复启动明确拒绝，原流程和档位保留', () => {
     assert.equal(again.status, 409)
-    assert.match(again.body.error, /已有流程在进行/)
+    // 判据是「这个会话」有没有在跑，不是「这个目录」：同目录别的会话不挡这一条。
+    assert.match(again.body.error, /当前会话已经有一条进行中的流程/)
     assert.equal(unchanged.body.id, started.body.id)
     assert.equal(unchanged.body.preset, 'fast')
   })
@@ -3193,7 +3194,7 @@ for (const [kind, reason, expected] of [
       // 需求整理稿已废弃：快照里不能再带这个字段，需求依据只有 brief。
       assert.equal('summary' in started.body, false)
       assert.equal(duplicate.status, 409)
-      assert.match(duplicate.body.error, /已有流程在进行/)
+      assert.match(duplicate.body.error, /当前会话已经有一条进行中的流程/)
       assert.equal(afterDuplicate.body.id, started.body.id)
       assert.equal(afterDuplicate.body.brief, brief)
       assert.equal('summary' in afterDuplicate.body, false)
@@ -4471,60 +4472,137 @@ for (const [kind, reason, expected] of [
   }
 }
 
-// 工作区提示与启动限制共用同一条活动流程，冷恢复后也必须成立。
+// 工作区提示只说明「这个目录里还有谁在做流程」：自己的流程看会话身份，
+// 邻居只做提示，既不挡启动也不接管门禁（G07/G09）。
 {
   const ws = mkdtempSync(join(tmpdir(), 'flowgate-共享 工作区-'))
   const services = { sessions: { get: (id) => ({ header: { id, cwd: id === 'nested' ? join(ws, 'nested') : id === 'outside' ? join(ws, '..', 'other-workspace') : id === 'case-alias' ? ws.toUpperCase() : ws } }) } }
   const state = (host, id) => host.request('/api/flowgate/state?sessionId=' + id)
   try {
     const first = makeHost(ws, 'owner', { services })
-    assert.equal((await state(first, 'sibling')).body.workspace.flow, null)
+    const idle = (await state(first, 'sibling')).body.workspace
+    assert.equal(idle.flow, null)
+    assert.deepEqual(idle.neighbors, [])
     await first.tool('flowgate_start', { title: '共享提示' })
     const shared = (await state(first, 'sibling')).body
-    check('同工作区无流程会话也读取活动流程的阶段摘要', () => {
+    check('同目录邻居的流程只出现在 neighbors 里，不冒充本会话的流程', () => {
       assert.equal(shared.active, false)
-      assert.equal(shared.workspace.active, true)
-      assert.equal(shared.workspace.flow.sessionId, 'owner')
-      assert.equal(shared.workspace.flow.stage, 'S1')
-      assert.equal(shared.workspace.flow.stageIndex, 0)
+      // 判据是会话：别人的流程不能变成「你现在的阶段」，否则界面会拿它渲染提示与按钮。
+      assert.equal(shared.workspace.active, false)
+      assert.equal(shared.workspace.flow, null)
+      assert.equal(shared.workspace.neighbors.length, 1)
+      assert.equal(shared.workspace.neighbors[0].sessionId, 'owner')
+      assert.equal(shared.workspace.neighbors[0].stage, 'S1')
+      assert.equal(shared.workspace.neighbors[0].stageIndex, 0)
     })
-    if (process.platform === 'win32') {
-      const alias = (await state(first, 'case-alias')).body.workspace
-      const rejected = await first.request('/api/flowgate/action', { sessionId: 'case-alias', action: 'start', payload: { title: '不得替换原流程' } })
-      const owner = (await state(first, 'owner')).body
-      check('Windows 工作区路径仅大小写不同时共享提示并拒绝第二条，原流程保持不变', () => {
-        assert.equal(alias.flow.sessionId, 'owner')
-        assert.equal(rejected.status, 409)
-        assert.match(rejected.body.error, /已有流程在进行.*先结束或放弃/)
-        assert.equal(owner.title, '共享提示')
-        assert.equal(owner.workspace.flow.sessionId, 'owner')
-        assert.equal(owner.stage, 'S1')
-      })
-    }
+    const own = (await state(first, 'owner')).body.workspace
+    check('自己的流程仍然按会话取，且不把自己算成邻居', () => {
+      assert.equal(own.active, true)
+      assert.equal(own.flow.sessionId, 'owner')
+      assert.deepEqual(own.neighbors, [])
+    })
     const nested = (await state(first, 'nested')).body.workspace
     const outside = (await state(first, 'outside')).body.workspace
-    check('工作区精确隔离，子目录和相邻工作区不显示父工作区提示', () => {
+    check('工作区精确隔离，子目录和相邻工作区看不到父工作区的邻居', () => {
       assert.equal(nested.flow, null)
+      assert.deepEqual(nested.neighbors, [])
       assert.equal(outside.flow, null)
+      assert.deepEqual(outside.neighbors, [])
     })
     const restored = makeHost(ws, 'owner', { services })
     const cold = await state(restored, 'sibling')
-    const duplicate = await restored.request('/api/flowgate/action', { sessionId: 'sibling', action: 'start', payload: {} })
-    check('宿主冷恢复后其他会话仍显示活动流程并拒绝第二条流程', () => {
-      assert.equal(cold.body.workspace.flow.sessionId, 'owner')
-      assert.equal(duplicate.status, 409)
-      assert.match(duplicate.body.error, /已有流程在进行.*先结束或放弃/)
+    check('宿主冷恢复后邻居提示仍在，但不挡这个会话启动自己的流程', () => {
+      assert.equal(cold.body.workspace.neighbors[0].sessionId, 'owner')
+      assert.equal(cold.body.workspace.flow, null)
     })
-    await restored.tool('flowgate_cancel', {})
-    assert.equal((await state(restored, 'sibling')).body.workspace.flow, null)
-    const next = await restored.request('/api/flowgate/action', { sessionId: 'sibling', action: 'start', payload: {} })
-    const history = (await state(restored, 'owner')).body
-    check('放弃后可启动新流程，历史会话的结束状态不遮住工作区活动摘要', () => {
+    const next = await restored.request('/api/flowgate/action', { sessionId: 'sibling', action: 'start', payload: { title: '同目录第二条' } })
+    const ownerAfter = (await state(restored, 'owner')).body
+    const siblingAfter = (await state(restored, 'sibling')).body
+    check('同目录另一个会话可以有自己的流程，两条互不顶替', () => {
       assert.equal(next.status, 200)
-      assert.equal(history.cancelled, true)
-      assert.equal(history.workspace.flow.sessionId, 'sibling')
+      assert.equal(ownerAfter.id !== next.body.id, true)
+      assert.equal(ownerAfter.workspace.flow.sessionId, 'owner')
+      assert.equal(ownerAfter.title, '共享提示')
+      assert.equal(siblingAfter.workspace.flow.sessionId, 'sibling')
+      assert.equal(siblingAfter.workspace.neighbors.length, 1)
+      assert.equal(siblingAfter.workspace.neighbors[0].sessionId, 'owner')
     })
+    const duplicate = await restored.request('/api/flowgate/action', { sessionId: 'sibling', action: 'start', payload: {} })
+    check('同一会话再启动仍被拒绝，拒绝理由说的是这个会话', () => {
+      assert.equal(duplicate.status, 409)
+      assert.match(duplicate.body.error, /当前会话已经有一条进行中的流程.*先结束或放弃/)
+    })
+    await restored.request('/api/flowgate/action', { sessionId: 'owner', action: 'cancel', payload: {} })
+    const afterCancel = (await state(restored, 'sibling')).body.workspace
+    check('邻居放弃后提示消失，自己的流程不受影响', () => {
+      assert.deepEqual(afterCancel.neighbors, [])
+      assert.equal(afterCancel.flow.sessionId, 'sibling')
+    })
+    if (process.platform === 'win32') {
+      // 路径大小写只是同一目录的别名：它影响「东西放哪」，不影响「这条流程属于谁」。
+      const alias = await restored.request('/api/flowgate/action', { sessionId: 'case-alias', action: 'start', payload: { title: '大小写别名' } })
+      const owner = (await state(restored, 'owner')).body
+      const aliased = (await state(restored, 'case-alias')).body
+      check('Windows 路径仅大小写不同时仍是同一目录，但流程归属按会话各算各的', () => {
+        assert.equal(alias.status, 200)
+        assert.equal(aliased.workspace.flow.sessionId, 'case-alias')
+        assert.equal(aliased.workspace.neighbors.length, 1)
+        assert.equal(aliased.workspace.neighbors[0].sessionId, 'sibling')
+        assert.equal(owner.cancelled, true)
+      })
+    }
     await restored.request('/api/flowgate/action', { sessionId: 'sibling', action: 'cancel', payload: {} })
+  } finally {
+    rmSync(ws, { recursive: true, force: true })
+  }
+}
+
+// G09：历史详情必须按流程自己的 id 取。同一个会话开了新流程之后，
+// 再按 sessionId 问只会拿到新的那条——用户以为在翻旧账，看的却是今天的。
+{
+  const ws = mkdtempSync(join(tmpdir(), 'flowgate-历史详情-'))
+  const host = makeHost(ws, 'hist')
+  try {
+    await host.tool('flowgate_start', { title: '第一条', preset: 'fast' })
+    const first = (await host.request('/api/flowgate/state?sessionId=hist')).body
+    await host.tool('flowgate_cancel', { reason: '腾出位置开第二条' })
+    await host.tool('flowgate_start', { title: '第二条', preset: 'strict' })
+    const second = (await host.request('/api/flowgate/state?sessionId=hist')).body
+    const current = (await host.request('/api/flowgate/state?sessionId=hist')).body
+    const history = await host.request('/api/flowgate/state?sessionId=hist&flowId=' + encodeURIComponent(first.id) + '&cwd=' + encodeURIComponent(ws))
+    const missing = await host.request('/api/flowgate/state?sessionId=hist&flowId=f_不存在&cwd=' + encodeURIComponent(ws))
+    check('同会话换新流程后，按 flowId 仍然取得到当初那条', () => {
+      assert.notEqual(first.id, second.id)
+      // 不带 flowId 时只能拿到当前这条：这正是「用错键」的表现。
+      assert.equal(current.id, second.id)
+      assert.equal(history.status, 200)
+      assert.equal(history.body.id, first.id)
+      assert.equal(history.body.title, '第一条')
+      assert.equal(history.body.cancelled, true)
+      assert.equal(history.body.preset, 'fast')
+    })
+    check('历史视图不借用当前会话的等待器与门禁', () => {
+      // 历史快照不绑活会话：没有等待器，也就没有「门禁还在等你点」这种说法。
+      assert.equal(history.body.waiting, false)
+      assert.equal(history.body.waitingKind, null)
+      assert.equal(history.body.gate.pending, false)
+      assert.equal(history.body.doc.interrupted, false)
+      assert.equal(history.body.activity, null)
+      assert.equal(history.body.nudge, null)
+    })
+    check('找不到这条流程时明确报找不到，不退回当前流程', () => {
+      assert.equal(missing.status, 404)
+      assert.match(missing.body.error, /找不到这条流程/)
+    })
+    // 结束的流程仍然读得到：历史详情看的本来就是已经收尾的那条。
+    await host.tool('flowgate_cancel', { reason: '收尾' })
+    const archived = await host.request('/api/flowgate/state?sessionId=hist&flowId=' + encodeURIComponent(second.id) + '&cwd=' + encodeURIComponent(ws))
+    check('已结束的流程仍可按 flowId 取回，且不带可操作门禁', () => {
+      assert.equal(archived.status, 200)
+      assert.equal(archived.body.id, second.id)
+      assert.equal(archived.body.finished, true)
+      assert.equal(archived.body.waiting, false)
+    })
   } finally {
     rmSync(ws, { recursive: true, force: true })
   }

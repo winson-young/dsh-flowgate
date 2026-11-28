@@ -273,20 +273,27 @@ await check('flowgate_start 启动流程并进入 S1', async () => {
   assert.match((await call('flowgate_status', {})).summary, /集成工作区规则 S1/)
 })
 
-await check('工作区所有会话读取同一条流程，工具与界面均拒绝重复启动', async () => {
+await check('流程归属按会话判定：同目录的邻居只作提示，不冒充本会话的流程', async () => {
   const sibling = await getState('sess-other')
   assert.equal(sibling.active, false)
-  assert.equal(sibling.workspace.active, true)
-  assert.equal(sibling.workspace.flow.sessionId, SESSION)
-  assert.equal(sibling.workspace.flow.stage, 'S1')
-  assert.equal(sibling.workspace.flow.stageIndex, 0)
-  await assert.rejects(call('flowgate_start', {}, 'sess-other'), /已有流程在进行/)
-  await assert.rejects(call('flowgate_start', {}), /已有流程在进行/)
-  const rejected = await post({ sessionId: 'sess-other', action: 'start', payload: {} })
+  // 判据是会话：别人在跑不代表「你现在处于 S1」，界面不能拿它渲染阶段与按钮。
+  assert.equal(sibling.workspace.active, false)
+  assert.equal(sibling.workspace.flow, null)
+  assert.equal(sibling.workspace.neighbors.length, 1)
+  assert.equal(sibling.workspace.neighbors[0].sessionId, SESSION)
+  assert.equal(sibling.workspace.neighbors[0].stage, 'S1')
+  assert.equal(sibling.workspace.neighbors[0].stageIndex, 0)
+  // 同一会话重复启动仍然被拒：那会把上一条顶掉。
+  await assert.rejects(call('flowgate_start', {}), /当前会话已经有一条进行中的流程/)
+  const rejected = await post({ sessionId: SESSION, action: 'start', payload: {} })
   assert.equal(rejected.status, 409)
   assert.match(rejected.data.error, /先结束或放弃/)
-  assert.equal((await getState('sess-other')).active, false)
+  // 同目录另开一个会话是正常用法：它有自己的流程，两条互不顶替。
+  await call('flowgate_start', { title: '同目录第二条' }, 'sess-other')
+  assert.equal((await getState('sess-other')).active, true)
+  assert.equal((await getState()).id !== (await getState('sess-other')).id, true)
   assert.equal((await getState()).workspace.flow.sessionId, SESSION)
+  assert.equal((await getState('sess-other')).workspace.flow.sessionId, 'sess-other')
 })
 
 await check('S1 阶段的写操作被拒绝', async () => {
@@ -787,7 +794,9 @@ await check('测试汇总通过不能替代 AC 证据，明确接受缺口后结
   assert.ok(!gapEvents.some((event) => event.type === 'gate.passed' && event.detail.stage === 'S4'), '带缺口结项不能同时写 gate.passed')
   assert.ok(gapEvents.some((event) => event.type === 'flow.finished' && event.detail.closure === 'accepted_with_gaps'), '结束事件要写明结束方式')
   assert.equal(view.workspace.flow, null)
-  assert.equal((await getState('sess-other')).workspace.active, false)
+  // 邻居的流程不会因为这条结束就变成「本会话的流程」：归属始终按会话算。
+  assert.equal((await getState('sess-other')).workspace.flow.sessionId, 'sess-other')
+  assert.ok(!(await getState('sess-other')).workspace.neighbors.some((item) => item.sessionId === SESSION))
 })
 
 await check('流程结束后写操作不再受 scope 限制', async () => {

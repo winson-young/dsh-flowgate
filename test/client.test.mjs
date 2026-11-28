@@ -3739,7 +3739,9 @@ await check('流程列表通过新接口每页显示十条，翻页清详情，�
     assert.ok(!flat(renderer.toJSON()).includes('甲任务11'))
     assert.ok(!flat(renderer.toJSON()).includes('旧名单流程不能渲染'))
     await click(buttonByText(renderer.toJSON(), '甲任务01'))
-    assert.ok(flat(renderer.toJSON()).includes('出口门禁'))
+    // 历史记录只能看：门禁面板属于当前会话那条流程，这里不给。
+    assert.ok(flat(renderer.toJSON()).includes('这条流程已不在当前会话上'))
+    assert.ok(!flat(renderer.toJSON()).includes('出口门禁'), '历史详情不该出现当前流程的门禁面板')
     await click(buttonByText(renderer.toJSON(), '下一页'))
     assert.deepEqual(flowCalls.at(-1), { path: alpha.path, page: 2, pageSize: 10 })
     assert.ok(!flat(renderer.toJSON()).includes('出口门禁'), '换页必须清掉 opened 流程详情')
@@ -5046,6 +5048,61 @@ await check('阶段提示：等待说明按 waitingKind 分流，只有可作答
   assert.equal(why((await render(stageHint, {})).toJSON()), '在左侧栏「流程工作台」确认后才继续')
   currentView = baseView('S2', { waiting: true, waitingKind: 'gate' })
   assert.equal(why((await render(stageHint, {})).toJSON()), '在左侧栏「流程工作台」确认后才继续')
+})
+
+await check('阶段提示：同目录邻居的流程只说一句，不冒充本会话的阶段', async () => {
+  const sessionId = 'hint-neighbor-' + (++seq)
+  // 别人的流程在跑：本会话没有流程，提示条必须还是「可以开始」，只是多说一句邻居。
+  currentView = baseView('S2', {
+    workspace: { path: '/repo', active: false, flow: null, neighbors: [workspaceFlow({ sessionId: 'owner', stage: 'S2', label: '开发' })] },
+  })
+  const tree = (await render(stageHint, { session: { sessionId } }, false)).toJSON()
+  const why = flat(nodeByClass(tree, 'fg-hint-why'))
+  assert.match(why, /同目录另有流程：/)
+  assert.match(why, /属于别的会话/)
+  assert.ok(flat(tree).includes('从需求分析开始新流程'), '邻居不挡这个会话开自己的流程')
+  assert.ok(!flat(tree).includes('该工作区已有流程在进行'), '不能拿别人的流程说「你已有流程」')
+  // 自己也有流程时不再提邻居：那一条才是要点。
+  currentView = baseView('S2', {
+    workspace: { path: '/repo', active: true, flow: workspaceFlow({ sessionId, stage: 'S2', label: '开发' }), neighbors: [workspaceFlow({ sessionId: 'owner' })] },
+  })
+})
+
+await check('阶段提示：自己有流程时不念邻居，只显示自己的阶段', async () => {
+  const sessionId = 'hint-own-' + (++seq)
+  currentView = baseView('S2', {
+    workspace: { path: '/repo', active: true, flow: workspaceFlow({ sessionId, stage: 'S2', label: '开发' }), neighbors: [workspaceFlow({ sessionId: 'owner' })] },
+  })
+  const text = flat((await render(stageHint, { session: { sessionId } }, false)).toJSON())
+  assert.ok(!text.includes('同目录另有流程'), '自己有流程时不念邻居：' + text)
+  assert.ok(text.includes('S2 开发'), '显示的是自己的阶段：' + text)
+})
+
+await check('历史详情按 flowId 取，只读渲染，不出现当前流程的门禁', async () => {
+  const sessionId = 'detail-history-' + (++seq)
+  currentView = baseView('S1', { doc: { html: '<p>当初的文档</p>', pending: true, interrupted: false } })
+  const urls = []
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (url, init) => { urls.push(String(url)); return originalFetch(url, init) }
+  try {
+    const renderer = await render(FlowDetail, { sessionId, flowId: 'flow-1', history: true, cwd: '/repo', allowStart: false }, false)
+    const text = flat(renderer.toJSON())
+    assert.ok(urls.some((url) => new URL(url, 'http://localhost').searchParams.get('flowId') === 'flow-1'), '历史详情必须按 flowId 取')
+    assert.ok(text.includes('这条流程已不在当前会话上'), '历史详情要说明只能看')
+    assert.ok(!text.includes('出口门禁'), '历史详情不给当前流程的门禁面板')
+    assert.ok(text.includes('历史记录：需求文档只可查看'), '历史里的文档不给批准与换预设')
+    assert.equal(hasButton(renderer.toJSON(), '批准并冻结 scope'), false)
+    assert.ok(!hasButton(renderer.toJSON(), '开始需求分析'), '历史详情不暴露新建入口')
+  } finally { globalThis.fetch = originalFetch }
+})
+
+await check('当前流程的详情仍可操作门禁（历史只读不影响正常入口）', async () => {
+  const sessionId = 'detail-live-' + (++seq)
+  currentView = baseView('S2')
+  const renderer = await render(FlowDetail, { sessionId, flowId: 'flow-1', allowStart: false }, false)
+  const text = flat(renderer.toJSON())
+  assert.ok(text.includes('出口门禁'), '当前流程要有门禁面板')
+  assert.ok(!text.includes('这条流程已不在当前会话上'))
 })
 
 await check('阶段提示：推荐标记只追加一次，标签里不再自带', async () => {
