@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.33
+
+- **G21 退回 S1 不清 scope 作业状态：新方案背着旧账，还可能一上来就被判「AI 卡死」**：`rollbackTo(flow,'S1')` 只清 `scope` / `doc` / 草稿 / 丢弃清单，另外六个字段原样留着——`pendingCommands`（门禁追问上一轮待补的命令，点「补」还会撞上「这条命令已经在清单里了」）、`declinedCommands`、`scopeRiskStrikes`（连续退回计数，到 3 次直接 `cancelFlow`，新一轮只剩 1–2 次机会）、`scopeRiskLast`（Agent 摘要读到的是上一轮的缺口）、`pendingScopeRisks`（草稿已清空、门禁却说「待批准的方案有 N 条缺口」）、`scopeRequests`（报告没提；S1 反向核对会拿它判「申请单被丢弃」，Agent 在新一轮合理删命令时被拒）。
+
+  改法三层。① **结构层：收进一个值对象，换轮就整块换掉**。新增 `emptyScopeCycle(epoch)`，把上述六个字段连同 `draft` / `dropped` 收进 `flow.scopeCycle`；`createFlow` 用它初始化，`rollbackTo('S1')` 改成整块替换（`pendingCommands` / `declinedCommands` 跨轮保留，其余归零，`epoch` 递增），`repairFlow` 只认「整块可信」或「整块作废」（`repairScopeCycle`），不做逐字段抢救；冷恢复顺带 `delete` 旧顶层八个字段，避免 `{ ...base, ...raw }` 把它们带回成两份真相。以后加字段也不必每处补齐零清单。
+
+  ② **语义层：两个队列不清，改成冻结时对账出队**。`pendingCommands` / `declinedCommands` 记的是用户想补的、拒绝过的命令，属于跨轮的用户诉求；清掉等于把用户的决定一起删了（「不补」只影响要不要再问，不拦放行）。它们跨轮保留，但 scope 冻结时按新 `commands` 清单过滤，已写进清单的自动出队——这堵死了「S4 被拒 → 回 S1 写进清单 → 队列还在 → 点补报错」的死锁。
+
+  ③ **惩罚层：第 3 次不再判死，停在 S1 交回决定权**。同一个信号两头都不准：换了一批 AC、缺口类型没变时签名不变，误杀；Agent 每轮只修一条时签名每轮都变，上限永远到不了。改成到上限只拒绝提交、照常禁止自动通过，但流程停在 S1，门禁给出三选一（自己改 scope / 补一条被拒命令清零重来 / 放弃流程），与「改道不是判死，是把决定权交回给人」保持一致。顺带修 G20 在 scope 侧的同款问题：缺口签名从只取 `item.code` 改成带 AC 身份（`item.acs` 排序后拼 `ac:code`），同一批缺口不再因状态抖动或换 AC 而失真。
+
+  视图层字段名保持不变（`pendingScope` / `pendingScopeRisks` / `scopeRiskStrikes` / `pendingCommands` 等），`lib/client.js` 不用改。
+
+  验证：`test/host.test.mjs` 新增两组用例（同一批缺口连交三次停在 S1、第四次仍不结束；回 S1 后 `epoch+1`、`strikes===null`、`riskLast` / `risks` / `requests` 归零、队列按新清单出队），手工构造的 flow 夹具补 `scopeCycle`，`test/integration.test.mjs` / `test/provenance.test.mjs` 改读 `scopeCycle.draft`；`npm test` 十五套全 PASS。版本 0.1.33。
+
 ## 0.1.32
 
 - **改道 S1 之后「同一批」只认 AC id，用户改完验收办法再退一次又被扔回 S1**：`testStall` 比对的是未通过 AC 的 id 集合，而改道 S1 的用意正是换一种能量测的验收办法——用户改的往往就是 `procedure`（甚至 `method`），id 一个字没变。于是回 S1 改完、重新交件、S4 再退一次，判据照样判成「同一批」，`streak` 从 3 累到 4 立刻又改道，补救路径等于只给一次机会；同时 `flow.testStall` 原样保留 streak=3，改道这个动作本身也没在任何地方留下痕迹。

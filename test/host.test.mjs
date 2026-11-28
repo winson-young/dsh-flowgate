@@ -510,7 +510,7 @@ check('未登记进白名单的工具默认被拒绝', () => {
     for (const stage of ['S1', 'S2', 'S3', 'S4']) {
       flow.stage = stage
       flow.scope = { frozen: true, data: { commands: ['npm test'], files_expected_to_change: ['allowed.js'] } }
-      const before = JSON.stringify(flow.pendingCommands)
+      const before = JSON.stringify(flow.scopeCycle.pendingCommands)
       service.noteActivity(owner, { name: 'read', arguments: { path: 'owner-marker' } }, stage)
       const activity = service.activity.get(owner)
       for (const header of ordinary) {
@@ -518,7 +518,7 @@ check('未登记进白名单的工具默认被拒绝', () => {
         cx.handlers.get('agent/status')({ status: 'idle', agent: { session: { header } } })
       }
       check(`G07 ${stage} 无关顶层与子代理普通操作全部放行且不污染清单或进度`, () => {
-        assert.equal(JSON.stringify(flow.pendingCommands), before)
+        assert.equal(JSON.stringify(flow.scopeCycle.pendingCommands), before)
         assert.equal(service.activity.get(owner), activity)
       })
       for (const header of [child('sess_sibling', owner), child('sess_nested', owner, join(ws, 'nested')), child('moved', owner, tmpdir()), child('grandchild', 'middle', ws, 2)]) {
@@ -4229,6 +4229,7 @@ for (const [kind, reason, expected] of [
       stage,
       events: [],
       scope: { frozen: true, data: { in_scope: { files_expected_to_change: ['src/a.ts'], commands, capabilities: [] } } },
+    scopeCycle: { epoch: 1, draft: null, dropped: [], risks: [], riskLast: [], strikes: null, requests: [], pendingCommands: [], declinedCommands: [] },
     })
     const s1 = flowOf('S1', ['npm test'])
     const s3 = flowOf('S3', ['npm test', 'npm run *'])
@@ -4413,9 +4414,9 @@ for (const [kind, reason, expected] of [
 
     const secondError = await rejected(riskScope())
     const secondState = await rx.request('/api/flowgate/state?sessionId=sess-scope-risk')
-    check('同一批缺口再交一次，计数累加并预告下一次就结束', () => {
+    check('同一批缺口再交一次，计数累加并预告下一次会停下来等人决定', () => {
       assert.match(secondError, /第 2\/3 次/)
-      assert.match(secondError, /同一批缺口再出现一次，这条流程会被自动结束/)
+      assert.match(secondError, /同一批缺口再出现一次，这条流程会停在 S1 等你决定，不会自动结束/)
       assert.equal(secondState.body.doc.scopeRiskStrikes.count, 2)
     })
 
@@ -4453,13 +4454,15 @@ for (const [kind, reason, expected] of [
 }
 
 // ---------------------------------------------------------------------------
-// 同一批缺口连交三次：不是 Agent 不努力，是这条路走不通。
-// 让它结束，比让同一份 scope 在人和 Agent 之间再抛三个来回更诚实。
+// 同一批缺口连交三次：不替用户判死，而是停在 S1 把决定权交回去。
+// 卡住的原因可能是 Agent 没改对，也可能是这份验收方法在当前环境根本测不了；
+// 前者该继续修，后者该放弃，这个判断只有用户做得出来。
 // ---------------------------------------------------------------------------
 {
   const strikeCwd = mkdtempSync(join(tmpdir(), 'flowgate-scope-strike-'))
   try {
     const sx = makeHost(strikeCwd, 'sess-scope-strike')
+    const act = (action, payload) => sx.request('/api/flowgate/action', { sessionId: 'sess-scope-strike', action, payload })
     await sx.tool('flowgate_start', { title: '缺口三振', preset: 'fast' })
     const strikeScope = {
       files_expected_to_change: ['test/host.test.mjs'],
@@ -4473,27 +4476,130 @@ for (const [kind, reason, expected] of [
         verification: { method: 'integration', procedure: '先改 test/fixtures/session.ts，再运行集成用例', commands: ['node test/host.test.mjs'] },
       }],
     }
-    const messages = []
-    for (let round = 0; round < 3; round += 1) {
+    const submitStrike = async () => {
       try {
         await sx.tool('flowgate_doc', { html: '<html><body><p>缺口</p></body></html>', scope: strikeScope })
-        messages.push('')
+        return ''
       } catch (error) {
-        messages.push(String(error?.message ?? error))
+        return String(error?.message ?? error)
       }
     }
+    const messages = []
+    for (let round = 0; round < 3; round += 1) messages.push(await submitStrike())
     const strikeState = await sx.request('/api/flowgate/state?sessionId=sess-scope-strike')
-    check('同一批缺口连交三次，流程自动结束并说清原因', () => {
+    check('同一批缺口连交三次：停在 S1 等用户选路，不替用户判死', () => {
       assert.match(messages[0], /第 1\/3 次/)
       assert.match(messages[1], /第 2\/3 次/)
-      assert.match(messages[2], /连续 3 次没能补齐，这条流程已自动结束/)
-      assert.equal(strikeState.body.finished, true)
-      assert.match(String(strikeState.body.cancelReason ?? ''), /scope 缺口/)
-      assert.deepEqual(strikeState.body.doc.scopeRiskLast, [], '结束的流程不再留待办缺口')
-      assert.equal(strikeState.body.doc.scopeRiskStrikes, null)
+      assert.match(messages[2], /连续 3 次没能补齐/)
+      assert.match(messages[2], /这条流程停在 S1/)
+      assert.match(messages[2], /放弃这条流程/)
+      assert.equal(strikeState.body.finished, false, '停在 S1，不是结束')
+      assert.equal(strikeState.body.stage, 'S1')
+      assert.equal(strikeState.body.doc.scopeRiskStrikes.count, 3)
+      assert.equal(strikeState.body.doc.scopeRiskStrikes.stalled, true)
+      // 缺口原文留着：用户得能看见到底卡在哪一条，才谈得上选路。
+      assert.equal(strikeState.body.doc.scopeRiskLast[0].code, 'procedure-file-outside-scope')
+    })
+
+    // 再交一次：人还没做决定，计数封顶不再涨，流程原地等着。
+    const fourthError = await submitStrike()
+    const fourthState = await sx.request('/api/flowgate/state?sessionId=sess-scope-strike')
+    check('卡住之后再交一次，计数封顶在 3，处罚不加重', () => {
+      assert.match(fourthError, /连续 3 次没能补齐/)
+      assert.equal(fourthState.body.doc.scopeRiskStrikes.count, 3)
+      assert.equal(fourthState.body.finished, false)
+    })
+
+    // 用户选第一条路：自己把缺口改掉再交一次。停在 S1 不是判死——改好了门禁照常放行。
+    // 补命令那条路在这里走不通也说得通：S1 阶段被拒的命令本来就不进待补队列（那是阶段违规，不是清单写漏）。
+    strikeScope.acceptance_criteria[0].verification.procedure = '先改 test/host.test.mjs，再运行集成用例'
+    // 绕过 chainWait：交件成功它会把这一步接成「等签收」，而这里没有人点按钮，会一直挂着。
+    const submitDirect = () => {
+      const definition = sx.tools.get('flowgate_doc')
+      const prepared = withGrill('flowgate_doc', { html: '<html><body><p>缺口</p></body></html>', scope: strikeScope })
+      return definition.execute(prepared, {
+        name: 'flowgate_doc',
+        arguments: prepared,
+        agent: { session: { header: { id: 'sess-scope-strike', cwd: strikeCwd } } },
+        signal: undefined,
+      })
+    }
+    const recovered = await submitDirect()
+    const recoveredState = await sx.request('/api/flowgate/state?sessionId=sess-scope-strike')
+    check('改好缺口再交一次：门禁照常放行，不因为之前的 3 次就拒收', () => {
+      assert.equal(recovered.decision, 'submitted', '缺口补掉后这次提交应当成功')
+      assert.equal(recoveredState.body.stage, 'S1')
+      assert.equal(recoveredState.body.doc.pending, true)
+      assert.equal(recoveredState.body.finished, false)
+      assert.equal(recoveredState.body.doc.scopeRiskStrikes, null)
     })
   } finally {
     rmSync(strikeCwd, { recursive: true, force: true })
+  }
+}
+
+// ---------------------------------------------------------------------------
+// G21：退回 S1 是换一轮 scope 作业，不是接着上一轮做。
+// 旧账不清，新方案一上来就背着别人的缺口：门禁追问一条早就不存在的命令，
+// 连续退回的次数还会把新方案直接判成「AI 卡死了」。
+// ---------------------------------------------------------------------------
+{
+  const cycleWs = g40Workspace('scope-cycle')
+  // 要补的命令得真在项目里，否则「命令不适用」会盖过这里要验的换轮。
+  writeFileSync(join(cycleWs, 'package.json'), JSON.stringify({
+    name: 'g21-fixture',
+    scripts: { test: 'node --test test/session.test.mjs', build: 'node scripts/build.mjs' },
+  }, null, 2) + '\n')
+  const sid = 'sess-scope-cycle'
+  try {
+    const cx = makeHost(cycleWs, sid)
+    const service = currentService()
+    const act = (action, payload) => cx.request('/api/flowgate/action', { sessionId: sid, action, payload })
+    await cx.tool('flowgate_start', { title: '换一轮', preset: 'fast' })
+    // 本块自带一份干净 scope：G40_SCOPE 定义在文件末尾，const 的 TDZ 让这里读不到它。
+    const cycleScope = {
+      files_expected_to_change: ['src/session.mjs'],
+      commands: ['npm test'],
+      command_sources: [{ command: 'npm test', from: 'package.json scripts.test' }],
+      capabilities: [],
+      out_of_scope_explicitly: [],
+      acceptance_criteria: [{
+        id: 'AC-1',
+        when: '会话过期后发请求',
+        then: '返回 401',
+        verification: { method: 'unit', procedure: '调用 response(true) 并断言状态码 401', commands: ['npm test'] },
+      }],
+    }
+    const docCall = cx.tool('flowgate_doc', { html: '<p>需求</p>', scope: cycleScope })
+    await tick()
+    assert.equal((await act('doc', { decision: 'approve' })).status, 200)
+    await keepAlive(docCall)
+    assert.equal(service.get(sid).stage, 'S2', '干净 scope 批准后进 S2')
+    // S2 撞一条不在清单里的命令：它进待补队列，这就是退回 S1 的由头。
+    await cx.guard('bash', { command: 'npm run build' })
+    // 上一轮攒下的旧账从内存造进来：这条用例验的是「换轮时它们会不会被带走」，
+    // 不是它们怎么来的。
+    const before = service.get(sid).scopeCycle
+    assert.equal(before.pendingCommands.length, 1, '被拒的命令要先入队')
+    before.strikes = { signature: 'AC-1:procedure-file-outside-scope', count: 2, at: '2026-01-01T00:00:00.000Z' }
+    before.riskLast = [{ code: 'procedure-file-outside-scope', message: '上一轮的缺口', acs: ['AC-1'] }]
+    before.risks = [{ code: 'procedure-file-outside-scope', message: '上一轮的缺口', acs: ['AC-1'] }]
+    before.requests = [{ command: 'npm test', dir: '.', entry: 'npm test', addedAt: 1 }]
+    const epochBefore = before.epoch
+    const reopened = await act('reopenScopeForCommands', {})
+    const after = service.get(sid).scopeCycle
+    check('G21-1 退回 S1 是换一轮：旧缺口、旧计数、旧申请单都不跟着走', () => {
+      assert.equal(reopened.status, 200, JSON.stringify(reopened.body))
+      assert.equal(service.get(sid).stage, 'S1')
+      assert.equal(after.epoch, epochBefore + 1, '换轮要留下递增的代号，界面才说得清这是第几轮')
+      assert.equal(after.strikes, null, '上一轮的退回计数不能带进新方案')
+      assert.deepEqual(after.riskLast, [], '旧缺口不能留给 Agent 当返工清单')
+      assert.equal(after.risks.some((item) => item.code === 'procedure-file-outside-scope'), false, '缺口要按新清单重算，不能原样留着上一轮的结论')
+      assert.deepEqual(after.requests.map((item) => item.command), ['npm run build'], '申请单只留本次补录的那一条')
+      assert.deepEqual(after.pendingCommands, [], '刚进清单的命令已出队，门禁不该再问它')
+    })
+  } finally {
+    rmSync(cycleWs, { recursive: true, force: true })
   }
 }
 
@@ -5339,8 +5445,8 @@ for (const listedCommands of [[], ['node --check lib/index.js']]) {
       assert.deepEqual(before.doc.pendingScope.files_expected_to_change, ['src/gate.ts'])
     })
     const live = currentService().get(sid)
-    const saved = live.pendingScope
-    live.pendingScope = { ...saved, files_expected_to_change: [] }
+    const saved = live.scopeCycle.draft
+    live.scopeCycle.draft = { ...saved, files_expected_to_change: [] }
     for (const decision of ['approve', 'skip']) {
       const denied = await host.request('/api/flowgate/action', { sessionId: sid, action: 'doc', payload: { decision } })
       check('旧待批准空清单不能在 ' + decision + ' 时冻结：' + listedCommands.length, () => {
@@ -5350,7 +5456,7 @@ for (const listedCommands of [[], ['node --check lib/index.js']]) {
         assert.equal(live.scope.frozen, false)
       })
     }
-    live.pendingScope = saved
+    live.scopeCycle.draft = saved
     const approved = await host.request('/api/flowgate/action', { sessionId: sid, action: 'doc', payload: { decision: 'approve' } })
     await pending
     const frozen = JSON.parse(readFileSync(join(ws, '.dsh-flowgate', 'scope.json'), 'utf8'))
@@ -6103,7 +6209,7 @@ async function keepAlive(promise) {
     const docCall = cx.tool('flowgate_doc', { html: '<p>需求</p>', scope: G40_SCOPE })
     await tick()
     // 队列直接从内存造一条：这条用例验的是唤醒路径，不是拒绝入队的判定。
-    service.get(sid).pendingCommands = [{
+    service.get(sid).scopeCycle.pendingCommands = [{
       command: 'npm run build', dir: '.', cwd: ws, reason: '不在 scope 命令清单', stage: 'S1', at: Date.now(),
     }]
     const declined = await cx.request('/api/flowgate/action', {
@@ -6147,7 +6253,7 @@ async function keepAlive(promise) {
     await tick()
     // S1 上被拒的命令不进待补队列（那属于阶段违规），这里直接造一条：
     // 本条用例验的是补录之后的举证要求，不是入队判定。
-    service.get(sid).pendingCommands = [{
+    service.get(sid).scopeCycle.pendingCommands = [{
       command: 'npm run build', dir: '.', cwd: ws, reason: '不在 scope 命令清单', stage: 'S2', at: Date.now(), context: 'S2 开发',
     }]
     const reopened = await cx.request('/api/flowgate/action', {
@@ -6157,8 +6263,8 @@ async function keepAlive(promise) {
     check('G41-1 补录后申请单留下命令原文与被拒现场', () => {
       const flow = service.get(sid)
       assert.equal(flow.stage, 'S1')
-      assert.equal(flow.scopeRequests.length, 1)
-      const entry = flow.scopeRequests[0]
+      assert.equal(flow.scopeCycle.requests.length, 1)
+      const entry = flow.scopeCycle.requests[0]
       assert.equal(entry.entry, 'npm run build')
       assert.equal(entry.deniedStage, 'S2')
       assert.equal(entry.context, 'S2 开发')
@@ -6169,7 +6275,7 @@ async function keepAlive(promise) {
         () => cx.tool('flowgate_doc', { html: '<p>需求</p>', scope: G40_SCOPE }),
         /补进清单的命令在新提交里不见了/,
       )
-      assert.equal(service.get(sid).scopeRequests.length, 1, '被拒的提交不能把申请单一起清掉')
+      assert.equal(service.get(sid).scopeCycle.requests.length, 1, '被拒的提交不能把申请单一起清掉')
     })
     const withCommand = {
       ...G40_SCOPE,
@@ -6216,7 +6322,7 @@ async function keepAlive(promise) {
     check('G41-6 冻结后申请单清空，冻结事件里留下这次补录', () => {
       const flow = service.get(sid)
       assert.equal(flow.scope.frozen, true)
-      assert.deepEqual(flow.scopeRequests, [])
+      assert.deepEqual(flow.scopeCycle.requests, [])
       const frozen = g40Events(ws).filter((event) => event.type === 'scope.frozen').pop()
       assert.deepEqual(frozen.detail.supplemented, ['npm run build'])
     })
@@ -6232,7 +6338,7 @@ async function keepAlive(promise) {
     const service = currentService()
     await cx.tool('flowgate_start', { title: '改需求清申请单', preset: 'fast' })
     // 申请单直接造：本条验的是 revise 的清空动作，不是补录路径本身。
-    service.get(sid).scopeRequests = [{
+    service.get(sid).scopeCycle.requests = [{
       command: 'npm test', dir: '.', cwd: ws, entry: 'npm test', deniedStage: 'S2', deniedAt: Date.now(),
       deniedBecause: '不在 scope 命令清单', context: 'S2 开发', addedAt: Date.now(),
     }]
@@ -6244,7 +6350,7 @@ async function keepAlive(promise) {
     assert.equal(revised.status, 200, JSON.stringify(revised.body))
     assert.equal((await keepAlive(docCall)).decision, 'revise')
     check('G41-7 改需求会把申请单一起作废：拿旧申请单核对新 scope 只会报对不上的错', () => {
-      assert.deepEqual(service.get(sid).scopeRequests, [])
+      assert.deepEqual(service.get(sid).scopeCycle.requests, [])
     })
   } finally { rmSync(ws, { recursive: true, force: true }) }
 }
@@ -6262,7 +6368,7 @@ async function keepAlive(promise) {
     const autoDoc = await keepAlive(cx.tool('flowgate_doc', { html: '<p>需求</p>', scope: G40_SCOPE }))
     assert.equal(autoDoc.decision, 'approve', JSON.stringify(autoDoc))
     assert.equal(service.get(sid).stage, 'S2')
-    service.get(sid).pendingCommands = [{
+    service.get(sid).scopeCycle.pendingCommands = [{
       command: 'npm run build', dir: '.', cwd: ws, reason: '不在 scope 命令清单', stage: 'S4', at: Date.now(), context: 'S4 测试',
     }]
     const reopened = await cx.request('/api/flowgate/action', {
@@ -6273,7 +6379,7 @@ async function keepAlive(promise) {
       const flow = service.get(sid)
       assert.notEqual(flow.scope?.frozen, true, '补录命令还没有 AC 作证，不能自动冻结')
       assert.equal(flow.stage, 'S1')
-      assert.equal(flow.scopeRequests.length, 1)
+      assert.equal(flow.scopeCycle.requests.length, 1)
     })
   } finally { rmSync(ws, { recursive: true, force: true }) }
 }

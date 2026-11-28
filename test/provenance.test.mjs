@@ -85,6 +85,8 @@ function fixture(run, cleanupOptions) {
       acceptance_criteria: [{ id: 'AC-1', when: 'input', then: 'correct result' }],
     } },
     devChanges: { files: [], untracked: [] },
+    // 这一轮的 scope 作业状态（G21）：手工夹具也要带全，否则读草稿的地方拿到 undefined。
+    scopeCycle: { epoch: 1, draft: null, dropped: [], risks: [], riskLast: [], strikes: null, requests: [], pendingCommands: [], declinedCommands: [] },
   }
   try {
     fs.mkdirSync(cwd)
@@ -229,12 +231,12 @@ test('deletion and creation of a missing declared file are complete but differen
 }))
 
 test('pendingScope fallback includes its file list and acceptance criteria', () => fixture(({ flow }) => {
-  flow.pendingScope = { files_expected_to_change: ['src/main.js'], acceptance_criteria: [{ id: 'AC-1', then: 'ok' }] }
+  flow.scopeCycle.draft = { files_expected_to_change: ['src/main.js'], acceptance_criteria: [{ id: 'AC-1', then: 'ok' }] }
   delete flow.scope
   const before = captureSnapshot(flow)
   assert.equal(before.complete, true)
   assert.equal(before.files[0].hash, hash('first'))
-  flow.pendingScope.acceptance_criteria[0].then = 'new behavior'
+  flow.scopeCycle.draft.acceptance_criteria[0].then = 'new behavior'
   assert.notEqual(captureSnapshot(flow).id, before.id)
 }))
 

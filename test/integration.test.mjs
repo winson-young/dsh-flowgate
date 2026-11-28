@@ -446,7 +446,7 @@ await check('需求文档门禁：批准后 scope 冻结并进入 S2', async () 
 await check('S2 无关会话或不完整父链放行，不污染所属流程台账', async () => {
   const service = mod.currentService()
   const flow = service.get(SESSION)
-  const pending = structuredClone(flow.pendingCommands)
+  const pending = structuredClone(flow.scopeCycle.pendingCommands)
   const activity = structuredClone([...service.activity])
   const unrelated = [
     ['sess-independent', { delegationDepth: 0 }],
@@ -465,7 +465,7 @@ await check('S2 无关会话或不完整父链放行，不污染所属流程台�
     assert.equal((await guard('write', { file_path: 'src/outside.ts' }, id)).kind, 'allow', id + ' 不应借 cwd 归入流程')
     assert.equal((await guard('bash', { command: 'pnpm run ' + id }, id)).kind, 'allow', id + ' 命令应放行')
   }
-  assert.deepEqual(flow.pendingCommands, pending, '无关命令不能进入流程待补清单')
+  assert.deepEqual(flow.scopeCycle.pendingCommands, pending, '无关命令不能进入流程待补清单')
   assert.deepEqual([...service.activity], activity, '无关调用不能覆盖流程活动或新增活动记录')
 })
 
@@ -481,7 +481,7 @@ await check('S2 未登记真实后代沿 sessions 与 agents 父链拒绝越界�
     assert.match(denied.reason, /不在冻结 scope 内/)
     const command = 'pnpm run blocked-' + id
     assert.equal((await guard('bash', { command }, id)).kind, 'deny')
-    assert.ok(flow.pendingCommands.some((entry) => entry.command === command && entry.stage === 'S2'), '后代命令应写入所属流程的待补清单')
+    assert.ok(flow.scopeCycle.pendingCommands.some((entry) => entry.command === command && entry.stage === 'S2'), '后代命令应写入所属流程的待补清单')
     assert.equal(service.activity.get(SESSION)?.tool, 'bash')
     assert.equal(service.activity.has(id), false, '活动应记在流程所有者而非子会话')
     assert.equal(service.get(id), null, '后代不应另建流程')
@@ -490,7 +490,7 @@ await check('S2 未登记真实后代沿 sessions 与 agents 父链拒绝越界�
   }
   const declined = await post({ sessionId: SESSION, action: 'declineScopeCommands', payload: {} })
   assert.equal(declined.status, 200, '后续门禁前通过真实用户动作处理本例产生的待补命令')
-  assert.deepEqual(flow.pendingCommands, [])
+  assert.deepEqual(flow.scopeCycle.pendingCommands, [])
 })
 
 await check('S2 放行 scope 内的写操作', async () => {
@@ -527,7 +527,7 @@ await check('AC-7 审计流水与待补队列都记下执行目录', async () =>
   }
   assert.equal(denied.kind, 'deny')
   const flow = mod.currentService().get(SESSION)
-  const queued = flow.pendingCommands.find((entry) => entry.command === command)
+  const queued = flow.scopeCycle.pendingCommands.find((entry) => entry.command === command)
   assert.ok(queued, '被拒命令必须进待补队列')
   assert.equal(queued.dir, 'packages/web', '待补队列要记下被拒时的执行目录')
   assert.equal(queued.cwd, sub)
@@ -549,7 +549,7 @@ await check('AC-10 补进清单时自动带上被拒时的目录后缀', async (
   assert.deepEqual(view.doc.pendingScope.commands, [command + ' [packages/web]'], '补进去的条目必须带目录后缀')
   // G41：补进来的命令要有人作证。把它的原文（含目录后缀）写进 AC 的 verification.commands，
   // 说明它证明哪一条；没人作证的补录命令会让这份 scope 拒绝冻结。
-  const pendingScope = mod.currentService().get(SESSION).pendingScope
+  const pendingScope = mod.currentService().get(SESSION).scopeCycle.draft
   const attested = pendingScope.acceptance_criteria[0]
   attested.verification = {
     method: 'integration',
@@ -571,7 +571,7 @@ await check('AC-7 命令带 workdir 时按 workdir 判定，审计与待补队�
   const denied = await guard('bash', { command, workdir: 'packages/web' })
   assert.equal(denied.kind, 'deny', '清单条目只批准在流程根执行，workdir 换到子目录必须被拒')
   const flow = mod.currentService().get(SESSION)
-  const queued = flow.pendingCommands.find((entry) => entry.command === command)
+  const queued = flow.scopeCycle.pendingCommands.find((entry) => entry.command === command)
   assert.ok(queued, '被拒命令必须进待补队列')
   assert.equal(queued.dir, 'packages/web', '待补队列要记下 workdir 决定的执行目录')
   assert.equal(queued.cwd, join(CWD, 'packages', 'web'))
@@ -587,14 +587,14 @@ await check('AC-7 命令带 workdir 时按 workdir 判定，审计与待补队�
   assert.equal(audit.at(-1).detail.cwd, CWD)
   const declined = await post({ sessionId: SESSION, action: 'declineScopeCommands', payload: {} })
   assert.equal(declined.status, 200, '清理本例产生的待补命令')
-  assert.deepEqual(flow.pendingCommands, [])
+  assert.deepEqual(flow.scopeCycle.pendingCommands, [])
 })
 
 await check('AC-7 空命令拒绝有审计且不进入待补队列', async () => {
   const flow = mod.currentService().get(SESSION)
-  const count = flow.pendingCommands.length
+  const count = flow.scopeCycle.pendingCommands.length
   assert.equal((await guard('bash', { command: '   ', workdir: 'packages/web' })).kind, 'deny')
-  assert.equal(flow.pendingCommands.length, count)
+  assert.equal(flow.scopeCycle.pendingCommands.length, count)
   const event = flow.events.at(-1)
   assert.equal(event.type, 'shell.denied')
   assert.equal(event.detail.outcome, 'empty')
