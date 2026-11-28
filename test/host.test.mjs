@@ -2078,6 +2078,23 @@ rmSync(cwd, { recursive: true, force: true })
     assert.equal(again.submitted.id, reviewGate.submitted.id)
     assert.match(again.message, /已经提交过/)
   })
+
+  // 中断落在「等签收」上时，返回值必须自己说清报告已经落盘：
+  // 这是 Agent 判断要不要重跑一遍的唯一依据，缺了它就会白烧一轮。
+  // *_run 两个入口的返回值就是这里的同一个分支，所以这条断言同时锁住它们。
+  const waitController = new AbortController()
+  const waitingReview = cx.tool('flowgate_wait', { gateId: reviewGate.gateId }, { signal: waitController.signal })
+  await tick()
+  waitController.abort()
+  const haltedReview = await waitingReview
+  check('S3 等签收被中断：halt 带回评审报告回执，并说清不要重交', () => {
+    assert.equal(haltedReview.decision, 'halt')
+    assert.equal(haltedReview.waitReason, 'aborted')
+    assert.equal(haltedReview.submitted.kind, 'review')
+    assert.equal(haltedReview.submitted.id, reviewGate.submitted.id)
+    assert.match(haltedReview.message, /已经提交并保存/)
+    assert.match(haltedReview.message, /不要再调用 flowgate_review/)
+  })
 }
 
 // ---------------------------------------------------------------------------

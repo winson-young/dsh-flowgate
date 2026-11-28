@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **G35 回执补齐：`*_run` 与 `flowgate_wait` 的中断分支真正带上 `submitted`**：0.1.29 给 `flowgate_review_run` / `flowgate_test_run` 的 output schema 声明了 `submitted`，描述也写着「等待被中断时返回 `halt` 与 `submitted` 回执」；但四个 `halt` 分支里只有 `waitDocGate`（`lib/index.js:5335`）与 `waitDevGate`（`lib/index.js:5514`）把回执 spread 出去，`waitReviewGate`（`lib/index.js:6341` 起）与 `waitTestGate`（`lib/index.js:6650` 起）的同一分支没有这一行——S3/S4 两个入口中断时永远拿不到回执，schema 里那个字段是空的。`flowgate_wait` 的 output schema 也漏了 `submitted`，而它在 S1/S2 的中断分支同样会返回这个字段，`additionalProperties: false` 会把它挡在输出校验处。改法：两处 `halt` 分支各补 `...(wait.submitted ? { submitted: wait.submitted } : {})`，`flowgate_wait` 的 schema 补 `submitted: SUBMITTED_SCHEMA`。测试：`test/host.test.mjs` 的 S3 专项补「等签收被中断仍带回评审报告回执」，`test/integration.test.mjs` 的被取代用例补回执断言，`test/subagents.test.mjs` 新增「`review_run` 等签收被中断时返回 `submitted`」。
+
+  验证：`node scripts/run-tests.mjs` 十五套全 PASS、退出码 0（host 466 项、subagents 88 项、client 255 项、integration 45 项）；`npm run check` 全绿。版本 0.1.30。
 - **G35 描述订正：`*_run` 的 description 与 output schema 回到实现**：0.1.28 把 `flowgate_review_run` / `flowgate_test_run` 的 `description` 写成了「交件立即返回（decision=submitted），交完调用 `flowgate_wait`」，但实现里这两个入口仍然是「跑子代理 + 落盘 + 挂起等签收」同一次调用（`await waitReviewGate` / `await waitTestGate`，没有走 `submitGate`）。照描述办事的 Agent 会在调用返回后以为门禁已经开了，再去 `flowgate_wait` 接一张不存在的闸；而这两个入口在中断时返回的 `halt` 与 `submitted` / `waitReason` / `willWake` / `gateId`，又因为 `additionalProperties: false` 的 schema 里没有这些字段，会在输出校验处被挡掉。改法：`description` 改回「落盘后在同一次调用里挂起等签收，中断时返回 `halt` 与 `submitted` 回执」；新增 `RUN_DECISION_DESC` 说明这两个入口的 `decision` 取值里没有 `submitted`；两个 output schema 补上 `submitted` / `waitReason` / `willWake` / `gateId`。`docs/development.md` 的工具索引与「交件与等签收是两个工具」一节同步改成「四个交件工具 + 两个例外」。
 
   验证：`node scripts/run-tests.mjs` 十五套全 PASS、退出码 0；`npm run check` 全绿（`Module revisions verified (7 modules).`、`Syntax verified (32 files).`、`check contracts verified (721 calls in 12 files).`）。版本 0.1.29。

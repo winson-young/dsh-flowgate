@@ -438,6 +438,25 @@ await test('AC-8 子代理 shell 与主 Agent 同一套目录规则', async () =
   })
 })
 
+await test('等签收被中断时 review_run 带回 submitted 回执，说明报告已落盘', async () => {
+  // *_run 把「跑子代理、落盘、等签收」放在同一次调用里：落盘之后只剩等待，
+  // 所以中断一定发生在「报告已经存好」之后。返回值必须自己把这件事说清，
+  // 否则 Agent 会以为没交成功，重跑一遍并覆盖掉这份报告。
+  await fixture({}, async (host) => {
+    await host.advance()
+    const controller = new AbortController()
+    const pending = host.call('flowgate_review_run', {}, { signal: controller.signal })
+    await eventually(async () => Boolean((await host.state()).review) && (await host.state()).waitingKind === 'gate', '评审报告已落盘并挂起')
+    const report = (await host.state()).review
+    controller.abort()
+    const value = await within(pending, '中断返回')
+    assert.equal(value.decision, 'halt')
+    assert.equal(value.submitted?.kind, 'review')
+    assert.equal(value.submitted.id, report.id)
+    assert.equal(value.waitReason, 'aborted')
+  })
+})
+
 await test('初始 SDK 未加载 ops_read_files：默认 read 与按需加载均通过只读守卫', async () => {
   await fixture({ onStart: async (activation, host) => {
     if (!activation.spec.label.startsWith('评审')) return
